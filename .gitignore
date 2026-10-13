@@ -1,0 +1,20 @@
+# Rust / Cargo
+target/
+**/*.rs.bk
+.toolchain/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Локальные данные и артефакты (не для репозитория)
+data/
+dist/
+*.log
+check_out.txt
+db_config.json
+*.db
+*.db-shm
+*.db-wal
+

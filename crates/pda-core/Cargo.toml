@@ -1,0 +1,29 @@
+[package]
+name = "pda-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ядро PDA: модели, реестр тегов, журнал, драйверы S7/Modbus, слой БД"
+
+[lib]
+name = "pda_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+parking_lot = "0.12"
+
+rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+tokio-modbus = { version = "0.11", default-features = false, features = ["tcp", "server"] }
+byteorder = "1"
+regex = "1"
+once_cell = "1"
+async-trait = "0.1"
+
+# PostgreSQL — async, без C-зависимостей (чистый Rust, линкуется под GNU)
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }

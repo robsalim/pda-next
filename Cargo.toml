@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/pda-core", "crates/pda-server", "crates/pda-desktop"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+
+# Общие зависимости для всех crates workspace
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

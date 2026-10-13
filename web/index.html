@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDA</title>
+    <link rel="stylesheet" href="https://unpkg.com/uplot@1.6.30/dist/uPlot.min.css">
+    <script src="https://unpkg.com/uplot@1.6.30/dist/uPlot.iife.min.js"></script>
+    <link rel="stylesheet" href="app.css">
+</head>
+<body>
+    <header>
+        <div class="nav-left">
+            <div class="logo">PDA</div>
+            <button id="btn-tab-charts" class="tab-btn active" onclick="switchTab('charts')">Charts</button>
+            <button id="btn-tab-bits" class="tab-btn" onclick="switchTab('bits')">Bits</button>
+            <button id="btn-tab-io" class="tab-btn" onclick="switchTab('io')">I/O</button>
+            <button id="btn-tab-db" class="tab-btn" onclick="switchTab('db')">Database</button>
+            <button id="btn-tab-help" class="tab-btn" onclick="switchTab('help')">Help</button>
+        </div>
+        <div class="nav-right">
+            <div class="app-badge" id="app-badge">PDA</div>
+            <div class="cursor-info">
+                <span class="c-x1" id="lbl-x1">X1: —</span>
+                <span class="c-x2" id="lbl-x2">X2: —</span>
+                <span class="c-dt" id="lbl-dt">ΔT: —</span>
+            </div>
+            <button id="btn-theme" class="theme-btn" onclick="toggleTheme()">🌙 Тёмная</button>
+        </div>
+    </header>
+
+    <div class="content">
+        <!-- 1. ВКЛАДКА CHARTS -->
+        <div id="page-charts" class="tab-page active">
+            <div class="sidebar">
+                <div class="sidebar-title">Дерево сигналов (клик / drag)</div>
+                <ul class="tag-list tree-list" id="sidebar-tags">
+                    <li style="padding: 12px; color: var(--text-faint);">Загрузка тегов...</li>
+                </ul>
+            </div>
+            <div class="chart-area">
+                <div class="controls-bar">
+                    <label>Режим:</label>
+                    <select id="charts-mode" onchange="onModeChange('charts')">
+                        <option value="Live">Live</option>
+                        <option value="Archive">Archive</option>
+                    </select>
+
+                    <span id="charts-live-panel">
+                        <label>Окно Live:</label>
+                        <select id="charts-span" onchange="reloadCharts(true)">
+                            <option value="15 мин">15 мин</option>
+                            <option value="1 час">1 час</option>
+                            <option value="4 часа">4 часа</option>
+                            <option value="12 часов">12 часов</option>
+                            <option value="24 часа" selected>24 часа</option>
+                            <option value="72 часа">72 часа</option>
+                        </select>
+                        <button id="btn-pause-charts" onclick="togglePause('charts')">⏸ Пауза</button>
+                    </span>
+
+                    <span id="charts-arch-panel" style="display: none;">
+                        <label>Начало:</label>
+                        <input type="datetime-local" id="charts-arch-start">
+                        <label>Длительность:</label>
+                        <select id="charts-arch-dur">
+                            <option value="15 мин">15 мин</option>
+                            <option value="1 час">1 час</option>
+                            <option value="4 часа">4 часа</option>
+                            <option value="12 часов">12 часов</option>
+                            <option value="24 часа" selected>24 часа</option>
+                            <option value="72 часа">72 часа</option>
+                        </select>
+                        <button onclick="shiftArchive('charts', -1)">◀</button>
+                        <button onclick="shiftArchive('charts', 1)">▶</button>
+                        <button class="btn-load" onclick="reloadCharts(true)">📥 Загрузить архив</button>
+                    </span>
+
+                    <button onclick="resetZoom(getActiveWindow()?.chart)">🔍 100%</button>
+                    <button onclick="clearCharts()">✕ Очистить</button>
+                </div>
+                <div class="windows-toolbar">
+                    <button onclick="addChartWindow()">＋ Добавить график</button>
+                </div>
+                <div class="chart-windows" id="chart-windows"></div>
+            </div>
+        </div>
+
+        <!-- 2. ВКЛАДКА BITS -->
+        <div id="page-bits" class="tab-page">
+            <div class="sidebar">
+                <div class="sidebar-title">Дерево сигналов (8-16 бит)</div>
+                <ul class="tag-list tree-list" id="bits-tree">
+                    <li class="tree-empty">Загрузка тегов...</li>
+                </ul>
+            </div>
+            <div class="bits-right">
+            <div class="controls-bar">
+                <span id="bits-current" style="font-weight:bold; color: var(--text-strong);">Регистр: —</span>
+                <label>Режим:</label>
+                <select id="bits-mode" onchange="onModeChange('bits')">
+                    <option value="Live">Live</option>
+                    <option value="Archive">Archive</option>
+                </select>
+                <span id="bits-live-panel">
+                    <label>Окно Live:</label>
+                    <select id="bits-span" onchange="reloadBits(true)">
+                        <option value="15 мин">15 мин</option>
+                        <option value="1 час">1 час</option>
+                        <option value="4 часа">4 часа</option>
+                        <option value="12 часов">12 часов</option>
+                        <option value="24 часа" selected>24 часа</option>
+                        <option value="72 часа">72 часа</option>
+                    </select>
+                    <button id="btn-pause-bits" onclick="togglePause('bits')">⏸ Пауза</button>
+                </span>
+                <span id="bits-arch-panel" style="display: none;">
+                    <label>Начало:</label>
+                    <input type="datetime-local" id="bits-arch-start">
+                    <label>Длительность:</label>
+                    <select id="bits-arch-dur">
+                        <option value="15 мин">15 мин</option>
+                        <option value="1 час">1 час</option>
+                        <option value="4 часа">4 часа</option>
+                        <option value="12 часов">12 часов</option>
+                        <option value="24 часа" selected>24 часа</option>
+                        <option value="72 часа">72 часа</option>
+                    </select>
+                    <button onclick="shiftArchive('bits', -1)">◀</button>
+                    <button onclick="shiftArchive('bits', 1)">▶</button>
+                    <button class="btn-load" onclick="reloadBits(true)">📥 Загрузить архив</button>
+                </span>
+                <button id="btn-swap-bits" onclick="toggleBitsSwap()" title="Порядок байт в 16-битном слове: Hi-Lo / Lo-Hi">↕ Hi-Lo</button>
+                <button onclick="resetZoom(bitsChart)">🔍 100%</button>
+            </div>
+            <div class="chart-box" id="uplot-bits"></div>
+            </div>
+        </div>
+
+        <!-- 3. ВКЛАДКА I/O -->
+        <div id="page-io" class="tab-page">
+            <div class="io-left">
+                <div class="io-left-head">
+                    <span class="sidebar-title" style="border:none;padding:6px 0;">Дерево I/O</span>
+                    <button class="mini-btn" onclick="ioRefreshAll()" title="Обновить">⟳</button>
+                </div>
+                <div id="io-tree" class="io-tree"></div>
+                <div class="io-btns">
+                    <button class="btn-add" onclick="ioAddConn()">➕ Модуль</button>
+                    <button class="btn-edit" onclick="ioEditConn()">✏ Модуль</button>
+                    <button class="btn-del" onclick="ioDelConn()">✕ Модуль</button>
+                </div>
+                <div class="io-btns">
+                    <button class="btn-add" onclick="ioAddGroup()">➕ Группа</button>
+                    <button class="btn-edit" onclick="ioRenameGroup()">✏ Группа</button>
+                    <button class="btn-del" onclick="ioDelGroup()">✕ Группа</button>
+                </div>
+                <div class="io-btns">
+                    <button class="btn-teal" onclick="ioExportTree()">📦 Экспорт дерева</button>
+                    <button class="btn-violet" onclick="document.getElementById('io-import-file').click()">📥 Импорт</button>
+                    <input type="file" id="io-import-file" accept=".json" style="display:none" onchange="ioImportTree(this.files[0])">
+                </div>
+                <div id="io-status" class="io-status"></div>
+            </div>
+            <div class="io-right">
+                <div class="io-right-head">
+                    <span id="io-conn-title" class="io-conn-title">Переменные</span>
+                    <div class="io-right-actions">
+                        <button class="btn-action" onclick="ioAddTag()">➕ Переменная</button>
+                        <button class="btn-violet" onclick="ioEditTag()">✏ Изменить</button>
+                        <button class="btn-del" onclick="ioDelTags()">✕ Удалить</button>
+                        <button class="btn-teal" onclick="ioExportCsv()">📤 CSV</button>
+                        <button class="btn-violet" onclick="document.getElementById('io-csv-file').click()">📥 CSV</button>
+                        <input type="file" id="io-csv-file" accept=".csv" style="display:none" onchange="ioImportCsv(this.files[0])">
+                    </div>
+                </div>
+                <div class="io-filter">
+                    <input type="text" id="io-search" placeholder="Поиск по имени / адресу / группе…" oninput="ioRenderTags()">
+                    <span id="io-tag-count" class="io-tag-count"></span>
+                </div>
+                <div class="io-table-wrap">
+                    <table class="io-table" id="io-tag-table"></table>
+                </div>
+            </div>
+        </div>
+
+        <!-- 4. ВКЛАДКА DATABASE -->
+        <div id="page-db" class="tab-page">
+            <div class="db-wrap">
+                <h2>Настройки базы данных и архивации (Data Storage)</h2>
+                <div class="db-card">
+                    <div class="db-row"><label>Движок СУБД (Storage Engine):</label>
+                        <select id="db-engine" onchange="dbOnEngineChanged()">
+                            <option value="postgres">PostgreSQL / TimescaleDB (Сетевая)</option>
+                            <option value="mariadb">MariaDB / MySQL InnoDB (Сетевая)</option>
+                            <option value="sqlite">LocalDB - SQLite (Локальный файл)</option>
+                        </select>
+                    </div>
+                    <div class="db-row db-net"><label>Хост / IP сервера:</label><input type="text" id="db-host" value="localhost"></div>
+                    <div class="db-row db-net"><label>TCP Порт:</label><input type="number" id="db-port" value="5432" min="1" max="65535"></div>
+                    <div class="db-row db-net"><label>Имя базы данных:</label><input type="text" id="db-name" value="pda_data"></div>
+                    <div class="db-row db-net"><label>Пользователь:</label><input type="text" id="db-user" value="postgres"></div>
+                    <div class="db-row db-net"><label>Пароль:</label><input type="password" id="db-pass" value=""></div>
+                    <div class="db-row db-sqlite"><label>Файл базы данных:</label>
+                        <div class="db-sqlite-box"><input type="text" id="db-sqlite-path" value="data/pda_local.db"></div>
+                    </div>
+                    <div class="db-row"><label>Глубина хранения (сутки):</label>
+                        <div class="db-retention"><input type="number" id="db-retention" value="30" min="0" step="1">
+                        <button class="btn-action" onclick="dbApplyRetention()">Применить</button></div>
+                    </div>
+                </div>
+                <div class="db-btns">
+                    <button class="btn-action" onclick="dbTest()">🔌 Проверить подключение</button>
+                    <button class="btn-violet" id="db-btn-create" onclick="dbCreate()">＋ Создать базу</button>
+                    <button class="btn-add" onclick="dbSwitch()">💾 Применить и переключить</button>
+                </div>
+                <div id="db-status-line" class="db-status-line">Статус: готов к подключению</div>
+                <div class="db-card db-status-panel" id="db-panel">
+                    <div id="db-p-db"></div>
+                    <div id="db-p-modules"></div>
+                    <div id="db-p-journal"></div>
+                    <div id="db-p-errors"></div>
+                    <div id="db-p-updated" class="db-updated"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 5. ВКЛАДКА HELP -->
+        <div id="page-help" class="tab-page">
+            <div class="help-wrap" id="help-body"></div>
+        </div>
+    </div>
+
+    <!-- Модальные диалоги (общая подложка) -->
+    <div id="modal-overlay" class="modal-overlay" style="display:none;">
+        <div id="modal-box" class="modal-box"></div>
+    </div>
+    <div id="modal-confirm" class="modal-overlay" style="display:none;">
+        <div class="modal-box modal-box-narrow">
+            <div id="confirm-text" class="confirm-text"></div>
+            <div class="confirm-btns">
+                <button id="confirm-yes" class="btn-action">Да</button>
+                <button id="confirm-no" class="btn-del">Нет</button>
+                <button id="confirm-cancel" class="btn-plain">Отмена</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+    <script src="io.js"></script>
+    <script src="db.js"></script>
+    <script src="help.js"></script>
+</body>
+</html>

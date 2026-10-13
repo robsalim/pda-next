@@ -1,0 +1,18 @@
+[package]
+name = "pda-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Нативная оболочка PDA: окно tao + WebView2 (wry), внутри — тот же pda-server и тот же frontend"
+
+[dependencies]
+pda-core = { path = "../pda-core" }
+pda-server = { path = "../pda-server" }
+
+tokio = { workspace = true }
+axum = { version = "0.7", features = ["ws"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+tao = "0.37"
+wry = "0.57"
