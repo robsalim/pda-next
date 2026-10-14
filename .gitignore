@@ -8,6 +8,9 @@ target/
 .vscode/
 *.swp
 
+# macOS
+.DS_Store
+
 # Локальные данные и артефакты (не для репозитория)
 data/
 dist/

@@ -49,6 +49,7 @@
                     <span id="charts-live-panel">
                         <label>Окно Live:</label>
                         <select id="charts-span" onchange="reloadCharts(true)">
+                            <option value="5 мин">5 мин</option>
                             <option value="15 мин">15 мин</option>
                             <option value="1 час">1 час</option>
                             <option value="4 часа">4 часа</option>
@@ -56,7 +57,7 @@
                             <option value="24 часа" selected>24 часа</option>
                             <option value="72 часа">72 часа</option>
                         </select>
-                        <button id="btn-pause-charts" onclick="togglePause('charts')">⏸ Пауза</button>
+                        <button id="btn-pause-charts" class="btn-action" onclick="togglePause('charts')">⏸ Пауза</button>
                     </span>
 
                     <span id="charts-arch-panel" style="display: none;">
@@ -64,6 +65,7 @@
                         <input type="datetime-local" id="charts-arch-start">
                         <label>Длительность:</label>
                         <select id="charts-arch-dur">
+                            <option value="5 мин">5 мин</option>
                             <option value="15 мин">15 мин</option>
                             <option value="1 час">1 час</option>
                             <option value="4 часа">4 часа</option>
@@ -71,16 +73,17 @@
                             <option value="24 часа" selected>24 часа</option>
                             <option value="72 часа">72 часа</option>
                         </select>
-                        <button onclick="shiftArchive('charts', -1)">◀</button>
-                        <button onclick="shiftArchive('charts', 1)">▶</button>
+                        <button class="btn-action" onclick="shiftArchive('charts', -1)">◀</button>
+                        <button class="btn-action" onclick="shiftArchive('charts', 1)">▶</button>
                         <button class="btn-load" onclick="reloadCharts(true)">📥 Загрузить архив</button>
                     </span>
 
-                    <button onclick="resetZoom(getActiveWindow()?.chart)">🔍 100%</button>
-                    <button onclick="clearCharts()">✕ Очистить</button>
+                    <button class="btn-action" onclick="resetZoom(getActiveWindow()?.chart)">🔍 100%</button>
+                    <button class="btn-action" onclick="clearCharts()">✕ Очистить</button>
+                    <button class="btn-teal" onclick="exportActiveChartPng()" title="Сохранить активное окно графика как PNG">🖼 PNG</button>
                 </div>
                 <div class="windows-toolbar">
-                    <button onclick="addChartWindow()">＋ Добавить график</button>
+                    <button class="btn-add" onclick="addChartWindow()">＋ Добавить график</button>
                 </div>
                 <div class="chart-windows" id="chart-windows"></div>
             </div>
@@ -105,6 +108,7 @@
                 <span id="bits-live-panel">
                     <label>Окно Live:</label>
                     <select id="bits-span" onchange="reloadBits(true)">
+                        <option value="5 мин">5 мин</option>
                         <option value="15 мин">15 мин</option>
                         <option value="1 час">1 час</option>
                         <option value="4 часа">4 часа</option>
@@ -112,13 +116,14 @@
                         <option value="24 часа" selected>24 часа</option>
                         <option value="72 часа">72 часа</option>
                     </select>
-                    <button id="btn-pause-bits" onclick="togglePause('bits')">⏸ Пауза</button>
+                    <button id="btn-pause-bits" class="btn-action" onclick="togglePause('bits')">⏸ Пауза</button>
                 </span>
                 <span id="bits-arch-panel" style="display: none;">
                     <label>Начало:</label>
                     <input type="datetime-local" id="bits-arch-start">
                     <label>Длительность:</label>
                     <select id="bits-arch-dur">
+                        <option value="5 мин">5 мин</option>
                         <option value="15 мин">15 мин</option>
                         <option value="1 час">1 час</option>
                         <option value="4 часа">4 часа</option>
@@ -126,12 +131,12 @@
                         <option value="24 часа" selected>24 часа</option>
                         <option value="72 часа">72 часа</option>
                     </select>
-                    <button onclick="shiftArchive('bits', -1)">◀</button>
-                    <button onclick="shiftArchive('bits', 1)">▶</button>
+                    <button class="btn-action" onclick="shiftArchive('bits', -1)">◀</button>
+                    <button class="btn-action" onclick="shiftArchive('bits', 1)">▶</button>
                     <button class="btn-load" onclick="reloadBits(true)">📥 Загрузить архив</button>
                 </span>
-                <button id="btn-swap-bits" onclick="toggleBitsSwap()" title="Порядок байт в 16-битном слове: Hi-Lo / Lo-Hi">↕ Hi-Lo</button>
-                <button onclick="resetZoom(bitsChart)">🔍 100%</button>
+                <button id="btn-swap-bits" class="btn-action" onclick="toggleBitsSwap()" title="Порядок байт в 16-битном слове: Hi-Lo (старший байт первым, как отдаёт Siemens) / Lo-Hi (байты меняются местами)">↕ Hi-Lo</button>
+                <button class="btn-action" onclick="resetZoom(bitsChart)">🔍 100%</button>
             </div>
             <div class="chart-box" id="uplot-bits"></div>
             </div>
@@ -146,8 +151,9 @@
                 </div>
                 <div id="io-tree" class="io-tree"></div>
                 <div class="io-btns">
-                    <button class="btn-add" onclick="ioAddConn()">➕ Модуль</button>
-                    <button class="btn-edit" onclick="ioEditConn()">✏ Модуль</button>
+                    <button class="btn-add" onclick="ioAddConn()" title="Создать новый модуль (подключение)">➕ Модуль</button>
+                    <button class="btn-action" onclick="ioRestartConn()" title="Перезапустить драйвер выбранного модуля">⟳ Перезапустить</button>
+                    <button class="btn-violet" onclick="ioEditConn()">✏ Модуль</button>
                     <button class="btn-del" onclick="ioDelConn()">✕ Модуль</button>
                 </div>
                 <div class="io-btns">
@@ -168,6 +174,7 @@
                     <div class="io-right-actions">
                         <button class="btn-action" onclick="ioAddTag()">➕ Переменная</button>
                         <button class="btn-violet" onclick="ioEditTag()">✏ Изменить</button>
+                        <button class="btn-add" onclick="ioCopyTag()" title="Дублировать выбранную переменную со сдвигом имени и адреса">⎘ Копировать</button>
                         <button class="btn-del" onclick="ioDelTags()">✕ Удалить</button>
                         <button class="btn-teal" onclick="ioExportCsv()">📤 CSV</button>
                         <button class="btn-violet" onclick="document.getElementById('io-csv-file').click()">📥 CSV</button>
@@ -175,7 +182,12 @@
                     </div>
                 </div>
                 <div class="io-filter">
-                    <input type="text" id="io-search" placeholder="Поиск по имени / адресу / группе…" oninput="ioRenderTags()">
+                    <input type="text" id="io-search" placeholder="Поиск по имени / адресу / группе / типу…" oninput="ioRenderTags()">
+                    <select id="io-filter-mode" onchange="ioRenderTags()">
+                        <option value="all">Все переменные</option>
+                        <option value="changed">Изменившиеся</option>
+                        <option value="fav">Избранные</option>
+                    </select>
                     <span id="io-tag-count" class="io-tag-count"></span>
                 </div>
                 <div class="io-table-wrap">

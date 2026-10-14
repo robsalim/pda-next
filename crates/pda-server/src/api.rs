@@ -39,12 +39,16 @@ impl From<pda_core::database::db_service::DbError> for ApiError {
 
 // ---------------------------------------------------------------- утилиты
 
-/// Разбор текстового окна ("15 мин", "1 час", ...) — копия parse_span из
-/// web_server.py, порядок проверок сохранён один в один.
+/// Разбор текстового окна ("5 мин", "15 мин", "1 час", ...) по образцу
+/// _parse_span_text из десктопного chart_widget.py. «15 мин» проверяется
+/// раньше «5 мин» (в Python подстрока «5» есть в «15» — не копируем этот баг).
 pub fn parse_span_ms(text: &str) -> i64 {
     let t = text.trim();
     if t.contains("15") && t.contains("мин") {
         return 15 * 60_000;
+    }
+    if t.contains("5") && t.contains("мин") {
+        return 5 * 60_000;
     }
     if t.contains("1") && t.contains("час") && !t.contains("12") {
         return 3_600_000;
@@ -393,6 +397,22 @@ pub async fn delete_tags(State(core): State<Arc<AppCore>>, Json(b): Json<IdsBody
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(serde::Deserialize)]
+pub struct MoveTagsBody {
+    pub ids: Vec<i64>,
+    pub target_connection_id: i64,
+    #[serde(default)]
+    pub target_group: String,
+}
+
+/// Перенос переменных в другую группу/модуль (drag&drop дерева I/O).
+pub async fn move_tags(State(core): State<Arc<AppCore>>, Json(b): Json<MoveTagsBody>) -> ApiResult<Json<Value>> {
+    let db = core.db_snapshot().await;
+    db.move_tags(&b.ids, b.target_connection_id, &b.target_group).await?;
+    core.manager.read().await.reload_tags().await;
+    Ok(Json(json!({ "ok": true })))
+}
+
 // ---------------------------------------------------------------- справочник драйверов
 
 /// Типы драйверов + подписи + подсказки адресов (конструкторы IO-вкладки).
@@ -525,6 +545,7 @@ pub fn router(core: Arc<AppCore>) -> Router {
         .route("/tags", get(tags).post(add_tag))
         .route("/tags/:id", put(update_tag))
         .route("/tags/delete", post(delete_tags))
+        .route("/tags/move", post(move_tags))
         .route("/points/:tag_id", get(points))
         .route("/archive/:tag_id", get(archive))
         .route("/live", get(live))

@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use rusqlite::{params, Connection};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_postgres::types as pg_types;
 
 use super::super::models::{Connection as ConnModel, DataPoint, Engine, Tag};
 use super::collector::Record;
@@ -149,6 +150,9 @@ pub trait DbConfigStore: Send + Sync {
         self.delete_tags(&[tag_id]).await
     }
     async fn delete_tags(&self, tag_ids: &[i64]) -> DbResult<()>;
+    /// Перенос переменных в другую группу/модуль (drag&drop в дереве I/O,
+    /// аналог move_tags_to_group из io_widget.py).
+    async fn move_tags(&self, tag_ids: &[i64], target_conn_id: i64, target_group: &str) -> DbResult<()>;
     async fn get_groups_by_connection(&self, conn_id: i64) -> DbResult<Vec<String>>;
     async fn add_group(&self, conn_id: i64, name: &str) -> DbResult<()>;
     async fn rename_group(&self, conn_id: i64, old_name: &str, new_name: &str) -> DbResult<()>;
@@ -487,8 +491,8 @@ fn tag_from_irow(r: &rusqlite::Row) -> rusqlite::Result<Tag> {
 
 fn tag_from_prow(r: &tokio_postgres::Row) -> Tag {
     Tag {
-        id: r.get(0),
-        connection_id: r.get(1),
+        id: r.get::<_, i32>(0) as i64,
+        connection_id: r.get::<_, i32>(1) as i64,
         name: r.get(2),
         address_str: r.get(3),
         data_type: r.get(4),
@@ -496,7 +500,7 @@ fn tag_from_prow(r: &tokio_postgres::Row) -> Tag {
         offset_val: r.get::<_, Option<f64>>(6).unwrap_or(0.0),
         unit: r.get::<_, Option<String>>(7).unwrap_or_default(),
         group_name: r.get::<_, Option<String>>(8).unwrap_or_else(|| "Общие".into()),
-        log_interval_ms: r.get::<_, Option<i32>>(9).unwrap_or(1000) as i64,
+        log_interval_ms: r.get::<_, i32>(9) as i64,
         deadband: r.get::<_, Option<f64>>(10).unwrap_or(0.0),
     }
 }
@@ -524,7 +528,7 @@ fn conn_from_prow(r: &tokio_postgres::Row) -> ConnModel {
         .try_get::<_, serde_json::Value>(5)
         .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
     ConnModel {
-        id: r.get(0),
+        id: r.get::<_, i32>(0) as i64,
         name: r.get(1),
         driver_type: crate::drivers::registry::normalize_driver_type(r.get(2)),
         enabled: r.get::<_, bool>(3),
@@ -664,9 +668,9 @@ impl DbConfigStore for DatabaseService {
     }
 
     async fn add_connection(&self, conn: &ConnModel) -> DbResult<i64> {
-        let cfg_json = serde_json::to_string(&conn.config).map_err(|e| e.to_string())?;
         match self.be()? {
             Backend::Sqlite(lock) => {
+                let cfg_json = serde_json::to_string(&conn.config).map_err(|e| e.to_string())?;
                 let conn_db = lock.lock().await;
                 conn_db
                     .execute(
@@ -680,8 +684,8 @@ impl DbConfigStore for DatabaseService {
                 let c = lock.lock().await;
                 let id: i32 = c
                     .query_one(
-                        "INSERT INTO connections (name, driver_type, enabled, poll_interval_ms, config) VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id;",
-                        &[&conn.name, &conn.driver_type, &conn.enabled, &(conn.poll_interval_ms as i32), &cfg_json],
+                        "INSERT INTO connections (name, driver_type, enabled, poll_interval_ms, config) VALUES ($1, $2, $3, $4, $5) RETURNING id;",
+                        &[&conn.name, &conn.driver_type, &conn.enabled, &(conn.poll_interval_ms as i32), &pg_types::Json(&conn.config)],
                     )
                     .await
                     .map_err(|e| e.to_string())?
@@ -692,9 +696,9 @@ impl DbConfigStore for DatabaseService {
     }
 
     async fn update_connection(&self, conn: &ConnModel) -> DbResult<()> {
-        let cfg_json = serde_json::to_string(&conn.config).map_err(|e| e.to_string())?;
         match self.be()? {
             Backend::Sqlite(lock) => {
+                let cfg_json = serde_json::to_string(&conn.config).map_err(|e| e.to_string())?;
                 let c = lock.lock().await;
                 c.execute(
                     "UPDATE connections SET name = ?1, driver_type = ?2, enabled = ?3, poll_interval_ms = ?4, config = ?5 WHERE id = ?6;",
@@ -705,8 +709,8 @@ impl DbConfigStore for DatabaseService {
             Backend::Postgres(lock) => {
                 let c = lock.lock().await;
                 c.execute(
-                    "UPDATE connections SET name = $1, driver_type = $2, enabled = $3, poll_interval_ms = $4, config = $5::jsonb WHERE id = $6;",
-                    &[&conn.name, &conn.driver_type, &conn.enabled, &(conn.poll_interval_ms as i32), &cfg_json, &(conn.id as i32)],
+                    "UPDATE connections SET name = $1, driver_type = $2, enabled = $3, poll_interval_ms = $4, config = $5 WHERE id = $6;",
+                    &[&conn.name, &conn.driver_type, &conn.enabled, &(conn.poll_interval_ms as i32), &pg_types::Json(&conn.config), &(conn.id as i32)],
                 )
                 .await
                 .map_err(|e| e.to_string())?;
@@ -952,6 +956,57 @@ impl DbConfigStore for DatabaseService {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Пакетный перенос тегов в другую группу/подключение (drag&drop дерева I/O).
+    async fn move_tags(&self, tag_ids: &[i64], target_conn_id: i64, target_group: &str) -> DbResult<()> {
+        let mut ids: Vec<i64> = Vec::new();
+        for id in tag_ids {
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let group = if target_group.is_empty() { "Общие" } else { target_group };
+        match self.be()? {
+            Backend::Sqlite(lock) => {
+                let conn = lock.lock().await;
+                for chunk in chunks(&ids, 500) {
+                    let marks = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+                    let mut stmt = conn
+                        .prepare_cached(&format!(
+                            "UPDATE tags SET group_name = ?1, connection_id = ?2 WHERE id IN ({marks});"
+                        ))
+                        .map_err(|e| e.to_string())?;
+                    let mut pv: Vec<&dyn rusqlite::types::ToSql> = vec![&group, &target_conn_id];
+                    pv.extend(chunk.iter().map(|i| i as &dyn rusqlite::types::ToSql));
+                    stmt.execute(rusqlite::params_from_iter(pv.iter())).map_err(|e| e.to_string())?;
+                }
+            }
+            Backend::Postgres(lock) => {
+                let c = lock.lock().await;
+                for chunk in chunks(&ids, 500) {
+                    let marks = (0..chunk.len()).map(|i| format!("${}", i + 3)).collect::<Vec<_>>().join(", ");
+                    let target = target_conn_id as i32;
+                    let int_ids: Vec<i32> = chunk.iter().map(|i| *i as i32).collect();
+                    let mut refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                        vec![&group, &target];
+                    refs.extend(int_ids.iter().map(|i| i as &(dyn tokio_postgres::types::ToSql + Sync)));
+                    c.execute(
+                        &format!("UPDATE tags SET group_name = $1, connection_id = $2 WHERE id IN ({marks});"),
+                        &refs[..],
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        // Группа должна быть объявлена у целевого модуля, чтобы дерево показывало её
+        // даже после переноса последнего тега из неё в другую.
+        self.add_group(target_conn_id, group).await?;
         Ok(())
     }
 

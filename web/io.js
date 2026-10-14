@@ -1,6 +1,5 @@
 // Вкладка I/O: дерево модулей/групп, таблица тегов (live), диалоги подключения
 // и переменной с конструкторами адресов, экспорт/импорт дерева и CSV.
-// Поведение перенесено из python_app/ui/io_widget.py.
 
 let ioConns = [];            // /api/connections
 let ioStatus = {};           // drivers_json по conn_id
@@ -10,6 +9,14 @@ let ioSelConn = null;        // id выбранного подключения
 let ioSelGroup = null;       // имя выбранной группы
 let ioSelTagId = null;       // id выбранного тега (для «Изменить»)
 let ioChecked = new Set();   // отмеченные строки (массовое удаление)
+
+// Избранное и «изменившиеся» переменные (аналог TagTableModel.favorites/_recent
+// из tag_table_model.py: окно «свежего изменения» 2.5 с). Избранное на вебе
+// дополнительно переживает перезагрузку страницы через localStorage.
+const IO_RECENT_WINDOW_MS = 2500;
+let ioFavorites = new Set(JSON.parse(localStorage.getItem('pda_io_fav') || '[]'));
+let ioRecent = new Map();     // tag_id -> время последнего изменения значения
+let ioLastValues = new Map(); // tag_id -> последнее виденное значение
 
 function ioStatusLine(text, isError = false) {
     const el = document.getElementById('io-status');
@@ -74,7 +81,9 @@ function ioRenderTree() {
     let html = '';
     for (const c of ioConns) {
         const selConn = c.id === ioSelConn ? ' selected' : '';
-        html += `<div class="io-conn${selConn}" onclick="ioSelectConn(${c.id})">
+        // Модуль — тоже цель для drop (теги уезжают в группу «Общие», как в десктопе)
+        html += `<div class="io-conn${selConn}" data-conn="${c.id}" data-group="Общие"
+            onclick="ioSelectConn(${c.id})">
             <span class="dot ${ioDotClass(c.id)}"></span>
             <span class="io-conn-name">🔌 ${escHtml(c.name)}</span>
             <span class="io-drv">${escHtml(c.driver_type)}${c.enabled ? '' : ' · выкл'}</span>
@@ -84,10 +93,52 @@ function ioRenderTree() {
         for (const g of groups) {
             const n = ioTags.filter(t => (t.group_name || 'Общие') === g).length;
             const selG = g === ioSelGroup ? ' selected' : '';
-            html += `<div class="io-group${selG}" onclick="ioSelectGroup('${escAttr(g)}')">📁 ${escHtml(g)} <span class="io-gcount">(${n})</span></div>`;
+            html += `<div class="io-group${selG}" data-conn="${c.id}" data-group="${escAttr(g)}"
+                onclick="ioSelectGroup('${escAttr(g)}')">📁 ${escHtml(g)} <span class="io-gcount">(${n})</span></div>`;
         }
     }
     root.innerHTML = html;
+    ioBindTreeDrops(root);
+}
+
+// Drag&drop строк таблицы на узлы дерева (аналог DroppableTreeWidget):
+// target=group|conn, accept-подсветка, drop -> POST /api/tags/move.
+function ioBindTreeDrops(root) {
+    for (const node of root.querySelectorAll('.io-conn[data-conn], .io-group[data-conn]')) {
+        node.addEventListener('dragover', (e) => {
+            if (!ioDragTagIds) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            node.classList.add('drop-target');
+        });
+        node.addEventListener('dragleave', () => node.classList.remove('drop-target'));
+        node.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            node.classList.remove('drop-target');
+            const ids = ioDragTagIds;
+            ioDragTagIds = null;
+            if (!ids || !ids.length) return;
+            const connId = Number(node.dataset.conn);
+            const group = node.dataset.group || 'Общие';
+            try {
+                await apiPost('/api/tags/move', { ids, target_connection_id: connId, target_group: group });
+                ioStatusLine(`Перенесено переменных: ${ids.length} → ${group}`);
+                ioChecked.clear();
+                await ioSelectConn(connId);
+                await fetchTags();
+            } catch (err) { ioStatusLine(`Ошибка переноса: ${err.message}`, true); }
+        });
+    }
+}
+
+function ioRestartConn() {
+    if (!ioSelConn) return ioStatusLine('Сначала выберите модуль', true);
+    const c = ioConns.find(x => x.id === ioSelConn);
+    ioStatusLine(`Перезапуск драйвера «${c.name}»…`);
+    apiPost(`/api/connections/${ioSelConn}/restart`, {}).then(() => {
+        ioStatusLine(`Модуль «${c.name}» перезапущен`);
+        setTimeout(ioRefreshAll, 300);
+    }).catch(e => ioStatusLine(`Ошибка: ${e.message}`, true));
 }
 function escAttr(s) { return String(s).replace(/'/g, "\\'").replace(/"/g, '&quot;'); }
 
@@ -100,32 +151,76 @@ function ioSelectGroup(g) {
 // ------------------------------------------------------------------ таблица
 const IO_COLS = ['ID', 'Name', 'Группа', 'Address', 'Type', 'Scale', 'Offset', 'Unit', 'Value', 'Time'];
 let ioSortCol = null, ioSortDir = 1;
+let ioSelRows = new Set();    // выделенные строки (клик/Ctrl/Shift, как QTableView)
+let ioLastRow = null;         // якорь для shift-диапазона
+let ioDragTagIds = null;      // id, тащимые в данный момент на дерево
+let ioVisIds = [];            // id видимых строк текущего рендера
 
-function ioRenderTags() {
-    const table = document.getElementById('io-tag-table');
+// Избранное: сохранённый набор id (localStorage), переживает перезагрузку.
+function ioSaveFavorites() {
+    localStorage.setItem('pda_io_fav', JSON.stringify([...ioFavorites]));
+}
+function ioToggleFavorite(id) {
+    if (ioFavorites.has(id)) ioFavorites.delete(id); else ioFavorites.add(id);
+    ioSaveFavorites();
+    ioRenderTags();
+}
+
+// Отслеживание «изменившихся» значений (TagTableModel.apply_updates):
+// значение изменилось или появилось впервые -> tag в _recent на 2.5 с.
+function ioTrackRecent() {
+    const now = Date.now();
+    for (const [id, row] of liveRows) {
+        const prev = ioLastValues.get(id);
+        if (row.value != null && (prev === undefined || prev !== row.value)) {
+            ioLastValues.set(id, row.value);
+            ioRecent.set(id, now);
+        } else if (row.value != null) {
+            ioLastValues.set(id, row.value);
+        }
+    }
+    const cutoff = now - IO_RECENT_WINDOW_MS;
+    for (const [id, t] of ioRecent) if (t < cutoff) ioRecent.delete(id);
+}
+
+function ioVisibleTags() {
     let tags = ioTags.slice();
     if (ioSelGroup) tags = tags.filter(t => (t.group_name || 'Общие') === ioSelGroup);
+    const mode = (document.getElementById('io-filter-mode') || {}).value || 'all';
+    if (mode === 'changed') tags = tags.filter(t => ioRecent.has(t.id));
+    if (mode === 'fav') tags = tags.filter(t => ioFavorites.has(t.id));
+    // Поиск как TagFilterModel: имя + адрес + группа + тип + единицы
     const q = (document.getElementById('io-search').value || '').trim().toLowerCase();
-    if (q) tags = tags.filter(t =>
-        (t.name || '').toLowerCase().includes(q) ||
-        (t.address_str || '').toLowerCase().includes(q) ||
-        (t.group_name || '').toLowerCase().includes(q));
+    if (q) tags = tags.filter(t => [t.name, t.address_str, t.group_name || '', t.data_type, t.unit || '']
+        .join(' ').toLowerCase().includes(q));
     if (ioSortCol != null) {
         tags.sort((a, b) => String(a[ioSortCol] ?? '').localeCompare(String(b[ioSortCol] ?? ''), undefined, { numeric: true }) * ioSortDir);
     }
+    return tags;
+}
+
+function ioRenderTags() {
+    const table = document.getElementById('io-tag-table');
+    const tags = ioVisibleTags();
+    const visIds = tags.map(t => t.id);
 
     let html = `<thead><tr>` + IO_COLS.map(c => `<th onclick="ioSort('${c}')">${c}${ioSortCol === c ? (ioSortDir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('') + `</tr></thead><tbody>`;
     for (const t of tags) {
         const lv = liveRows.get(t.id);
         const checked = ioChecked.has(t.id) ? ' checked' : '';
-        const sel = t.id === ioSelTagId ? ' selected' : '';
+        const sel = ioSelRows.has(t.id) ? ' selected' : '';
+        const fav = ioFavorites.has(t.id);
+        const changed = ioRecent.has(t.id);
         const valCell = lv
             ? `<span class="${lv.quality === 0 ? 'v-good' : 'v-bad'}">${fmtLiveVal(lv.value)}</span>`
             : `<span style="color:var(--text-faint)">—</span>`;
         const timeCell = lv && lv.timestamp ? formatTime(lv.timestamp) : '';
-        html += `<tr class="${sel.trim()}" ondblclick="ioEditTag(${t.id})">
+        html += `<tr class="${sel.trim()}${changed ? ' changed' : ''}${fav ? ' fav' : ''}" draggable="true"
+            data-id="${t.id}" onmousedown="ioRowClick(event, ${t.id})"
+            ondblclick="ioEditTag(${t.id})" oncontextmenu="ioRowMenu(event, ${t.id})"
+            ondragstart="ioRowDragStart(event, ${t.id})">
             <td>${t.id}</td>
-            <td><input type="checkbox"${checked} onclick="ioToggleCheck(${t.id}, this.checked); event.stopPropagation();"> ${escHtml(t.name)}</td>
+            <td><input type="checkbox"${checked} onclick="ioToggleCheck(${t.id}, this.checked); event.stopPropagation();"> ${fav ? '★ ' : ''}${escHtml(t.name)}</td>
             <td>${escHtml(t.group_name || 'Общие')}</td>
             <td>${escHtml(t.address_str)}</td>
             <td>${escHtml(t.data_type)}</td>
@@ -135,6 +230,77 @@ function ioRenderTags() {
     html += `</tbody>`;
     table.innerHTML = html;
     document.getElementById('io-tag-count').textContent = `${tags.length} из ${ioTags.length}`;
+    ioVisIds = visIds;
+}
+
+// Выделение строк как в QTableView (ExtendedSelection): клик / Ctrl / Shift.
+// Подсветка обновляется без перерисовки таблицы — иначе dblclick по строке
+// не дожил бы до второго клика (DOM-узел был бы заменён на mousedown).
+function ioRowClick(event, id) {
+    if (event.target.tagName === 'INPUT') return;
+    if (event.ctrlKey || event.metaKey) {
+        ioSelRows.has(id) ? ioSelRows.delete(id) : ioSelRows.add(id);
+    } else if (event.shiftKey && ioLastRow != null) {
+        const a = ioVisIds.indexOf(ioLastRow), b = ioVisIds.indexOf(id);
+        if (a >= 0 && b >= 0) for (let i = Math.min(a, b); i <= Math.max(a, b); i++) ioSelRows.add(ioVisIds[i]);
+    } else {
+        ioSelRows = new Set([id]);
+    }
+    ioLastRow = id;
+    ioSelTagId = id;
+    ioApplySelection();
+}
+
+function ioApplySelection() {
+    const tbody = document.querySelector('#io-tag-table tbody');
+    if (!tbody) return;
+    for (const tr of tbody.rows) {
+        tr.classList.toggle('selected', ioSelRows.has(Number(tr.dataset.id)));
+    }
+}
+
+function ioRowDragStart(event, id) {
+    // Перетаскиваем все выделенные (десктоп: selectedRows)
+    const ids = ioSelRows.has(id) ? [...ioSelRows] : [id];
+    ioDragTagIds = ids;
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', ids.join(','));
+}
+
+// Контекстное меню строки: избранное (как TagTableView.contextMenuEvent)
+// + быстрые действия для выделенных переменных.
+function ioRowMenu(event, id) {
+    event.preventDefault();
+    if (!ioSelRows.has(id)) { ioSelRows = new Set([id]); ioSelTagId = id; ioLastRow = id; ioApplySelection(); }
+    ioCloseCtxMenu();
+    const t = ioTags.find(x => x.id === id);
+    if (!t) return;
+    const menu = document.createElement('div');
+    menu.className = 'ctx-menu';
+    menu.id = 'io-ctx-menu';
+    const fav = ioFavorites.has(id);
+    const items = [
+        [fav ? '★ Убрать из избранного' : '☆ В избранное', () => ioToggleFavorite(id)],
+        ['⎘ Копировать (сдвиг имени/адреса)', () => ioCopyTag(id)],
+        ['✏ Изменить', () => ioEditTag(id)],
+        ['📊 На график', () => addSignal(id)],
+    ];
+    items.forEach(([label, fn]) => {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.onclick = () => { ioCloseCtxMenu(); fn(); };
+        menu.appendChild(b);
+    });
+    document.body.appendChild(menu);
+    const x = Math.min(event.clientX, window.innerWidth - menu.offsetWidth - 4);
+    const y = Math.min(event.clientY, window.innerHeight - menu.offsetHeight - 4);
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+    setTimeout(() => document.addEventListener('mousedown', ioCloseCtxMenu, { once: true }), 0);
+}
+
+function ioCloseCtxMenu() {
+    document.getElementById('io-ctx-menu')?.remove();
 }
 
 function ioSort(col) {
@@ -152,9 +318,23 @@ function fmtLiveVal(v) {
 // live-обновление только значений в таблице (без полной перерисовки DOM)
 onLiveUpdate(() => {
     if (activeTab !== 'io') return;
+    ioTrackRecent();
     ioRenderTags();
     ioRenderTree(); // статусы драйверов могли измениться
 });
+
+// Как prune_recent + dataChanged на таймере в io_widget.py: подсветка
+// «изменившиеся» гаснет через окно 2.5 с, фильтр «changed» обновляется сам.
+setInterval(() => {
+    if (activeTab !== 'io') return;
+    if (ioRecent.size && ioTrackRecentChanged()) ioRenderTags();
+}, 500);
+
+function ioTrackRecentChanged() {
+    const before = ioRecent.size;
+    ioTrackRecent();
+    return ioRecent.size !== before;
+}
 
 // ------------------------------------------------------------------ модуль
 function ioConnForm(conn) {
@@ -456,6 +636,90 @@ async function ioDelTags() {
     if (await confirmBox(`Удалить ${ids.length} переменн. (сигналы)?`) !== true) return;
     try { await apiPost('/api/tags/delete', { ids }); ioChecked.clear(); ioSelTagId = null; await ioSelectConn(ioSelConn); await fetchTags(); }
     catch (e) { ioStatusLine(`Ошибка: ${e.message}`, true); }
+}
+
+// ------------------------------------------------------------------ копирование переменной
+// Порт _next_name / _next_address / _copy_last_tag из io_widget.py.
+
+// 'DB3.DBW0' -> 'DB3.DBW01', 'Feed2' -> 'Feed3'; следующий свободный хвост.
+function ioNextName(base, taken) {
+    const m = /(\d+)$/.exec(base || '');
+    const stem = m ? base.slice(0, m.index) : (base || '');
+    let nxt = m ? parseInt(m[1], 10) + 1 : 1;
+    let name = `${stem}${nxt}`;
+    while (taken.has(name)) { nxt += 1; name = `${stem}${nxt}`; }
+    return name;
+}
+
+// Следующий элемент того же типа: Modbus — целочисленный регистр (+1,
+// у FLOAT две ячейки); S7 — смещение на размер чтения (DB1.DBW4 -> DB1.DBW6,
+// VW100 -> VW102, бит -> следующий).
+function ioNextAddress(address, dataType) {
+    const addr = (address || '').trim();
+    const up = dataType.toUpperCase();
+
+    // Modbus с областью: C7 -> C8, DI15 -> DI16, HR100(FLOAT) -> HR102.
+    const mb = parseModbus(addr);
+    const isNumeric = !!addr.replace(/^-/, '').match(/^\d+$/);
+    if (mb && (!isNumeric || mb.area !== 'HR')) {
+        const isBit = ['C', 'DI'].includes(mb.area);
+        const step = isBit ? 1 : (up === 'FLOAT' ? 2 : 1);
+        // Явный префикс сохраняем; канонический числовой HR — остаётся числом.
+        const explicit = /^[a-z]/i.test(addr) || addr.toLowerCase().includes('x');
+        if (mb.area === 'HR' && !explicit) return String(mb.offset + step);
+        return `${mb.area}${mb.offset + step}`;
+    }
+
+    if (addr.replace(/^-/, '').match(/^\d+$/)) {
+        const step = up === 'FLOAT' ? 2 : 1;
+        return String(parseInt(addr, 10) + step);
+    }
+
+    // S7: DB1.DBW4 / DB1.DBX0.0 / MW230 / VW100 / V100.3 / M3.4 / SM0.0
+    const norm = addr.toUpperCase().replace(/%/g, '').replace(/ /g, '');
+    const m = /^(?:DB(\d+)\.DB([WBXD])(\d+)|([MVIEQ]|SM)([WBXD]?)(\d+))(?:\.(\d+))?$/.exec(norm);
+    if (!m) return addr;
+    const bitRaw = m[7];
+    let bit = parseInt(bitRaw || '0', 10);
+    let sizeLetter = m[2] || m[5] || ({ FLOAT: 'D', DWORD: 'D', BOOL: 'X', BYTE: 'B' }[up] || 'W');
+    if (bitRaw != null) sizeLetter = 'X';
+    const byteLen = { W: 2, B: 1, D: 4, X: 1 }[sizeLetter];
+
+    if (sizeLetter === 'X') {
+        if (bit < 7) return addr.slice(0, addr.length - 1) + String(bit + 1);
+        bit = 0;
+    }
+
+    if (m[1]) { // форма DB<n>.DBx<offset>
+        const prefix = `DB${m[1]}.DB${sizeLetter}${parseInt(m[3], 10) + byteLen}`;
+        return sizeLetter === 'X' ? `${prefix}.${bit}` : prefix;
+    }
+
+    // форма <область><размер><смещение> (M, I, Q, SM, V — без буквы X у бита)
+    const area = m[4];
+    if (sizeLetter === 'X') return `${area}${parseInt(m[6], 10) + byteLen}.${bit}`;
+    return `${area}${sizeLetter}${parseInt(m[6], 10) + byteLen}`;
+}
+
+async function ioCopyTag(id) {
+    if (!ioSelConn) return ioStatusLine('Сначала выберите модуль подключения', true);
+    const source = ioTags.find(t => t.id === (id != null ? id : ioSelTagId)) || ioTags[ioTags.length - 1];
+    if (!source) return ioStatusLine('В текущем списке нет ни одной переменной', true);
+    const taken = new Set(ioTags.map(t => t.name));
+    const body = {
+        id: 0, connection_id: ioSelConn,
+        name: ioNextName(source.name, taken),
+        address_str: ioNextAddress(source.address_str, source.data_type),
+        data_type: source.data_type,
+        scale: source.scale, offset_val: source.offset_val, unit: source.unit,
+        group_name: source.group_name || 'Общие',
+        log_interval_ms: source.log_interval_ms ?? 1000, deadband: source.deadband ?? 0.0,
+    };
+    try {
+        await apiPost('/api/tags', body);
+        ioSelTagId = null; ioSelRows.clear();
+        await ioSelectConn(ioSelConn); await fetchTags();
+    } catch (e) { ioStatusLine(`Не удалось создать копию: ${e.message}`, true); }
 }
 
 // ------------------------------------------------------------------ экспорт/импорт дерева

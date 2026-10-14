@@ -248,6 +248,9 @@ mod tests {
         async fn delete_tags(&self, _ids: &[i64]) -> DbResult<()> {
             Ok(())
         }
+        async fn move_tags(&self, _ids: &[i64], _c: i64, _g: &str) -> DbResult<()> {
+            Ok(())
+        }
         async fn get_groups_by_connection(&self, _id: i64) -> DbResult<Vec<String>> {
             Ok(vec![])
         }

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 /// Значения по умолчанию для DB_CONFIG (PostgreSQL).
 pub fn db_config_default() -> HashMap<String, serde_json::Value> {
     let mut m = HashMap::new();
-    m.insert("dbname".into(), serde_json::json!("pda_data"));
+    m.insert("dbname".into(), serde_json::json!("pda_next"));
     m.insert("user".into(), serde_json::json!("postgres"));
     m.insert("password".into(), serde_json::json!("25052015"));
     m.insert("host".into(), serde_json::json!("localhost"));
@@ -15,7 +15,7 @@ pub fn db_config_default() -> HashMap<String, serde_json::Value> {
 }
 
 pub const DEFAULT_MODBUS_SERVER_PORT: u16 = 502;
-pub const WEB_HOST: &str = "0.0.0.0";
+pub const WEB_HOST: &str = "127.0.0.1";
 pub const WEB_PORT: u16 = 8082;
 pub const APP_NAME: &str = "PDA Next";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");

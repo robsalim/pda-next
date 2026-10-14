@@ -323,3 +323,56 @@ async fn frontend_assets_served() {
     h.stop().await;
     let _ = h.tmp.path();
 }
+
+/// parse_span_ms: все подписи окон из комбобоксов десктопа,
+/// «15 мин» не должен разбираться как «5 мин».
+#[test]
+fn parse_span_ms_spans() {
+    assert_eq!(api::parse_span_ms("5 мин"), 5 * 60_000);
+    assert_eq!(api::parse_span_ms("15 мин"), 15 * 60_000);
+    assert_eq!(api::parse_span_ms("1 час"), 3_600_000);
+    assert_eq!(api::parse_span_ms("4 часа"), 4 * 3_600_000);
+    assert_eq!(api::parse_span_ms("12 часов"), 12 * 3_600_000);
+    assert_eq!(api::parse_span_ms("24 часа"), 24 * 3_600_000);
+    assert_eq!(api::parse_span_ms("72 часа"), 72 * 3_600_000);
+    assert_eq!(api::parse_span_ms("что-то другое"), 3_600_000, "дефолт 1 час, как в Python");
+}
+
+/// Drag&drop перенос переменных: группа/модуль меняются в БД,
+/// целевая группа объявляется автоматически, драйверы перезагружаются.
+#[tokio::test(flavor = "multi_thread")]
+async fn move_tags_between_groups() {
+    let h = Harness::start().await;
+
+    let c1 = h.post_json("/api/connections", json!({
+        "name": "MOVE A", "driver_type": "modbus_client", "enabled": false,
+        "poll_interval_ms": 200, "config": {"ip": "127.0.0.1", "port": 15020}
+    })).await["id"].as_i64().unwrap();
+    let c2 = h.post_json("/api/connections", json!({
+        "name": "MOVE B", "driver_type": "modbus_client", "enabled": false,
+        "poll_interval_ms": 200, "config": {"ip": "127.0.0.1", "port": 15021}
+    })).await["id"].as_i64().unwrap();
+
+    let t1 = h.post_json("/api/tags", json!({
+        "id": 0, "connection_id": c1, "name": "mv_1", "address_str": "HR10", "data_type": "UINT16",
+        "scale": 1.0, "offset_val": 0.0, "unit": "", "group_name": "Старая",
+        "log_interval_ms": 1000, "deadband": 0.0
+    })).await["id"].as_i64().unwrap();
+
+    // Перенос в другую группу того же модуля
+    h.post_json("/api/tags/move", json!({ "ids": [t1], "target_connection_id": c1, "target_group": "Новая" })).await;
+    let groups = h.get_json(&format!("/api/connections/{c1}/groups")).await;
+    let names: Vec<&str> = groups["groups"].as_array().unwrap().iter().map(|g| g.as_str().unwrap()).collect();
+    assert!(names.contains(&"Новая"), "целевая группа объявлена: {names:?}");
+    let tags = h.get_json(&format!("/api/connections/{c1}/tags")).await;
+    assert_eq!(tags.as_array().unwrap()[0]["group_name"], json!("Новая"));
+
+    // Перенос в другой модуль
+    h.post_json("/api/tags/move", json!({ "ids": [t1], "target_connection_id": c2, "target_group": "Общие" })).await;
+    let moved = h.get_json(&format!("/api/connections/{c2}/tags")).await;
+    assert_eq!(moved.as_array().unwrap().len(), 1, "тег переехал в модуль B");
+    assert_eq!(moved.as_array().unwrap()[0]["name"], json!("mv_1"));
+
+    h.stop().await;
+    let _ = h.tmp.path();
+}

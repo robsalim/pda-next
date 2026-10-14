@@ -1,5 +1,5 @@
 // Единый frontend PDA: Charts + Bits (uPlot), статус, live-WS, модальные диалоги.
-// Логика графиков перенесена из Python-версии (web/index.html) один в один.
+// Логика графиков: Charts + Bits (uPlot), live-трансляция, курсоры X1/X2/ΔT.
 
 // ---------------------------------------------------------------- API helpers
 async function apiGet(path) {
@@ -30,8 +30,11 @@ let mainChart = null;
 let chartWindows = [];
 let activeWindowId = null;
 let bitsChart = null;
-let cursorX1 = null;
-let cursorX2 = null;
+// Курсоры X1/X2 независимы для каждого графика: живут в win.cursors
+// (окна Charts) и bitsCursors (вкладка Bits). Панель в шапке показывает
+// курсоры активного графика.
+function makeCursors() { return { x1: null, x2: null }; }
+let bitsCursors = makeCursors();
 let chartsPaused = false;
 let bitsPaused = false;
 let userZoomedCharts = false;
@@ -58,7 +61,7 @@ function toggleTheme() {
     updateThemeButton();
     chartWindows.forEach(w => rebuildChartWindow(w, false));
     if (bitsChart) reloadBits(false);
-    updateCursorPanel();
+    refreshHeaderCursors();
 }
 
 function initDateTimeInputs() {
@@ -78,24 +81,34 @@ function onModeChange(tab) {
 }
 
 function togglePause(tab) {
+    // Как в десктопе: на паузе кнопка подсвечивается зелёным «add»-чипсом
     if (tab === 'charts') {
         chartsPaused = !chartsPaused;
-        document.getElementById('btn-pause-charts').innerText = chartsPaused ? '▶ Продолжить' : '⏸ Пауза';
+        const btn = document.getElementById('btn-pause-charts');
+        btn.innerText = chartsPaused ? '▶ Продолжить' : '⏸ Пауза';
+        btn.classList.toggle('btn-add', chartsPaused);
+        btn.classList.toggle('btn-action', !chartsPaused);
         if (!chartsPaused) reloadCharts(false);
     } else {
         bitsPaused = !bitsPaused;
-        document.getElementById('btn-pause-bits').innerText = bitsPaused ? '▶ Продолжить' : '⏸ Пауза';
+        const btn = document.getElementById('btn-pause-bits');
+        btn.innerText = bitsPaused ? '▶ Продолжить' : '⏸ Пауза';
+        btn.classList.toggle('btn-add', bitsPaused);
+        btn.classList.toggle('btn-action', !bitsPaused);
         if (!bitsPaused) reloadBits(false);
     }
 }
 
+// Разбор подписи окна: полный цикл «15 мин» проверяем раньше «5 мин»,
+// «12/24/72 часа» раньше «1 час».
 function getDurationMs(text) {
     if (text.includes('15') && text.includes('мин')) return 15 * 60 * 1000;
-    if (text.includes('1') && text.includes('час') && !text.includes('12')) return 3600 * 1000;
-    if (text.includes('4') && text.includes('час') && !text.includes('24')) return 4 * 3600 * 1000;
+    if (text.includes('5') && text.includes('мин')) return 5 * 60 * 1000;
     if (text.includes('12')) return 12 * 3600 * 1000;
-    if (text.includes('72')) return 72 * 3600 * 1000;
     if (text.includes('24')) return 24 * 3600 * 1000;
+    if (text.includes('72')) return 72 * 3600 * 1000;
+    if (text.includes('4') && text.includes('час')) return 4 * 3600 * 1000;
+    if (text.includes('1') && text.includes('час')) return 3600 * 1000;
     return 24 * 3600 * 1000;
 }
 
@@ -110,7 +123,16 @@ function shiftArchive(tab, dir) {
     else reloadBits(true);
 }
 
-function wheelZoomPlugin(chartType) {
+// курсоры этого графика обновляют шапку только если график активен
+function refreshHeaderCursors() {
+    if (activeTab === 'bits') updateCursorPanel(bitsCursors);
+    else {
+        const win = getActiveWindow();
+        updateCursorPanel(win ? win.cursors : null);
+    }
+}
+
+function wheelZoomPlugin(chartType, cursors) {
     return {
         hooks: {
             ready: u => {
@@ -129,25 +151,69 @@ function wheelZoomPlugin(chartType) {
                     u.setScale("x", { min: left - ratio * nextDelta, max: left + (1 - ratio) * nextDelta });
                 });
                 plot.addEventListener("dblclick", () => resetZoom(u));
+
+                // Перетаскивание курсоров X1/X2 (аналог movable InfiniteLine из chart_widget.py).
+                // Capture-слушатель на u.root срабатывает ДО обработчика uPlot на .u-over:
+                // если мышь рядом с линией курсора, гасим rubber-band zoom и тащим курсор сами.
+                let dragCursor = null;   // 'x1' | 'x2'
+                let suppressClick = false;
+                const nearCursor = (px) => {
+                    for (const name of ['x1', 'x2']) {
+                        const cx = cursors[name];
+                        if (cx == null) continue;
+                        if (Math.abs(u.valToPos(cx, 'x', true) - px) <= 6) return name;
+                    }
+                    return null;
+                };
+                u.root.addEventListener("mousedown", e => {
+                    const rect = plot.getBoundingClientRect();
+                    if (!rect.contains(e.clientX, e.clientY)) return;
+                    // Перетаскивание возможно только за свою линию: ЛКМ — X1, ПКМ — X2
+                    const near = nearCursor(e.clientX - rect.left);
+                    dragCursor = ((e.button === 0 && near === 'x1') || (e.button === 2 && near === 'x2')) ? near : null;
+                    if (!dragCursor) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    suppressClick = true;
+                    document.body.style.userSelect = 'none';
+                }, true);
+                window.addEventListener("mousemove", e => {
+                    if (!dragCursor) return;
+                    const left = e.clientX - plot.getBoundingClientRect().left;
+                    cursors[dragCursor] = u.posToVal(left, "x");
+                    refreshHeaderCursors();
+                    u.redraw();
+                });
+                window.addEventListener("mouseup", () => {
+                    if (!dragCursor) return;
+                    dragCursor = null;
+                    document.body.style.userSelect = '';
+                    // click после mouseup может не прийти (отпустили вне plot) —
+                    // снимаем флаг, чтобы он не «съел» следующий обычный клик
+                    setTimeout(() => { suppressClick = false; }, 0);
+                });
+
+                // ЛКМ -> X1, ПКМ -> X2 (на каждом графике свои)
                 plot.addEventListener("click", e => {
-                    let valX = u.posToVal(e.clientX - plot.getBoundingClientRect().left, "x");
-                    if (e.ctrlKey || e.shiftKey) cursorX2 = valX;
-                    else cursorX1 = valX;
-                    updateCursorPanel();
+                    if (suppressClick) { suppressClick = false; return; }
+                    cursors.x1 = u.posToVal(e.clientX - plot.getBoundingClientRect().left, "x");
+                    refreshHeaderCursors();
                     u.redraw();
                 });
                 plot.addEventListener("contextmenu", e => {
                     e.preventDefault();
-                    cursorX2 = u.posToVal(e.clientX - plot.getBoundingClientRect().left, "x");
-                    updateCursorPanel();
+                    cursors.x2 = u.posToVal(e.clientX - plot.getBoundingClientRect().left, "x");
+                    refreshHeaderCursors();
                     u.redraw();
                 });
             },
             draw: u => {
+                // У каждого графика свои курсоры (cursors из замыкания) —
+                // линии видны на всех окнах одновременно и не связаны между собой.
                 let ctx = u.ctx, top = u.bbox.top, height = u.bbox.height;
                 ctx.save();
                 const tc = themeColors();
-                for (const [cx, lbl, color] of [[cursorX1, 'X1', tc.x1], [cursorX2, 'X2', tc.x2]]) {
+                for (const [cx, lbl, color] of [[cursors.x1, 'X1', tc.x1], [cursors.x2, 'X2', tc.x2]]) {
                     if (cx == null) continue;
                     let xPos = u.valToPos(cx, "x", true);
                     if (xPos >= u.bbox.left && xPos <= u.bbox.left + u.bbox.width) {
@@ -160,6 +226,16 @@ function wheelZoomPlugin(chartType) {
             }
         }
     };
+}
+
+// Инициализация курсоров на 5%/95% диапазона (как cursor_x1/x2 setValue в update_data(force_fit)).
+// Каждый график получает свои значения независимо.
+function initCursorsFromRange(cursors, tMin, tMax, forceFit) {
+    if (cursors.x1 == null || cursors.x2 == null || forceFit) {
+        const span = tMax - tMin;
+        cursors.x1 = tMin + span * 0.05;
+        cursors.x2 = tMax - span * 0.05;
+    }
 }
 
 function resetZoom(u) {
@@ -175,11 +251,12 @@ function formatTime(sec) {
     return `${String(d.getDate()).padStart(2,'0')}.${String(d.getMonth()+1).padStart(2,'0')} ${d.toTimeString().split(' ')[0]}.${String(d.getMilliseconds()).padStart(3, '0')}`;
 }
 
-function updateCursorPanel() {
-    document.getElementById("lbl-x1").innerText = "X1: " + (cursorX1 ? formatTime(cursorX1) : "—");
-    document.getElementById("lbl-x2").innerText = "X2: " + (cursorX2 ? formatTime(cursorX2) : "—");
-    if (cursorX1 && cursorX2) {
-        let dt = Math.abs(cursorX2 - cursorX1);
+function updateCursorPanel(cursors) {
+    const c = cursors || { x1: null, x2: null };
+    document.getElementById("lbl-x1").innerText = "X1: " + (c.x1 ? formatTime(c.x1) : "—");
+    document.getElementById("lbl-x2").innerText = "X2: " + (c.x2 ? formatTime(c.x2) : "—");
+    if (c.x1 && c.x2) {
+        let dt = Math.abs(c.x2 - c.x1);
         let totalSec = Math.floor(dt);
         let ms = Math.floor((dt - totalSec) * 1000);
         let hh = Math.floor(totalSec / 3600);
@@ -201,8 +278,10 @@ function switchTab(name) {
     document.getElementById(`page-${name}`).classList.add('active');
     activeTab = name;
     if (name === 'charts') {
+        refreshHeaderCursors();
         setTimeout(() => { if (mainChart) resizeChart(mainChart, getActiveWindow()); }, 50);
     } else if (name === 'bits') {
+        updateCursorPanel(bitsCursors);
         setTimeout(() => {
             if (bitsChart) resizeBits();
             else reloadBits(true);
@@ -288,6 +367,7 @@ function selectBitsTag(tagId) {
     bitsSelectedId = tagId;
     const t = allTags.find(x => x.id === tagId);
     document.getElementById('bits-current').innerText = `Регистр: ${t ? `${t.name} (${t.data_type})` : '—'}`;
+    updateBitsSwapButton();
     reloadBits(true);
 }
 
@@ -315,19 +395,52 @@ function addChartWindow() {
     const box = document.createElement('div');
     box.className = 'chart-window';
     box.dataset.windowId = id;
-    box.innerHTML = `<button class="window-close" onclick="removeChartWindow(${id}); event.stopPropagation();">×</button><div class="chart-box"><div class="chart-legend" style="display:none;"></div></div>`;
+    box.innerHTML = `<button class="window-close" onclick="removeChartWindow(${id}); event.stopPropagation();">×</button>` +
+        `<div class="chart-box"><div class="chart-legend" style="display:none;"></div></div>` +
+        `<div class="resize-handle" title="Потяните за нижний край, чтобы изменить высоту окна"></div>`;
     box.addEventListener('click', () => selectChartWindow(id));
     box.addEventListener('dragover', event => { event.preventDefault(); box.classList.add('drop-target'); });
     box.addEventListener('dragleave', () => box.classList.remove('drop-target'));
     box.addEventListener('drop', event => { event.preventDefault(); box.classList.remove('drop-target'); selectChartWindow(id); const tagId = Number(event.dataTransfer.getData('text/plain')); if (tagId) addSignal(tagId); });
+    attachResizeHandle(box);
+    const win = { id, signals: [], chart: null, zoomed: false, cursors: makeCursors() };
+    // ResizeObserver (аналог live-ресайза Qt-виджета): uPlot перерисовывается
+    // при любой смене размеров контейнера — ручка ресайза, сворачивание панелей, окно браузера.
+    const ro = new ResizeObserver(() => resizeChart(win.chart, win));
+    ro.observe(box.querySelector('.chart-box'));
+    win.resizeObserver = ro;
     document.getElementById('chart-windows').appendChild(box);
-    chartWindows.push({ id, signals: [], chart: null, zoomed: false });
+    chartWindows.push(win);
     selectChartWindow(id);
+}
+
+// Ресайз окна графика за нижнюю ручку: min-height 260px как в ChartWidget (chart_widget.py).
+function attachResizeHandle(winBox) {
+    const handle = winBox.querySelector('.resize-handle');
+    handle.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const startY = e.clientY;
+        const startH = winBox.offsetHeight;
+        winBox.classList.add('resizing');
+        const onMove = (ev) => {
+            winBox.style.height = `${Math.max(260, startH + (ev.clientY - startY))}px`;
+        };
+        const onUp = () => {
+            winBox.classList.remove('resizing');
+            window.removeEventListener('mousemove', onMove);
+            window.removeEventListener('mouseup', onUp);
+        };
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+    });
 }
 
 function selectChartWindow(id) {
     activeWindowId = id;
     document.querySelectorAll('.chart-window').forEach(box => box.classList.toggle('active', Number(box.dataset.windowId) === id));
+    // Курсоры у каждого окна свои — в шапке показываем значения активного окна.
+    if (activeTab === 'charts') refreshHeaderCursors();
 }
 
 function removeChartWindow(id) {
@@ -335,6 +448,7 @@ function removeChartWindow(id) {
     const index = chartWindows.findIndex(w => w.id === id);
     if (index < 0) return;
     chartWindows[index].chart?.destroy();
+    chartWindows[index].resizeObserver?.disconnect();
     document.querySelector(`.chart-window[data-window-id="${id}"]`)?.remove();
     chartWindows.splice(index, 1);
     if (activeWindowId === id) selectChartWindow(chartWindows[Math.max(0, index - 1)].id);
@@ -411,15 +525,25 @@ function renderLegend(win, legend) {
 }
 
 async function reloadCharts(forceFit = false) {
+    const isArchive = document.getElementById('charts-mode').value === 'Archive';
+    const emptySignals = [];
     for (const win of chartWindows) {
         if (forceFit) win.zoomed = false;
         for (const s of win.signals) {
             try {
                 const data = await apiGet(getChartsUrl(s.tag.id));
                 if (data.times && data.times.length > 0) Object.assign(s, { times: data.times, values: data.values, t_start: data.t_start, t_end: data.t_end });
-            } catch (e) {}
+                else emptySignals.push(s.tag.name);
+            } catch (e) { if (isArchive && forceFit) emptySignals.push(s.tag.name); }
         }
         rebuildChartWindow(win, forceFit);
+    }
+    // Раньше пустой ответ молча оставлял на экране старый график («тишина»).
+    // Теперь при явной загрузке архива говорим, что данных в окне нет.
+    if (isArchive && forceFit && emptySignals.length) {
+        const start = document.getElementById('charts-arch-start').value;
+        const dur = document.getElementById('charts-arch-dur').value;
+        alertBox('Архив', `Нет данных за период ${start} + ${dur}\nСигналы: ${emptySignals.join(', ')}`);
     }
 }
 
@@ -442,17 +566,19 @@ function rebuildChartWindow(win, forceFit = false) {
     });
     const tMin = win.signals[0].t_start || baseTimes[0];
     const tMax = win.signals[0].t_end || baseTimes[baseTimes.length - 1];
+    const fit = !win.zoomed || forceFit;
+    if (fit) initCursorsFromRange(win.cursors, tMin, tMax, forceFit);
     const tc = themeColors();
     const opts = {
         width: box.clientWidth || 1000, height: box.clientHeight || 400,
-        scales: { x: { time: true, min: (!win.zoomed || forceFit) ? tMin : undefined, max: (!win.zoomed || forceFit) ? tMax : undefined } },
-        plugins: [wheelZoomPlugin('charts')],
+        scales: { x: { time: true, min: fit ? tMin : undefined, max: fit ? tMax : undefined } },
+        plugins: [wheelZoomPlugin('charts', win.cursors)],
         axes: [{ stroke: tc.axis, grid: { stroke: tc.grid } }, { stroke: tc.axis, grid: { stroke: tc.grid } }],
         series, cursor: { drag: { x: true, y: false } }
     };
     win.chart = new uPlot(opts, data, box);
     bindLegendValues(win, win.chart);
-    if (win.id === activeWindowId) mainChart = win.chart;
+    if (win.id === activeWindowId) { mainChart = win.chart; refreshHeaderCursors(); }
 }
 
 // ---------------------------------------------------------------- BITS
@@ -465,7 +591,15 @@ function toggleBitsSwap() {
 
 function updateBitsSwapButton() {
     const btn = document.getElementById('btn-swap-bits');
-    if (btn) btn.innerText = bitsByteSwap ? '↕ Lo-Hi' : '↕ Hi-Lo';
+    if (!btn) return;
+    btn.innerText = bitsByteSwap ? '↕ Lo-Hi' : '↕ Hi-Lo';
+    // Как в bits_widget.py: swap актуален только для 16-битных слов (INT16/UINT16),
+    // для BYTE кнопка неактивна; включённый swap подсвечивается зелёным «add»-чипсом.
+    const tag = allTags.find(x => x.id === bitsSelectedId);
+    const isByte = !!tag && (tag.data_type || '').toUpperCase() === 'BYTE';
+    btn.disabled = isByte;
+    btn.classList.toggle('btn-add', bitsByteSwap && !isByte);
+    btn.classList.toggle('btn-action', !bitsByteSwap || isByte);
 }
 
 function getBitsUrl(tagId) {
@@ -513,6 +647,8 @@ async function reloadBits(forceFit = false) {
 
     let tMin = payload.t_start || payload.times[0];
     let tMax = payload.t_end || payload.times[payload.times.length - 1];
+    const fit = !userZoomedBits || forceFit;
+    if (fit) initCursorsFromRange(bitsCursors, tMin, tMax, forceFit);
     const tc = themeColors();
     const opts = {
         width: box.clientWidth || 1200, height: box.clientHeight || 600,
@@ -520,7 +656,7 @@ async function reloadBits(forceFit = false) {
             x: { time: true, min: (!userZoomedBits || forceFit) ? tMin : undefined, max: (!userZoomedBits || forceFit) ? tMax : undefined },
             y: { min: -0.5, max: nBits + 0.5 }
         },
-        plugins: [wheelZoomPlugin('bits')],
+        plugins: [wheelZoomPlugin('bits', bitsCursors)],
         axes: [
             { stroke: tc.axis, grid: { stroke: tc.grid } },
             { stroke: tc.axis, grid: { stroke: tc.grid }, values: () => [], size: 90 }
@@ -529,6 +665,33 @@ async function reloadBits(forceFit = false) {
         series, cursor: { drag: { x: true, y: false } }
     };
     bitsChart = new uPlot(opts, data, box);
+    if (activeTab === 'bits') updateCursorPanel(bitsCursors);
+}
+
+// Экспорт активного окна графика в PNG (аналог «Сохранить как изображение» из десктопа).
+// Chromium/WebView2 блокируют скачивание по data:URL (toDataURL + a.click = тишина),
+// поэтому используем Blob + URL.createObjectURL — как в downloadFile из io.js.
+// Файл уходит в папку «Загрузки» без диалога (политика WebView2), поэтому
+// показываем подтверждение.
+function exportActiveChartPng() {
+    const win = getActiveWindow();
+    if (!win || !win.chart || !win.signals.length) {
+        alertBox('Экспорт PNG', 'На активном графике нет сигналов');
+        return;
+    }
+    const name = `pda_chart_${Date.now()}.png`;
+    win.chart.canvas.toBlob(blob => {
+        if (!blob) { alertBox('Экспорт PNG', 'Не удалось сформировать изображение', true); return; }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+        alertBox('Экспорт PNG', `Файл сохранен в папку «Загрузки»: ${name}`);
+    }, 'image/png');
 }
 
 function drawBitsTickLabels(self, nBits) {
@@ -555,6 +718,8 @@ function resizeBits() {
         bitsChart.setSize({ width: box.clientWidth, height: box.clientHeight });
     }
 }
+
+new ResizeObserver(resizeBits).observe(document.getElementById('uplot-bits'));
 
 function resizeChart(chartInstance, win) {
     const root = win && document.querySelector(`.chart-window[data-window-id="${win.id}"]`);
@@ -650,7 +815,7 @@ function alertBox(title, message, isError = false) {
 }
 
 // ---------------------------------------------------------------- live-обновление
-// Python-версия опрашивала /api/points каждые 1000 мс — сохраняем тот же ритм.
+// Каждые 1000 мс опрашиваем /api/points для обновления статус-панели.
 setInterval(async () => {
     const isChartsActive = document.getElementById('page-charts').classList.contains('active');
     const isBitsActive = document.getElementById('page-bits').classList.contains('active');
