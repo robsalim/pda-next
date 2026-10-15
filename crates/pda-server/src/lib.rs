@@ -35,6 +35,21 @@ pub fn web_root() -> String {
     "web".into()
 }
 
+/// Каталог для сохранённых изображений графиков: «Загрузки» пользователя,
+/// как при скачивании браузером. Если домашнюю папку определить не удалось,
+/// кладём рядом с exe в ./exports — путь всегда возвращается клиенту.
+pub fn exports_dir() -> PathBuf {
+    let home = if cfg!(windows) {
+        std::env::var("USERPROFILE").ok()
+    } else {
+        std::env::var("HOME").ok()
+    };
+    match home {
+        Some(h) if !h.is_empty() => PathBuf::from(h).join("Downloads"),
+        _ => exe_dir().join("exports"),
+    }
+}
+
 /// db_config.json: рядом с exe, в cwd, в rust_pda/ или в python_app/ (dev).
 /// Отсутствующий файл означает SQLite по умолчанию — как в Python-версии.
 /// Возвращает конфиг и путь, откуда он прочитан (для /api/db/switch).

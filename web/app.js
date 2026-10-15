@@ -679,30 +679,52 @@ async function reloadBits(forceFit = false) {
     if (activeTab === 'bits') updateCursorPanel(bitsCursors);
 }
 
-// Экспорт активного окна графика в PNG (аналог «Сохранить как изображение» из десктопа).
-// Chromium/WebView2 блокируют скачивание по data:URL (toDataURL + a.click = тишина),
-// поэтому используем Blob + URL.createObjectURL — как в downloadFile из io.js.
-// Файл уходит в папку «Загрузки» без диалога (политика WebView2), поэтому
-// показываем подтверждение.
-function exportActiveChartPng() {
+// Экспорт активного окна графика в PNG (аналог «Сохранить как изображение»).
+// Файл пишет сервер (POST /api/export/png), а не браузер: скачивание через
+// <a download> в WebView2 оболочки pda-desktop молча не доходило до
+// пользователя. Сервер отвечает реальным путём, и мы его показываем.
+async function exportActiveChartPng() {
     const win = getActiveWindow();
     if (!win || !win.chart || !win.signals.length) {
         alertBox('Экспорт PNG', 'На активном графике нет сигналов');
         return;
     }
-    const name = `pda_chart_${Date.now()}.png`;
-    win.chart.canvas.toBlob(blob => {
-        if (!blob) { alertBox('Экспорт PNG', 'Не удалось сформировать изображение', true); return; }
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = name;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 2000);
-        alertBox('Экспорт PNG', `Файл сохранен в папку «Загрузки»: ${name}`);
-    }, 'image/png');
+    try {
+        const blob = await chartPngBlob(win);
+        if (!blob) throw new Error('canvas не вернул изображение');
+        const name = `pda_chart_${exportStamp()}.png`;
+        const r = await fetch(`/api/export/png?name=${encodeURIComponent(name)}`, {
+            method: 'POST', headers: { 'Content-Type': 'image/png' }, body: blob,
+        });
+        const text = await r.text();
+        if (!r.ok) throw new Error(text || `HTTP ${r.status}`);
+        const j = JSON.parse(text);
+        alertBox('Экспорт PNG', `Сохранено (${Math.round(j.bytes / 1024)} КБ):\n${j.path}`);
+    } catch (e) {
+        alertBox('Экспорт PNG', `Не удалось сохранить: ${e.message}`, true);
+    }
+}
+
+// Полотно uPlot прозрачное — без фона темы PNG в просмотрщике выглядел бы
+// как график в никуда. Рисуем поверх цвета --plot-bg текущей темы.
+function chartPngBlob(win) {
+    const src = win.chart.canvas;
+    const out = document.createElement('canvas');
+    out.width = src.width;
+    out.height = src.height;
+    const ctx = out.getContext('2d');
+    const bg = getComputedStyle(document.body).getPropertyValue('--plot-bg').trim() || '#181818';
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, out.width, out.height);
+    ctx.drawImage(src, 0, 0);
+    return new Promise(resolve => out.toBlob(b => resolve(b), 'image/png'));
+}
+
+// Имя вида pda_chart_20261015_141302.png — сервер оставляет в нём только
+// безопасные символы и дописывает .png.
+function exportStamp() {
+    const d = new Date(), p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
 function drawBitsTickLabels(self, nBits) {

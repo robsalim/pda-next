@@ -538,6 +538,82 @@ pub async fn db_switch(State(core): State<Arc<AppCore>>, Json(b): Json<DbSwitchB
     Ok(Json(json!({ "ok": true })))
 }
 
+// ---------------------------------------------------------------- экспорт PNG
+
+/// Сигнатура PNG-файла — проверяем, чтобы в каталог выгрузки не записался мусор.
+const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+
+/// Разумный предел: график 4K в PNG весит единицы мегабайт.
+const MAX_PNG_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(serde::Deserialize)]
+pub struct ExportNameQuery {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Разделители пути: обратный слэш через unicode-escape, чтобы не зависеть
+/// от экранирования в исходнике.
+const SEPARATORS: [char; 2] = ['/', '\u{5c}'];
+
+/// Безопасное имя файла для сохранения: вырезается путь (в том числе с
+/// обратным слэшем), остаются только латиница/цифры/._-, расширение всегда .png.
+fn safe_export_name(raw: Option<&str>) -> String {
+    let base = raw.unwrap_or_default().rsplit(SEPARATORS).next().unwrap_or("");
+    let cleaned: String = base.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).collect();
+    let stem = cleaned.trim_matches('.').trim_end_matches(".png").trim_end_matches(".PNG").trim_matches('.');
+    // Ограничение на длину — чтобы уложиться в MAX_PATH даже во вложенных папках.
+    let stem: String = stem.chars().take(80).collect();
+    if stem.is_empty() {
+        format!("pda_chart_{}.png", chrono::Local::now().format("%Y%m%d_%H%M%S"))
+    } else {
+        format!("{stem}.png")
+    }
+}
+
+/// Не перезаписывать прежний экспорт: chart.png, chart-1.png, chart-2.png...
+fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let stem = name.trim_end_matches(".png");
+    for i in 1..1000 {
+        let candidate = dir.join(format!("{stem}-{i}.png"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    first
+}
+
+/// Сохранить PNG графика на диск и вернуть путь.
+///
+/// Экспорт делает сервер, а не браузер: в WebView2 (оболочка pda-desktop)
+/// скачивание по <a download> молча не доходит до пользователя, поэтому
+/// интерфейс полагаться на него не может. Ответ содержит реальный путь,
+/// который и показывается в сообщении.
+pub async fn export_png(
+    State(core): State<Arc<AppCore>>,
+    Query(q): Query<ExportNameQuery>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<Value>> {
+    if body.len() < PNG_MAGIC.len() || body[..PNG_MAGIC.len()] != PNG_MAGIC {
+        return Err(ApiError("Тело запроса не является PNG (пустое или повреждённое изображение)".into()));
+    }
+    if body.len() > MAX_PNG_BYTES {
+        return Err(ApiError(format!("Изображение слишком большое: {} МБ", body.len() / 1024 / 1024)));
+    }
+    let dir = core.exports_dir.clone();
+    std::fs::create_dir_all(&dir).map_err(|e| ApiError(format!("Не удалось создать каталог {}: {e}", dir.display())))?;
+    let path = unique_path(&dir, &safe_export_name(q.name.as_deref()));
+    // Файл маленький и запись одноразовая по клику — блокирующий write здесь
+    // уместнее, чем отдельная блокирующая задача (как в db_switch).
+    std::fs::write(&path, &body).map_err(|e| ApiError(format!("Не удалось записать {}: {e}", path.display())))?;
+    tracing::info!("PNG сохранён: {} ({} КБ)", path.display(), body.len() / 1024);
+    Ok(Json(json!({ "ok": true, "path": path.to_string_lossy(), "bytes": body.len() })))
+}
+
 // ---------------------------------------------------------------- маршруты
 
 pub fn router(core: Arc<AppCore>) -> Router {
@@ -565,7 +641,11 @@ pub fn router(core: Arc<AppCore>) -> Router {
         .route("/db/test", post(db_test))
         .route("/db/create", post(db_create))
         .route("/db/switch", post(db_switch))
-        .with_state(core.clone());
+        .route("/export/png", post(export_png))
+        .with_state(core.clone())
+        // Лимит тела по умолчанию в axum — 2 МБ, чемтёжный график в PNG может
+        // быть больше. Свой порог (32 МБ) проверяет сам export_png.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_PNG_BYTES));
 
     // Статика фронтенда: web/ рядом с бинарником или rust_pda/web (dev).
     // api — уже Router<()> после with_state, поэтому внешний роутер состояния не требует.

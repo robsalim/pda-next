@@ -225,5 +225,5 @@ table.io-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .modal-hint { font-size: 11px; min-height: 15px; margin: -4px 0 10px 170px; color: var(--hint); }
 .modal-hint.ok { color: var(--ok); } .modal-hint.error { color: var(--error); }
 .modal-btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
-.confirm-text { color: var(--text); margin-bottom: 16px; line-height: 1.5; white-space: pre-wrap; }
+.confirm-text { color: var(--text); margin-bottom: 16px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 .confirm-btns { display: flex; gap: 8px; justify-content: flex-end; }

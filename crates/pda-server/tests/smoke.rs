@@ -14,7 +14,7 @@ use tokio_modbus::prelude::*;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use pda_core::core::tag_registry::QUALITY_GOOD;
-use pda_core::database::db_service::DbConfig;
+use pda_core::database::db_service::{DatabaseService, DbConfig};
 use pda_server::{api, AppCore};
 
 struct Harness {
@@ -23,6 +23,8 @@ struct Harness {
     ws: String,
     http: reqwest::Client,
     tmp: TempDir,
+    /// Каталог экспорта PNG — временный, чтобы тест не писал в «Загрузки».
+    exports: std::path::PathBuf,
 }
 
 impl Harness {
@@ -31,7 +33,9 @@ impl Harness {
         let db_path = tmp.path().join("smoke.db").to_string_lossy().into_owned();
         let cfg = DbConfig { sqlite_path: db_path, ..Default::default() };
 
-        let core = AppCore::from_config(cfg, tmp.path().join("db_config.json")).await;
+        let exports = tmp.path().join("exports");
+        let db = std::sync::Arc::new(DatabaseService::open(cfg).await);
+        let core = AppCore::with_config_and_exports(db, tmp.path().join("db_config.json"), exports.clone());
         assert!(core.db_snapshot().await.is_available, "SQLite-база должна открыться");
         core.spawn_live_pump();
 
@@ -40,7 +44,7 @@ impl Harness {
         let router = api::router(core.clone());
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
-        Self { core, base: format!("http://{addr}"), ws: format!("ws://{addr}/api/live/ws"), http: reqwest::Client::new(), tmp }
+        Self { core, base: format!("http://{addr}"), ws: format!("ws://{addr}/api/live/ws"), http: reqwest::Client::new(), tmp, exports }
     }
 
     async fn stop(&self) {
@@ -372,6 +376,61 @@ async fn move_tags_between_groups() {
     let moved = h.get_json(&format!("/api/connections/{c2}/tags")).await;
     assert_eq!(moved.as_array().unwrap().len(), 1, "тег переехал в модуль B");
     assert_eq!(moved.as_array().unwrap()[0]["name"], json!("mv_1"));
+
+    h.stop().await;
+    let _ = h.tmp.path();
+}
+
+/// Вспомогательная функция для POST-экспорта PNG.
+async fn post_png(h: &Harness, name: &str, body: Vec<u8>) -> reqwest::Response {
+    h.http
+        .post(format!("{}/api/export/png", h.base))
+        .query(&[("name", name)])
+        .header("content-type", "image/png")
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Экспорт PNG: сервер пишет изображение в каталог выгрузки и возвращает путь.
+/// Регрессия на «тихий» экспорт: в WebView2 скачивание через <a download>
+/// не доходило до пользователя, теперь файл создаёт сервер.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_png_writes_file() {
+    let h = Harness::start().await;
+    let png = include_bytes!("fixtures/pixel.png").to_vec();
+
+    // Обычный экспорт: файл на диске, путь в ответе.
+    let v: Value = post_png(&h, "smoke_chart.png", png.clone()).await.json().await.unwrap();
+    let path = std::path::PathBuf::from(v["path"].as_str().unwrap_or_default());
+    assert_eq!(path.file_name().unwrap().to_string_lossy(), "smoke_chart.png", "имя из запроса: {v}");
+    assert_eq!(path.parent().unwrap(), h.exports.as_path(), "файл в каталоге выгрузки: {path:?}");
+    assert_eq!(std::fs::read(&path).unwrap(), png, "байты на диске равны отправленным");
+    assert_eq!(v["bytes"].as_i64(), Some(png.len() as i64));
+
+    // Повторный экспорт не затирает предыдущий.
+    let v2: Value = post_png(&h, "smoke_chart.png", png.clone()).await.json().await.unwrap();
+    let path2 = std::path::PathBuf::from(v2["path"].as_str().unwrap());
+    assert_eq!(path2.file_name().unwrap().to_string_lossy(), "smoke_chart-1.png", "второй файл не перезаписал первый: {v2}");
+    assert_ne!(path2, path);
+
+    // Вредоносное имя: путь и расширение вырезаются, файл остаётся в каталоге выгрузки.
+    let v3: Value = post_png(&h, "../../../windows/system32/evil.exe", png.clone()).await.json().await.unwrap();
+    let path3 = std::path::PathBuf::from(v3["path"].as_str().unwrap());
+    assert_eq!(path3.parent().unwrap(), h.exports.as_path(), "выход за каталог невозможен: {path3:?}");
+    assert!(path3.to_string_lossy().ends_with(".png"), "расширение всегда png: {path3:?}");
+    assert!(!std::path::Path::new(r"C:\windows\system32\evil.exe").exists());
+
+    // Не-PNG отклоняется, файл не создаётся.
+    let bad = post_png(&h, "bad.png", b"not a png".to_vec()).await;
+    assert!(bad.status().is_client_error() || bad.status().is_server_error(), "мусор должен отклоняться");
+    assert_eq!(std::fs::read_dir(&h.exports).unwrap().count(), 3, "отклонённый экспорт ничего не пишет");
+
+    // Имя без имени файла -> разумное значение по умолчанию.
+    let v5: Value = post_png(&h, "", png.clone()).await.json().await.unwrap();
+    let name5 = std::path::PathBuf::from(v5["path"].as_str().unwrap()).file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name5.starts_with("pda_chart_") && name5.ends_with(".png"), "имя по умолчанию: {name5}");
 
     h.stop().await;
     let _ = h.tmp.path();

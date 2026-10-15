@@ -28,6 +28,9 @@ pub struct AppCore {
     /// Куда писать db_config.json при переключении БД (тот же каталог, откуда
     /// читали — аналог поведения Python-приложения на месте запуска).
     pub db_config_path: PathBuf,
+    /// Куда сохранять экспортированные PNG (/api/export/png). По умолчанию
+    /// «Загрузки» пользователя; тесты подменяют на временный каталог.
+    pub exports_dir: PathBuf,
 }
 
 impl AppCore {
@@ -37,10 +40,22 @@ impl AppCore {
     }
 
     pub fn with_config_path(db: Arc<DatabaseService>, db_config_path: PathBuf) -> Arc<Self> {
+        Self::with_config_and_exports(db, db_config_path, crate::exports_dir())
+    }
+
+    /// То же, но с явным каталогом экспорта PNG (тесты пишут во временный).
+    pub fn with_config_and_exports(db: Arc<DatabaseService>, db_config_path: PathBuf, exports_dir: PathBuf) -> Arc<Self> {
         let manager = DriverManager::new(db.clone(), db.clone(), None);
         let registry = manager.registry.clone();
         let (live_tx, _) = broadcast::channel(64);
-        Arc::new(Self { db: RwLock::new(db), registry, manager: RwLock::new(manager), live_tx, db_config_path })
+        Arc::new(Self {
+            db: RwLock::new(db),
+            registry,
+            manager: RwLock::new(manager),
+            live_tx,
+            db_config_path,
+            exports_dir,
+        })
     }
 
     /// Открытие БД из db_config.json и сборка ядра.
