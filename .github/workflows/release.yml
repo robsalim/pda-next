@@ -7,13 +7,22 @@ name: release
 on:
   push:
     tags: ['v*']
-  workflow_dispatch: {}
+  # Ручной запуск: без tag собирает только артефакты (проверка CI),
+  # с tag (например v1.1.1) ещё и публикует GitHub Release. Позволяет
+  # выпустить релиз без пересоздания тега.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег для публикации релиза (например v1.1.1, пусто — только артефакты)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  REL_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
   windows:
@@ -28,14 +37,14 @@ jobs:
       - run: cargo test --release -p pda-core -p pda-server
       - name: Собрать поставку
         run: |
-          $name = "PDA-Next-${{ github.ref_name }}-windows-x64"
+          $name = "PDA-Next-$($env:REL_TAG)-windows-x64"
           $out = "out\$name"
           New-Item -ItemType Directory -Force "$out\web" | Out-Null
           Copy-Item target\release\pda-server.exe "$out\"
           Copy-Item target\release\pda-desktop.exe "$out\"
           Copy-Item target\release\WebView2Loader.dll "$out\"
           Copy-Item web\* "$out\web\" -Recurse
-          "PDA Next ${{ github.ref_name }}`r`n`r`nЗапуск: pda-desktop.exe (окно) или pda-server.exe + браузер на http://127.0.0.1:8082`r`nБаза настраивается файлом db_config.json рядом с exe (без него - SQLite в data/pda_local.db)." | Set-Content "$out\README.txt" -Encoding UTF8
+          "PDA Next $($env:REL_TAG)`r`n`r`nЗапуск: pda-desktop.exe (окно) или pda-server.exe + браузер на http://127.0.0.1:8082`r`nБаза настраивается файлом db_config.json рядом с exe (без него - SQLite в data/pda_local.db)." | Set-Content "$out\README.txt" -Encoding UTF8
           Compress-Archive -Path "$out" -DestinationPath "$name.zip"
       - uses: actions/upload-artifact@v4
         with:
@@ -50,7 +59,7 @@ jobs:
       - run: cargo test --release -p pda-core -p pda-server
       - name: Собрать поставку
         run: |
-          name="PDA-Next-${GITHUB_REF_NAME}-linux-x86_64"
+          name="PDA-Next-${REL_TAG}-linux-x86_64"
           mkdir -p "out/$name/web"
           cp target/release/pda-server "out/$name/"
           cp -r web/. "out/$name/web/"
@@ -91,7 +100,7 @@ jobs:
       - run: cargo build --release -p pda-desktop
       - name: Собрать поставку
         run: |
-          name="PDA-Next-${GITHUB_REF_NAME}-linux-x86_64-desktop"
+          name="PDA-Next-${REL_TAG}-linux-x86_64-desktop"
           mkdir -p "out/$name/web"
           cp target/release/pda-desktop "out/$name/"
           cp -r web/. "out/$name/web/"
@@ -105,7 +114,7 @@ jobs:
 
   release:
     needs: [windows, linux, linux-desktop]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -117,7 +126,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "PDA Next $GITHUB_REF_NAME" \
+          gh release create "$REL_TAG" \
+            --title "PDA Next $REL_TAG" \
             --generate-notes \
             $(find dist -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print)
