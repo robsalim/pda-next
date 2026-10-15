@@ -134,7 +134,14 @@ jobs:
             echo "Нет артефактов для публикации:"; find dist -maxdepth 2; exit 1
           fi
           printf 'Файл релиза: %s\n' "${files[@]}"
-          gh release create "$REL_TAG" \
-            --title "PDA Next $REL_TAG" \
-            --generate-notes \
-            "${files[@]}"
+          # Повторный запуск для уже опубликованного тега допустим: ассеты
+          # перезаписываются (--clobber), заметки не пересоздаём.
+          if gh release view "$REL_TAG" >/dev/null 2>&1; then
+            echo "Релиз $REL_TAG уже есть - обновляю файлы."
+            gh release upload "$REL_TAG" "${files[@]}" --clobber
+          else
+            gh release create "$REL_TAG" \
+              --title "PDA Next $REL_TAG" \
+              --generate-notes \
+              "${files[@]}"
+          fi
