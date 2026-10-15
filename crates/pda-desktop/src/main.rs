@@ -15,9 +15,22 @@ use std::sync::mpsc;
 use pda_core::config::APP_NAME;
 use pda_server::{api, load_db_config, AppCore};
 use tao::event::{Event, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoop};
-use tao::window::WindowBuilder;
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::window::{Theme, WindowBuilder};
 use wry::WebViewBuilder;
+
+/// Событие из webview в событийный цикл окна. Тема страницы живёт в JS
+/// (localStorage), а цвет заголовка окна — нативный, поэтому синхронизация
+/// идёт через IPC: app.js шлёт "theme:dark" / "theme:light".
+#[derive(Debug, Clone, Copy)]
+enum UiEvent {
+    /// true — тёмная тема.
+    Theme(bool),
+}
+
+fn theme_to_ui(dark: bool) -> Theme {
+    if dark { Theme::Dark } else { Theme::Light }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -66,20 +79,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("{APP_NAME} desktop -> {url}");
 
     // --- Окно + WebView2 ---
-    let event_loop = EventLoop::new();
+    // EventLoop типизирован UiEvent: через прокси из IPC-обработчика приходит
+    // смена темы страницы (см. UiEvent). EventLoop::new() умеет только (),
+    // пользовательские события требуют builder.
+    let event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
+    // Тёмная шапка по умолчанию: тема страницы тоже тёмная, если в браузере
+    // ещё не переключали. Дальше тему синхронизирует app.js при загрузке.
     let window = WindowBuilder::new()
         .with_title(APP_NAME)
         .with_inner_size(tao::dpi::LogicalSize::new(1360.0, 860.0))
+        .with_theme(Some(Theme::Dark))
         .build(&event_loop)?;
 
-    let webview = WebViewBuilder::new().with_url(&url).build(&window)?;
+    let proxy = event_loop.create_proxy();
+    let webview = WebViewBuilder::new()
+        .with_url(&url)
+        // Тема страницы переключается в JS, а заголовок окна рисует Windows.
+        // tao сам прокидывает DWMWA_USE_IMMERSIVE_DARK_MODE по set_theme.
+        .with_ipc_handler(move |req| {
+            let dark = !req.body().contains("light");
+            let _ = proxy.send_event(UiEvent::Theme(dark));
+        })
+        .build(&window)?;
 
     event_loop.run(move |event, _, control_flow| {
         // Окно и webview живут всю жизнь цикла событий.
         let _ = (&window, &webview);
         *control_flow = ControlFlow::Wait;
-        if let Event::WindowEvent { event: WindowEvent::CloseRequested, .. } = event {
-            *control_flow = ControlFlow::Exit;
+        match event {
+            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => *control_flow = ControlFlow::Exit,
+            Event::UserEvent(UiEvent::Theme(dark)) => window.set_theme(Some(theme_to_ui(dark))),
+            _ => {}
         }
     });
 }

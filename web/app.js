@@ -55,10 +55,21 @@ function updateThemeButton() {
     const light = document.body.classList.contains('light');
     document.getElementById('btn-theme').innerText = light ? '🌙 Тёмная' : '☀️ Светлая';
 }
+// Нативная шапка окна (WebView2 в pda-desktop) рисуется Windows и сама про
+// тему страницы ничего не знает — иначе над тёмным интерфейсом остаётся
+// светлая полоса заголовка. pda-desktop слушает это сообщение и ставит
+// окну тёмный/светлый режим (tao -> DWMWA_USE_IMMERSIVE_DARK_MODE).
+function syncWindowTheme() {
+    try {
+        if (window.ipc) window.ipc.postMessage(document.body.classList.contains('light') ? 'theme:light' : 'theme:dark');
+    } catch (e) { /* в браузере IPC нет — не ошибка */ }
+}
+
 function toggleTheme() {
     const light = document.body.classList.toggle('light');
     localStorage.setItem('pda_web_theme', light ? 'light' : 'dark');
     updateThemeButton();
+    syncWindowTheme();
     chartWindows.forEach(w => rebuildChartWindow(w, false));
     if (bitsChart) reloadBits(false);
     refreshHeaderCursors();
@@ -834,6 +845,8 @@ setInterval(refreshAppBadge, 5000);
 (async function init() {
     if (localStorage.getItem('pda_web_theme') === 'light') document.body.classList.add('light');
     updateThemeButton();
+    // Шапка окна должна соответствовать теме, выбранной в прошлый раз.
+    syncWindowTheme();
     initDateTimeInputs();
     if (bitsByteSwap) updateBitsSwapButton();
     await fetchTags();
