@@ -50,8 +50,12 @@ async function ioRefreshAll() {
 
 function ioOnTagsChanged() { /* live-обновление таблицы делает onLiveUpdate */ }
 
-async function ioSelectConn(connId) {
+async function ioSelectConn(connId, clearGroup = false) {
     ioSelConn = connId;
+    // Клик по названию модуля = «показать все переменные модуля»: сбрасываем
+    // фильтр по группе. Иначе (как было) таблица оставалась отфильтрованной
+    // по последней выбранной группе и на модуль «нельзя было встать».
+    if (clearGroup) ioSelGroup = null;
     const conn = ioConns.find(c => c.id === connId);
     try {
         const g = await apiGet(`/api/connections/${connId}/groups`);
@@ -60,7 +64,9 @@ async function ioSelectConn(connId) {
     try { ioTags = await apiGet(`/api/connections/${connId}/tags`); }
     catch (e) { ioTags = []; }
     if (ioSelGroup && !ioGroups.includes(ioSelGroup)) ioSelGroup = null;
-    document.getElementById('io-conn-title').textContent = conn ? `Переменные — ${conn.name}` : 'Переменные';
+    document.getElementById('io-conn-title').textContent = conn
+        ? `Переменные — ${conn.name}${ioSelGroup ? ` · ${ioSelGroup}` : ''}`
+        : 'Переменные';
     ioRenderTree();
     ioRenderTags();
 }
@@ -83,7 +89,7 @@ function ioRenderTree() {
         const selConn = c.id === ioSelConn ? ' selected' : '';
         // Модуль — тоже цель для drop (теги уезжают в группу «Общие», как в десктопе)
         html += `<div class="io-conn${selConn}" data-conn="${c.id}" data-group="Общие"
-            onclick="ioSelectConn(${c.id})">
+            onclick="ioSelectConn(${c.id}, true)">
             <span class="dot ${ioDotClass(c.id)}"></span>
             <span class="io-conn-name">🔌 ${escHtml(c.name)}</span>
             <span class="io-drv">${escHtml(c.driver_type)}${c.enabled ? '' : ' · выкл'}</span>

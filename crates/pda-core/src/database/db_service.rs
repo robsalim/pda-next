@@ -582,22 +582,25 @@ impl DbWriter for DatabaseService {
                 // Один запрос на пачку.
                 let mut sql =
                     String::from("INSERT INTO data_points (\"timestamp\", tag_id, value, quality) VALUES ");
-                // TIMESTAMPTZ принимает UTC (chrono feature); метку конвертируем
-                // заранее — ссылки в args должны жить до конца запроса.
+                // Колонки: TIMESTAMPTZ, INT, DOUBLE PRECISION, SMALLINT.
+                // tokio-postgres сериализует параметр строго под тип, который ждёт
+                // сервер: i64 принимает только INT8, i32 — только INT4. Без кастов
+                // каждая пачка падала с "error serializing parameter 1" (tag_id i64 -> INT).
                 let utc_times: Vec<DateTime<Utc>> =
                     records.iter().map(|(ts, ..)| ts.with_timezone(&Utc)).collect();
+                let tag_ids: Vec<i32> = records.iter().map(|(_, t, ..)| *t as i32).collect();
+                let qualities: Vec<i16> = records.iter().map(|(_, _, _, q)| *q as i16).collect();
                 let mut args: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::with_capacity(records.len() * 4);
-                for (i, (ts, tag_id, value, quality)) in records.iter().enumerate() {
-                    let _ = ts;
+                for (i, (_, _, value, _)) in records.iter().enumerate() {
                     if i > 0 {
                         sql.push_str(", ");
                     }
                     let base = i * 4;
                     sql.push_str(&format!("(${}, ${}, ${}, ${})", base + 1, base + 2, base + 3, base + 4));
                     args.push(&utc_times[i]);
-                    args.push(tag_id);
+                    args.push(&tag_ids[i]);
                     args.push(value);
-                    args.push(quality);
+                    args.push(&qualities[i]);
                 }
                 c.execute(&sql, &args).await.map_err(|e| e.to_string())?;
                 Ok(records.len())

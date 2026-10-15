@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // Только Windows+GNU: на Linux у x86_64-unknown-linux-gnu TARGET_ENV тоже
+    // «gnu», поэтому привязка именно к ОС, иначе скрипт искал бы DLL в CI.
+    if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {
+        return;
+    }
     if std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() != "gnu" {
         return;
     }

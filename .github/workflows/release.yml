@@ -1,0 +1,123 @@
+name: release
+
+# Сборка готовых поставок по тегу vX.Y.Z: Windows (server + desktop) и
+# Linux/Debian/Ubuntu (server). Архивы прикрепляются к GitHub Release.
+# Ручной запуск (без релиза) — workflow_dispatch, удобен для проверки CI.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Тот же тулчейин, что в разработке: windows-gnu. webview2-com-sys на GNU
+      # линкуется через импорт-библиотеку, поэтому рядом с exe обязателен
+      # WebView2Loader.dll — его кладёт build.rs pda-desktop.
+      - run: rustup default stable-x86_64-pc-windows-gnu
+      - run: cargo build --release -p pda-server -p pda-desktop
+      - run: cargo test --release -p pda-core -p pda-server
+      - name: Собрать поставку
+        run: |
+          $name = "PDA-Next-${{ github.ref_name }}-windows-x64"
+          $out = "out\$name"
+          New-Item -ItemType Directory -Force "$out\web" | Out-Null
+          Copy-Item target\release\pda-server.exe "$out\"
+          Copy-Item target\release\pda-desktop.exe "$out\"
+          Copy-Item target\release\WebView2Loader.dll "$out\"
+          Copy-Item web\* "$out\web\" -Recurse
+          "PDA Next ${{ github.ref_name }}`r`n`r`nЗапуск: pda-desktop.exe (окно) или pda-server.exe + браузер на http://127.0.0.1:8082`r`nБаза настраивается файлом db_config.json рядом с exe (без него - SQLite в data/pda_local.db)." | Set-Content "$out\README.txt" -Encoding UTF8
+          Compress-Archive -Path "$out" -DestinationPath "$name.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: PDA-Next-*.zip
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release -p pda-server
+      - run: cargo test --release -p pda-core -p pda-server
+      - name: Собрать поставку
+        run: |
+          name="PDA-Next-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir -p "out/$name/web"
+          cp target/release/pda-server "out/$name/"
+          cp -r web/. "out/$name/web/"
+          cat > "out/$name/README.txt" <<'EOF'
+          PDA Next (Linux)
+
+          Установка зависимостей только для клиентских подключений не нужна:
+          бинарник статически слинкован, кроме glibc.
+
+            tar xf PDA-Next-*-linux-x86_64.tar.gz
+            cd PDA-Next-*-linux-x86_64
+            ./pda-server --port 8082
+
+          Дальше открыть в браузере http://<адрес_сервера>:8082
+          Доступ из локальной сети: ./pda-server --host 0.0.0.0 --port 8082
+
+          База настраивается файлом db_config.json рядом с бинарником
+          (без него - SQLite в data/pda_local.db).
+          EOF
+          tar czf "$name.tar.gz" -C out "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: PDA-Next-*.tar.gz
+
+  # Графическая оболочка для Linux: wry поверх webkit2gtk. Отдельная задача с
+  # continue-on-error — если системные пакеты WebKit не дадут собраться,
+  # релиз всё равно выйдет с сервером (основной Linux-сценарий: браузер).
+  linux-desktop:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Системные зависимости WebKitGTK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+      - run: cargo build --release -p pda-desktop
+      - name: Собрать поставку
+        run: |
+          name="PDA-Next-${GITHUB_REF_NAME}-linux-x86_64-desktop"
+          mkdir -p "out/$name/web"
+          cp target/release/pda-desktop "out/$name/"
+          cp -r web/. "out/$name/web/"
+          echo "Требуется WebKitGTK 4.1 (libwebkit2gtk-4.1-1, libgtk-3-0) в системе." > "out/$name/README.txt"
+          tar czf "$name.tar.gz" -C out "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-desktop
+          path: PDA-Next-*desktop.tar.gz
+          if-no-files-found: ignore
+
+  release:
+    needs: [windows, linux, linux-desktop]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          # desktop опционален: отсутствие артефакта не должно ронять релиз
+          fail-on-missing-outputs: false
+      - name: Опубликовать релиз
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "PDA Next $GITHUB_REF_NAME" \
+            --generate-notes \
+            $(find dist -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print)
