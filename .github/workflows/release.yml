@@ -1,7 +1,8 @@
 name: release
 
-# Сборка готовых поставок по тегу vX.Y.Z: Windows (server + desktop) и
-# Linux/Debian/Ubuntu (server). Архивы прикрепляются к GitHub Release.
+# Сборка готовых поставок по тегу vX.Y.Z: Windows (server + desktop),
+# Linux/Debian/Ubuntu (server + desktop) и macOS Intel (server + desktop).
+# Архивы прикрепляются к GitHub Release.
 # Ручной запуск (без релиза) — workflow_dispatch, удобен для проверки CI.
 
 on:
@@ -50,38 +51,6 @@ jobs:
         with:
           name: windows-x64
           path: PDA-Next-*.zip
-  macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Собрать сервер и десктоп
-        run: cargo build --release -p pda-server -p pda-desktop
-      - run: cargo test --release -p pda-core -p pda-server
-      - name: Собрать поставку
-        run: |
-          name="PDA-Next-${REL_TAG}-macos-aarch64"
-          mkdir -p "out/$name/web"
-          cp target/release/pda-server "out/$name/"
-          cp target/release/pda-desktop "out/$name/"
-          cp -r web/. "out/$name/web/"
-          cat > "out/$name/README.txt" <<'EOF'
-          PDA Next (macOS, Apple Silicon)
-
-          Запуск из терминала:
-            ./pda-server --port 8082        # сервер + браузер
-            ./pda-desktop                   # окно приложения
-
-          Или двойным кликом по pda-desktop в Finder (может потребоваться
-          правый клик -> Открыть из-за отсутствия подписи разработчика).
-
-          База настраивается файлом db_config.json рядом с бинарником
-          (без него - SQLite в data/pda_local.db).
-          EOF
-          tar czf "$name.tar.gz" -C out "$name"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-aarch64
-          path: PDA-Next-*.tar.gz
 
   linux:
     runs-on: ubuntu-latest
@@ -144,8 +113,47 @@ jobs:
           path: PDA-Next-*desktop.tar.gz
           if-no-files-found: ignore
 
+  # macOS Intel (x86_64). macos-13 — последний Intel-раннер в GitHub Actions.
+  # wry на macOS использует системный WKWebView, дополнительных пакетов не нужно.
+  # Бинарники без подписи: Gatekeeper блокирует двойной клик, обход —
+  # правый клик -> Открыть (или xattr -d com.apple.quarantine).
+  macos:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - name: Собрать сервер и десктоп
+        run: cargo build --release -p pda-server -p pda-desktop
+      - run: cargo test --release -p pda-core -p pda-server
+      - name: Собрать поставку
+        run: |
+          name="PDA-Next-${REL_TAG}-macos-x86_64"
+          mkdir -p "out/$name/web"
+          cp target/release/pda-server "out/$name/"
+          cp target/release/pda-desktop "out/$name/"
+          cp -r web/. "out/$name/web/"
+          cat > "out/$name/README.txt" <<'EOF'
+          PDA Next (macOS, Intel x86_64)
+
+          Запуск из терминала:
+            ./pda-server --port 8082        # сервер + браузер
+            ./pda-desktop                   # окно приложения
+
+          Или двойным кликом по pda-desktop в Finder. Приложение не подписано,
+          поэтому при первом запуске macOS может показать предупреждение:
+          правый клик по файлу -> Открыть -> Открыть. Альтернатива в терминале:
+            xattr -d com.apple.quarantine pda-desktop
+
+          База настраивается файлом db_config.json рядом с бинарником
+          (без него - SQLite в data/pda_local.db).
+          EOF
+          tar czf "$name.tar.gz" -C out "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-x86_64
+          path: PDA-Next-*.tar.gz
+
   release:
-    needs: [windows, linux, linux-desktop]
+    needs: [windows, linux, linux-desktop, macos]
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -155,7 +163,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-          # desktop опционален: отсутствие артефакта не должно ронять релиз
+          # desktop/macos опциональны: отсутствие артефакта не должно ронять релиз
           fail-on-missing-outputs: false
       - name: Опубликовать релиз
         env:
