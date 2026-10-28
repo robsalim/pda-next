@@ -50,6 +50,38 @@ jobs:
         with:
           name: windows-x64
           path: PDA-Next-*.zip
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Собрать сервер и десктоп
+        run: cargo build --release -p pda-server -p pda-desktop
+      - run: cargo test --release -p pda-core -p pda-server
+      - name: Собрать поставку
+        run: |
+          name="PDA-Next-${REL_TAG}-macos-aarch64"
+          mkdir -p "out/$name/web"
+          cp target/release/pda-server "out/$name/"
+          cp target/release/pda-desktop "out/$name/"
+          cp -r web/. "out/$name/web/"
+          cat > "out/$name/README.txt" <<'EOF'
+          PDA Next (macOS, Apple Silicon)
+
+          Запуск из терминала:
+            ./pda-server --port 8082        # сервер + браузер
+            ./pda-desktop                   # окно приложения
+
+          Или двойным кликом по pda-desktop в Finder (может потребоваться
+          правый клик -> Открыть из-за отсутствия подписи разработчика).
+
+          База настраивается файлом db_config.json рядом с бинарником
+          (без него - SQLite в data/pda_local.db).
+          EOF
+          tar czf "$name.tar.gz" -C out "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-aarch64
+          path: PDA-Next-*.tar.gz
 
   linux:
     runs-on: ubuntu-latest
