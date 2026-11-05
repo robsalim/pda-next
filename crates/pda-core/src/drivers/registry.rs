@@ -22,8 +22,8 @@ pub fn normalize_driver_type(value: &str) -> String {
         "s7_1200" | "s7-1200" | "s7_300" | "s7_1500" | "siemens_s7" | "siemens" | "s7" => {
             "snap7".into()
         }
-        "s7_200" | "s7-200" | "s7_200_smart" | "s7-200-smart" | "s7-200 smart"
-        | "s7 200 smart" | "snap7_s200_smart" | "snap7-s200" => "snap7_s200".into(),
+        "s7_200" | "s7-200" | "s7_200_smart" | "s7-200-smart" | "s7-200 smart" | "s7 200 smart"
+        | "snap7_s200_smart" | "snap7-s200" => "snap7_s200".into(),
         _ => key,
     }
 }

@@ -1,6 +1,6 @@
 //! Подмодули слоя БД.
-pub mod db_service;
 pub mod collector;
+pub mod db_service;
 
-pub use db_service::{DatabaseService, DbConfig};
 pub use collector::{Collector, OnStatus, Record};
+pub use db_service::{DatabaseService, DbConfig};

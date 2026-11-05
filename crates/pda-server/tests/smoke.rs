@@ -31,12 +31,22 @@ impl Harness {
     async fn start() -> Self {
         let tmp = tempfile::tempdir().expect("tmp dir");
         let db_path = tmp.path().join("smoke.db").to_string_lossy().into_owned();
-        let cfg = DbConfig { sqlite_path: db_path, ..Default::default() };
+        let cfg = DbConfig {
+            sqlite_path: db_path,
+            ..Default::default()
+        };
 
         let exports = tmp.path().join("exports");
         let db = std::sync::Arc::new(DatabaseService::open(cfg).await);
-        let core = AppCore::with_config_and_exports(db, tmp.path().join("db_config.json"), exports.clone());
-        assert!(core.db_snapshot().await.is_available, "SQLite-база должна открыться");
+        let core = AppCore::with_config_and_exports(
+            db,
+            tmp.path().join("db_config.json"),
+            exports.clone(),
+        );
+        assert!(
+            core.db_snapshot().await.is_available,
+            "SQLite-база должна открыться"
+        );
         core.spawn_live_pump();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -44,7 +54,14 @@ impl Harness {
         let router = api::router(core.clone());
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
-        Self { core, base: format!("http://{addr}"), ws: format!("ws://{addr}/api/live/ws"), http: reqwest::Client::new(), tmp, exports }
+        Self {
+            core,
+            base: format!("http://{addr}"),
+            ws: format!("ws://{addr}/api/live/ws"),
+            http: reqwest::Client::new(),
+            tmp,
+            exports,
+        }
     }
 
     async fn stop(&self) {
@@ -52,7 +69,12 @@ impl Harness {
     }
 
     async fn get_json(&self, path: &str) -> Value {
-        let r = self.http.get(format!("{}{}", self.base, path)).send().await.unwrap();
+        let r = self
+            .http
+            .get(format!("{}{}", self.base, path))
+            .send()
+            .await
+            .unwrap();
         let status = r.status();
         let v: Value = r.json().await.unwrap_or(Value::Null);
         assert!(status.is_success(), "GET {path} -> {status}: {v}");
@@ -60,7 +82,13 @@ impl Harness {
     }
 
     async fn post_json(&self, path: &str, body: Value) -> Value {
-        let r = self.http.post(format!("{}{}", self.base, path)).json(&body).send().await.unwrap();
+        let r = self
+            .http
+            .post(format!("{}{}", self.base, path))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
         let status = r.status();
         let v: Value = r.json().await.unwrap_or(Value::Null);
         assert!(status.is_success(), "POST {path} -> {status}: {v}");
@@ -72,14 +100,21 @@ impl Harness {
     }
 
     /// Ждёт, пока pred() станет истинной на live-снимках (поллинг /api/live).
-    async fn wait_live(&self, timeout_ms: u64, mut pred: impl FnMut(&Vec<Value>) -> bool) -> Vec<Value> {
+    async fn wait_live(
+        &self,
+        timeout_ms: u64,
+        mut pred: impl FnMut(&Vec<Value>) -> bool,
+    ) -> Vec<Value> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
             let rows = self.live().await;
             if pred(&rows) {
                 return rows;
             }
-            assert!(Instant::now() < deadline, "wait_live: timeout, live={rows:?}");
+            assert!(
+                Instant::now() < deadline,
+                "wait_live: timeout, live={rows:?}"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -92,7 +127,10 @@ impl Harness {
             if !values.is_empty() {
                 return values;
             }
-            assert!(Instant::now() < deadline, "wait_points: история не появилась для tag {tag_id}");
+            assert!(
+                Instant::now() < deadline,
+                "wait_points: история не появилась для tag {tag_id}"
+            );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
@@ -112,14 +150,23 @@ async fn end_to_end_modbus_cycle() {
     let port = free_port().await;
 
     // 1. Модули: сервер Modbus (эмуляция PLC) + клиент на тот же порт.
-    h.post_json("/api/connections", json!({
-        "name": "E2E SERVER", "driver_type": "modbus_server", "enabled": true,
-        "poll_interval_ms": 200, "config": {"host": "127.0.0.1", "port": port}
-    })).await;
-    let cli = h.post_json("/api/connections", json!({
-        "name": "E2E CLIENT", "driver_type": "modbus_client", "enabled": true,
-        "poll_interval_ms": 200, "config": {"ip": "127.0.0.1", "port": port, "slave_id": 1}
-    })).await;
+    h.post_json(
+        "/api/connections",
+        json!({
+            "name": "E2E SERVER", "driver_type": "modbus_server", "enabled": true,
+            "poll_interval_ms": 200, "config": {"host": "127.0.0.1", "port": port}
+        }),
+    )
+    .await;
+    let cli = h
+        .post_json(
+            "/api/connections",
+            json!({
+                "name": "E2E CLIENT", "driver_type": "modbus_client", "enabled": true,
+                "poll_interval_ms": 200, "config": {"ip": "127.0.0.1", "port": port, "slave_id": 1}
+            }),
+        )
+        .await;
     let client_id = cli["id"].as_i64().unwrap();
 
     // 2. Сигналы: FLOAT в HR160 и BOOL в C7 сервера; HR160 со scale=2,offset=1 клиента
@@ -143,26 +190,46 @@ async fn end_to_end_modbus_cycle() {
     let tags = h.get_json("/api/tags").await;
     let arr = tags.as_array().unwrap();
     let f = arr.iter().find(|t| t["id"] == json!(t_float)).unwrap();
-    assert_eq!(f["address"], json!("HR160"), "адрес строкой, как в Python /api/tags");
+    assert_eq!(
+        f["address"],
+        json!("HR160"),
+        "адрес строкой, как в Python /api/tags"
+    );
     assert_eq!(f["connection"], json!("E2E SERVER"));
     assert_eq!(f["group"], json!("Тест"));
     assert_eq!(f["unit"], json!("°C"));
 
     // 4. Свежие теги без значений: quality = BAD
     let rows = h.live().await;
-    let r = rows.iter().find(|x| x["id"] == json!(t_float)).expect("тег в live сразу после reload");
+    let r = rows
+        .iter()
+        .find(|x| x["id"] == json!(t_float))
+        .expect("тег в live сразу после reload");
     assert_eq!(r["value"], Value::Null, "нет значений — value null");
-    assert_ne!(r["quality"].as_i64().unwrap(), QUALITY_GOOD as i64, "качество BAD до первой записи");
+    assert_ne!(
+        r["quality"].as_i64().unwrap(),
+        QUALITY_GOOD as i64,
+        "качество BAD до первой записи"
+    );
 
     // 5. WS подключаем ДО записи, чтобы гарантированно поймать кадр live
     let (mut ws, _) = tokio_tungstenite::connect_async(&h.ws).await.unwrap();
 
     // 6. Сквозной цикл: внешний мастер пишет FC16 (FLOAT) и FC05 (BOOL) в сервер,
     //    сервер декодирует и публикует в реестр с меткой прихода посылки.
-    let mut client = tokio_modbus::client::tcp::connect_slave(([127, 0, 0, 1], port).into(), Slave(1)).await.unwrap();
+    let mut client =
+        tokio_modbus::client::tcp::connect_slave(([127, 0, 0, 1], port).into(), Slave(1))
+            .await
+            .unwrap();
     let bytes = 50.75f32.to_bits().to_be_bytes();
     client
-        .write_multiple_registers(160, &[u16::from_be_bytes([bytes[0], bytes[1]]), u16::from_be_bytes([bytes[2], bytes[3]])])
+        .write_multiple_registers(
+            160,
+            &[
+                u16::from_be_bytes([bytes[0], bytes[1]]),
+                u16::from_be_bytes([bytes[2], bytes[3]]),
+            ],
+        )
         .await
         .unwrap();
     client.write_single_coil(7, true).await.unwrap();
@@ -175,11 +242,15 @@ async fn end_to_end_modbus_cycle() {
     drop(client);
 
     // 7. Live реестра сервера показывает GOOD и корректные декодированные значения
-    let rows = h.wait_live(10_000, |rows| {
-        rows.iter().any(|r| r["id"] == json!(t_float) && r["value"].as_f64() == Some(50.75))
-            && rows.iter().any(|r| r["id"] == json!(t_bool) && r["value"].as_f64() == Some(1.0))
-    })
-    .await;
+    let rows = h
+        .wait_live(10_000, |rows| {
+            rows.iter()
+                .any(|r| r["id"] == json!(t_float) && r["value"].as_f64() == Some(50.75))
+                && rows
+                    .iter()
+                    .any(|r| r["id"] == json!(t_bool) && r["value"].as_f64() == Some(1.0))
+        })
+        .await;
     let r = rows.iter().find(|x| x["id"] == json!(t_float)).unwrap();
     assert_eq!(r["name"], json!("e2e_float"), "имя тега в live");
     assert_eq!(r["quality"].as_i64(), Some(QUALITY_GOOD as i64));
@@ -191,7 +262,11 @@ async fn end_to_end_modbus_cycle() {
             Ok(Some(Ok(WsMessage::Text(txt)))) => {
                 let v: Value = serde_json::from_str(&txt).unwrap();
                 if v["type"].as_str() == Some("live")
-                    && v["rows"].as_array().unwrap().iter().any(|x| x["id"] == json!(t_float) && x["value"].as_f64() == Some(50.75))
+                    && v["rows"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|x| x["id"] == json!(t_float) && x["value"].as_f64() == Some(50.75))
                 {
                     got_ws = true;
                     break;
@@ -206,14 +281,21 @@ async fn end_to_end_modbus_cycle() {
 
     // 9. История: журнал доносит значение до БД (виден через /api/points)
     let points = h.wait_points(t_float, 20_000).await;
-    assert!(points.iter().any(|p| (p.as_f64().unwrap_or(0.0) - 50.75).abs() < 1e-6), "50.75 в истории: {points:?}");
+    assert!(
+        points
+            .iter()
+            .any(|p| (p.as_f64().unwrap_or(0.0) - 50.75).abs() < 1e-6),
+        "50.75 в истории: {points:?}"
+    );
 
     // 10. Клиентский модуль (создан вместе с сервером) читает тот же HR160:
     //     scale=2, offset=1 -> 102.5
     h.wait_live(15_000, |rows| {
-        rows.iter().any(|r| r["id"] == json!(t_cli)
-            && (r["value"].as_f64().unwrap_or(0.0) - 102.5).abs() < 1e-6
-            && r["quality"].as_i64() == Some(QUALITY_GOOD as i64))
+        rows.iter().any(|r| {
+            r["id"] == json!(t_cli)
+                && (r["value"].as_f64().unwrap_or(0.0) - 102.5).abs() < 1e-6
+                && r["quality"].as_i64() == Some(QUALITY_GOOD as i64)
+        })
     })
     .await;
 
@@ -230,24 +312,53 @@ async fn end_to_end_modbus_cycle() {
         if drivers.len() == 2 && st["running"].as_u64() == Some(2) && drivers.iter().all(healthy) {
             break st;
         }
-        assert!(Instant::now() < deadline, "драйверы не вышли в рабочее состояние: {drivers:?}");
+        assert!(
+            Instant::now() < deadline,
+            "драйверы не вышли в рабочее состояние: {drivers:?}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(st["app"]["name"].as_str(), Some(pda_core::config::APP_NAME));
     assert_eq!(st["db"]["available"].as_bool(), Some(true));
 
     // 12. Удаление сигналов -> reload -> точки исчезают из live
-    h.post_json("/api/tags/delete", json!({ "ids": [t_float, t_bool, t_cli] })).await;
+    h.post_json(
+        "/api/tags/delete",
+        json!({ "ids": [t_float, t_bool, t_cli] }),
+    )
+    .await;
     let rows = h.live().await;
-    assert!(rows.iter().all(|r| r["id"] != json!(t_float) && r["id"] != json!(t_cli)), "live пуст по удалённым: {rows:?}");
+    assert!(
+        rows.iter()
+            .all(|r| r["id"] != json!(t_float) && r["id"] != json!(t_cli)),
+        "live пуст по удалённым: {rows:?}"
+    );
 
     // 13. Удаление модулей -> forget_connection
-    for c in h.get_json("/api/connections").await.as_array().unwrap().clone() {
+    for c in h
+        .get_json("/api/connections")
+        .await
+        .as_array()
+        .unwrap()
+        .clone()
+    {
         let cid = c["id"].as_i64().unwrap();
-        let r = h.http.delete(format!("{}/api/connections/{}", h.base, cid)).send().await.unwrap();
-        assert!(r.status().is_success(), "DELETE connection {cid} -> {}", r.status());
+        let r = h
+            .http
+            .delete(format!("{}/api/connections/{}", h.base, cid))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            r.status().is_success(),
+            "DELETE connection {cid} -> {}",
+            r.status()
+        );
     }
-    assert!(h.live().await.is_empty(), "реестр пуст после удаления модулей");
+    assert!(
+        h.live().await.is_empty(),
+        "реестр пуст после удаления модулей"
+    );
 
     h.stop().await;
     let _ = h.tmp.path();
@@ -262,16 +373,41 @@ async fn helpers_and_validation_endpoints() {
     let types = info["types"].as_array().unwrap();
     assert!(types.len() >= 3, "реестр драйверов: {types:?}");
     for t in types {
-        assert!(t["key"].is_string() && t["label"].is_string(), "контракт drivers/types: {t}");
-        assert!(t["address"].is_object(), "справка по адресам у каждого типа: {t}");
+        assert!(
+            t["key"].is_string() && t["label"].is_string(),
+            "контракт drivers/types: {t}"
+        );
+        assert!(
+            t["address"].is_object(),
+            "справка по адресам у каждого типа: {t}"
+        );
     }
 
     // /api/validate/address: успех и ошибка
-    let ok = h.post_json("/api/validate/address", json!({ "driver_type": "modbus_client", "address": "HR100", "data_type": "UINT16" })).await;
+    let ok = h
+        .post_json(
+            "/api/validate/address",
+            json!({ "driver_type": "modbus_client", "address": "HR100", "data_type": "UINT16" }),
+        )
+        .await;
     assert_eq!(ok["ok"], json!(true), "{ok}");
-    let bad = h.post_json("/api/validate/address", json!({ "driver_type": "modbus_client", "address": "DB1.DBD0", "data_type": "FLOAT" })).await;
-    assert_eq!(bad["ok"], json!(false), "s7-адрес не должен проходить modbus-валидатор");
-    let wrong_type = h.post_json("/api/validate/address", json!({ "driver_type": "modbus_client", "address": "C7", "data_type": "INT16" })).await;
+    let bad = h
+        .post_json(
+            "/api/validate/address",
+            json!({ "driver_type": "modbus_client", "address": "DB1.DBD0", "data_type": "FLOAT" }),
+        )
+        .await;
+    assert_eq!(
+        bad["ok"],
+        json!(false),
+        "s7-адрес не должен проходить modbus-валидатор"
+    );
+    let wrong_type = h
+        .post_json(
+            "/api/validate/address",
+            json!({ "driver_type": "modbus_client", "address": "C7", "data_type": "INT16" }),
+        )
+        .await;
     assert_eq!(wrong_type["ok"], json!(false), "INT16 в катушку — ошибка");
 
     // /api/db/status: sqlite по умолчанию
@@ -286,22 +422,45 @@ async fn helpers_and_validation_endpoints() {
 
     // /api/db/test на мёртвый postgres: ok=false + понятная ошибка (не 500)
     let dead = free_port().await;
-    let t = h.post_json("/api/db/test", json!({
-        "engine": "postgres", "host": "127.0.0.1", "port": dead,
-        "dbname": "none", "user": "none", "password": "none"
-    })).await;
-    assert_eq!(t["ok"], json!(false), "тест честно сообщает об ошибке: {t:?}");
+    let t = h
+        .post_json(
+            "/api/db/test",
+            json!({
+                "engine": "postgres", "host": "127.0.0.1", "port": dead,
+                "dbname": "none", "user": "none", "password": "none"
+            }),
+        )
+        .await;
+    assert_eq!(
+        t["ok"],
+        json!(false),
+        "тест честно сообщает об ошибке: {t:?}"
+    );
     assert!(t["error"].is_string(), "текст ошибки обязателен: {t}");
 
     // /api/db/test на свою sqlite-файл: успех
-    let ok_sqlite = h.post_json("/api/db/test", json!({
-        "engine": "sqlite", "sqlite_path": h.tmp.path().join("smoke.db").to_string_lossy()
-    })).await;
+    let ok_sqlite = h
+        .post_json(
+            "/api/db/test",
+            json!({
+                "engine": "sqlite", "sqlite_path": h.tmp.path().join("smoke.db").to_string_lossy()
+            }),
+        )
+        .await;
     assert_eq!(ok_sqlite["ok"], json!(true), "{ok_sqlite}");
 
     // /api/db/create: sqlite — «создаётся автоматически», не сетевой движок — ошибка
-    let c = h.post_json("/api/db/create", json!({ "engine": "sqlite", "sqlite_path": "x.db" })).await;
-    assert_eq!(c["ok"], json!(true), "sqlite create — информационный ответ: {c}");
+    let c = h
+        .post_json(
+            "/api/db/create",
+            json!({ "engine": "sqlite", "sqlite_path": "x.db" }),
+        )
+        .await;
+    assert_eq!(
+        c["ok"],
+        json!(true),
+        "sqlite create — информационный ответ: {c}"
+    );
 
     h.stop().await;
     let _ = h.tmp.path();
@@ -312,14 +471,19 @@ async fn helpers_and_validation_endpoints() {
 async fn frontend_assets_served() {
     let h = Harness::start().await;
     for (path, marker) in [
-        ("/", "btn-tab-charts"),         // index.html — вкладки
-        ("/app.css", "--plot-bg"),       // CSS с токенами темы
-        ("/app.js", "new uPlot"),        // Charts/Bits
-        ("/io.js", "ioRefreshAll"),      // вкладка I/O
-        ("/db.js", "dbRefreshPanel"),    // вкладка Database
-        ("/help.js", "HELP_SECTIONS"),   // вкладка Help
+        ("/", "btn-tab-charts"),       // index.html — вкладки
+        ("/app.css", "--plot-bg"),     // CSS с токенами темы
+        ("/app.js", "new uPlot"),      // Charts/Bits
+        ("/io.js", "ioRefreshAll"),    // вкладка I/O
+        ("/db.js", "dbRefreshPanel"),  // вкладка Database
+        ("/help.js", "HELP_SECTIONS"), // вкладка Help
     ] {
-        let r = h.http.get(format!("{}{}", h.base, path)).send().await.unwrap();
+        let r = h
+            .http
+            .get(format!("{}{}", h.base, path))
+            .send()
+            .await
+            .unwrap();
         assert!(r.status().is_success(), "GET {path} -> {}", r.status());
         let text = r.text().await.unwrap();
         assert!(text.contains(marker), "{path} должен содержать '{marker}'");
@@ -339,7 +503,11 @@ fn parse_span_ms_spans() {
     assert_eq!(api::parse_span_ms("12 часов"), 12 * 3_600_000);
     assert_eq!(api::parse_span_ms("24 часа"), 24 * 3_600_000);
     assert_eq!(api::parse_span_ms("72 часа"), 72 * 3_600_000);
-    assert_eq!(api::parse_span_ms("что-то другое"), 3_600_000, "дефолт 1 час, как в Python");
+    assert_eq!(
+        api::parse_span_ms("что-то другое"),
+        3_600_000,
+        "дефолт 1 час, как в Python"
+    );
 }
 
 /// Drag&drop перенос переменных: группа/модуль меняются в БД,
@@ -348,14 +516,28 @@ fn parse_span_ms_spans() {
 async fn move_tags_between_groups() {
     let h = Harness::start().await;
 
-    let c1 = h.post_json("/api/connections", json!({
-        "name": "MOVE A", "driver_type": "modbus_client", "enabled": false,
-        "poll_interval_ms": 200, "config": {"ip": "127.0.0.1", "port": 15020}
-    })).await["id"].as_i64().unwrap();
-    let c2 = h.post_json("/api/connections", json!({
-        "name": "MOVE B", "driver_type": "modbus_client", "enabled": false,
-        "poll_interval_ms": 200, "config": {"ip": "127.0.0.1", "port": 15021}
-    })).await["id"].as_i64().unwrap();
+    let c1 = h
+        .post_json(
+            "/api/connections",
+            json!({
+                "name": "MOVE A", "driver_type": "modbus_client", "enabled": false,
+                "poll_interval_ms": 200, "config": {"ip": "127.0.0.1", "port": 15020}
+            }),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    let c2 = h
+        .post_json(
+            "/api/connections",
+            json!({
+                "name": "MOVE B", "driver_type": "modbus_client", "enabled": false,
+                "poll_interval_ms": 200, "config": {"ip": "127.0.0.1", "port": 15021}
+            }),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
 
     let t1 = h.post_json("/api/tags", json!({
         "id": 0, "connection_id": c1, "name": "mv_1", "address_str": "HR10", "data_type": "UINT16",
@@ -364,17 +546,37 @@ async fn move_tags_between_groups() {
     })).await["id"].as_i64().unwrap();
 
     // Перенос в другую группу того же модуля
-    h.post_json("/api/tags/move", json!({ "ids": [t1], "target_connection_id": c1, "target_group": "Новая" })).await;
+    h.post_json(
+        "/api/tags/move",
+        json!({ "ids": [t1], "target_connection_id": c1, "target_group": "Новая" }),
+    )
+    .await;
     let groups = h.get_json(&format!("/api/connections/{c1}/groups")).await;
-    let names: Vec<&str> = groups["groups"].as_array().unwrap().iter().map(|g| g.as_str().unwrap()).collect();
-    assert!(names.contains(&"Новая"), "целевая группа объявлена: {names:?}");
+    let names: Vec<&str> = groups["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g.as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"Новая"),
+        "целевая группа объявлена: {names:?}"
+    );
     let tags = h.get_json(&format!("/api/connections/{c1}/tags")).await;
     assert_eq!(tags.as_array().unwrap()[0]["group_name"], json!("Новая"));
 
     // Перенос в другой модуль
-    h.post_json("/api/tags/move", json!({ "ids": [t1], "target_connection_id": c2, "target_group": "Общие" })).await;
+    h.post_json(
+        "/api/tags/move",
+        json!({ "ids": [t1], "target_connection_id": c2, "target_group": "Общие" }),
+    )
+    .await;
     let moved = h.get_json(&format!("/api/connections/{c2}/tags")).await;
-    assert_eq!(moved.as_array().unwrap().len(), 1, "тег переехал в модуль B");
+    assert_eq!(
+        moved.as_array().unwrap().len(),
+        1,
+        "тег переехал в модуль B"
+    );
     assert_eq!(moved.as_array().unwrap()[0]["name"], json!("mv_1"));
 
     h.stop().await;
@@ -402,35 +604,134 @@ async fn export_png_writes_file() {
     let png = include_bytes!("fixtures/pixel.png").to_vec();
 
     // Обычный экспорт: файл на диске, путь в ответе.
-    let v: Value = post_png(&h, "smoke_chart.png", png.clone()).await.json().await.unwrap();
+    let v: Value = post_png(&h, "smoke_chart.png", png.clone())
+        .await
+        .json()
+        .await
+        .unwrap();
     let path = std::path::PathBuf::from(v["path"].as_str().unwrap_or_default());
-    assert_eq!(path.file_name().unwrap().to_string_lossy(), "smoke_chart.png", "имя из запроса: {v}");
-    assert_eq!(path.parent().unwrap(), h.exports.as_path(), "файл в каталоге выгрузки: {path:?}");
-    assert_eq!(std::fs::read(&path).unwrap(), png, "байты на диске равны отправленным");
+    assert_eq!(
+        path.file_name().unwrap().to_string_lossy(),
+        "smoke_chart.png",
+        "имя из запроса: {v}"
+    );
+    assert_eq!(
+        path.parent().unwrap(),
+        h.exports.as_path(),
+        "файл в каталоге выгрузки: {path:?}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        png,
+        "байты на диске равны отправленным"
+    );
     assert_eq!(v["bytes"].as_i64(), Some(png.len() as i64));
 
     // Повторный экспорт не затирает предыдущий.
-    let v2: Value = post_png(&h, "smoke_chart.png", png.clone()).await.json().await.unwrap();
+    let v2: Value = post_png(&h, "smoke_chart.png", png.clone())
+        .await
+        .json()
+        .await
+        .unwrap();
     let path2 = std::path::PathBuf::from(v2["path"].as_str().unwrap());
-    assert_eq!(path2.file_name().unwrap().to_string_lossy(), "smoke_chart-1.png", "второй файл не перезаписал первый: {v2}");
+    assert_eq!(
+        path2.file_name().unwrap().to_string_lossy(),
+        "smoke_chart-1.png",
+        "второй файл не перезаписал первый: {v2}"
+    );
     assert_ne!(path2, path);
 
     // Вредоносное имя: путь и расширение вырезаются, файл остаётся в каталоге выгрузки.
-    let v3: Value = post_png(&h, "../../../windows/system32/evil.exe", png.clone()).await.json().await.unwrap();
+    let v3: Value = post_png(&h, "../../../windows/system32/evil.exe", png.clone())
+        .await
+        .json()
+        .await
+        .unwrap();
     let path3 = std::path::PathBuf::from(v3["path"].as_str().unwrap());
-    assert_eq!(path3.parent().unwrap(), h.exports.as_path(), "выход за каталог невозможен: {path3:?}");
-    assert!(path3.to_string_lossy().ends_with(".png"), "расширение всегда png: {path3:?}");
+    assert_eq!(
+        path3.parent().unwrap(),
+        h.exports.as_path(),
+        "выход за каталог невозможен: {path3:?}"
+    );
+    assert!(
+        path3.to_string_lossy().ends_with(".png"),
+        "расширение всегда png: {path3:?}"
+    );
     assert!(!std::path::Path::new(r"C:\windows\system32\evil.exe").exists());
 
     // Не-PNG отклоняется, файл не создаётся.
     let bad = post_png(&h, "bad.png", b"not a png".to_vec()).await;
-    assert!(bad.status().is_client_error() || bad.status().is_server_error(), "мусор должен отклоняться");
-    assert_eq!(std::fs::read_dir(&h.exports).unwrap().count(), 3, "отклонённый экспорт ничего не пишет");
+    assert!(
+        bad.status().is_client_error() || bad.status().is_server_error(),
+        "мусор должен отклоняться"
+    );
+    assert_eq!(
+        std::fs::read_dir(&h.exports).unwrap().count(),
+        3,
+        "отклонённый экспорт ничего не пишет"
+    );
 
     // Имя без имени файла -> разумное значение по умолчанию.
     let v5: Value = post_png(&h, "", png.clone()).await.json().await.unwrap();
-    let name5 = std::path::PathBuf::from(v5["path"].as_str().unwrap()).file_name().unwrap().to_string_lossy().into_owned();
-    assert!(name5.starts_with("pda_chart_") && name5.ends_with(".png"), "имя по умолчанию: {name5}");
+    let name5 = std::path::PathBuf::from(v5["path"].as_str().unwrap())
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        name5.starts_with("pda_chart_") && name5.ends_with(".png"),
+        "имя по умолчанию: {name5}"
+    );
+
+    h.stop().await;
+    let _ = h.tmp.path();
+}
+
+/// /api/series с явными t0/t1 должен вернуть ИМЕННО это окно, а не дефолтный
+/// «последний час». Регрессия на контракт зума: фронт присылает границы
+/// прямо из uPlot.scales.x (секунды, float) после setScale. Данные в БД для
+/// проверки не нужны — сервер обязан корректно рассчитать само окно.
+#[tokio::test(flavor = "multi_thread")]
+async fn series_respects_explicit_zoom_window() {
+    let h = Harness::start().await;
+
+    // Явное окно в прошлом: конец = «сейчас минус сутки», начало ещё на час раньше.
+    let t1 = chrono::Local::now().timestamp_millis() as f64 / 1000.0 - 86_400.0;
+    let t0 = t1 - 3_600.0;
+    let v = h
+        .get_json(&format!("/api/series?tags=1&t0={t0}&t1={t1}"))
+        .await;
+    let eps = 0.01;
+    assert!(
+        (v["t_start"].as_f64().unwrap() - t0).abs() < eps,
+        "t_start обязан равняться переданному t0 (приоритет над span): {v}"
+    );
+    assert!(
+        (v["t_end"].as_f64().unwrap() - t1).abs() < eps,
+        "t_end обязан равняться переданному t1: {v}"
+    );
+
+    // Неотфильтрованный дефолт без t0/t1: окно = последний час (span).
+    let d = h.get_json("/api/series?tags=1").await;
+    let span = d["t_end"].as_f64().unwrap() - d["t_start"].as_f64().unwrap();
+    assert!(
+        (span - 3600.0).abs() < eps,
+        "без t0/t1 живёт дефолтный span: {d}"
+    );
+
+    // t1 <= t0 — невалидное окно игнорируется, снова дефолт (не инверсия).
+    let v2 = h
+        .get_json(&format!("/api/series?tags=1&t0={t1}&t1={t0}"))
+        .await;
+    assert!(
+        v2["t_end"].as_f64() > v2["t_start"].as_f64(),
+        "инвертированное окно отброшено: {v2}"
+    );
+    let span2 = v2["t_end"].as_f64().unwrap() - v2["t_start"].as_f64().unwrap();
+    assert!(
+        (span2 - 3600.0).abs() < eps,
+        "окно вернулось к дефолту: {v2}"
+    );
 
     h.stop().await;
     let _ = h.tmp.path();

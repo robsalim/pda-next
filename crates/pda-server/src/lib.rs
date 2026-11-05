@@ -17,13 +17,20 @@ use std::path::PathBuf;
 use pda_core::database::db_service::DbConfig;
 
 fn exe_dir() -> PathBuf {
-    std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)).unwrap_or_default()
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(PathBuf::from))
+        .unwrap_or_default()
 }
 
 /// Каталог фронтенда: ./web рядом с exe (продакшн), rust_pda/web (dev-запуск
 /// из корня workspace), ../web от crates/pda-server (cargo run). Иначе — "web".
 pub fn web_root() -> String {
-    let mut candidates = vec![exe_dir().join("web"), PathBuf::from("web"), PathBuf::from("rust_pda/web")];
+    let mut candidates = vec![
+        exe_dir().join("web"),
+        PathBuf::from("web"),
+        PathBuf::from("rust_pda/web"),
+    ];
     if let Some(manifest) = option_env!("CARGO_MANIFEST_DIR") {
         candidates.push(PathBuf::from(manifest).join("../../web"));
     }
@@ -54,7 +61,12 @@ pub fn exports_dir() -> PathBuf {
 /// Отсутствующий файл означает SQLite по умолчанию — как в Python-версии.
 /// Возвращает конфиг и путь, откуда он прочитан (для /api/db/switch).
 pub fn load_db_config() -> (DbConfig, PathBuf) {
-    for dir in [exe_dir(), PathBuf::from("."), PathBuf::from("rust_pda"), PathBuf::from("../python_app")] {
+    for dir in [
+        exe_dir(),
+        PathBuf::from("."),
+        PathBuf::from("rust_pda"),
+        PathBuf::from("../python_app"),
+    ] {
         let p = dir.join("db_config.json");
         if let Ok(text) = std::fs::read_to_string(&p) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {

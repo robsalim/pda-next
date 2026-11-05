@@ -4,8 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PDA</title>
-    <link rel="stylesheet" href="https://unpkg.com/uplot@1.6.30/dist/uPlot.min.css">
-    <script src="https://unpkg.com/uplot@1.6.30/dist/uPlot.iife.min.js"></script>
+    <!-- uPlot лежит рядом с фронтендом, а не на unpkg: desktop-оболочка
+         (WebView2 / WKWebView) работает на объектах без доступа в сеть,
+         и тогда window.uPlot не появляется вовсе. -->
+    <link rel="stylesheet" href="vendor/uplot.min.css">
+    <script src="vendor/uplot.iife.min.js"></script>
     <link rel="stylesheet" href="app.css">
 </head>
 <body>
@@ -19,6 +22,7 @@
             <button id="btn-tab-help" class="tab-btn" onclick="switchTab('help')">Help</button>
         </div>
         <div class="nav-right">
+            <button id="btn-view-only" class="btn-action" onclick="toggleViewOnly()" title="Остановить опрос всех модулей и работать только на просмотр истории">⏸ Опрос</button>
             <div class="app-badge" id="app-badge">PDA</div>
             <div class="cursor-info">
                 <span class="c-x1" id="lbl-x1">X1: —</span>
@@ -50,11 +54,11 @@
                         <label>Окно Live:</label>
                         <select id="charts-span" onchange="reloadCharts(true)">
                             <option value="5 мин">5 мин</option>
-                            <option value="15 мин">15 мин</option>
+                            <option value="15 мин" selected>15 мин</option>
                             <option value="1 час">1 час</option>
                             <option value="4 часа">4 часа</option>
                             <option value="12 часов">12 часов</option>
-                            <option value="24 часа" selected>24 часа</option>
+                            <option value="24 часа">24 часа</option>
                             <option value="72 часа">72 часа</option>
                         </select>
                         <button id="btn-pause-charts" class="btn-action" onclick="togglePause('charts')">⏸ Пауза</button>
@@ -62,9 +66,9 @@
 
                     <span id="charts-arch-panel" style="display: none;">
                         <label>Начало:</label>
-                        <input type="datetime-local" id="charts-arch-start">
+                        <input type="datetime-local" id="charts-arch-start" onchange="userSetArchStart.add('charts'); clearArchWindow();">
                         <label>Длительность:</label>
-                        <select id="charts-arch-dur">
+                        <select id="charts-arch-dur" onchange="clearArchWindow(); reloadCharts(true)">
                             <option value="5 мин">5 мин</option>
                             <option value="15 мин">15 мин</option>
                             <option value="1 час">1 час</option>
@@ -76,11 +80,24 @@
                         <button class="btn-action" onclick="shiftArchive('charts', -1)">◀</button>
                         <button class="btn-action" onclick="shiftArchive('charts', 1)">▶</button>
                         <button class="btn-load" onclick="reloadCharts(true)">📥 Загрузить архив</button>
+                        <span class="arch-hint" id="charts-last-data" title="Метка самой свежей записи в базе — позже этого времени данных нет"></span>
                     </span>
 
                     <button class="btn-action" onclick="resetZoom(getActiveWindow()?.chart)">🔍 100%</button>
                     <button class="btn-action" onclick="clearCharts()">✕ Очистить</button>
                     <button class="btn-teal" onclick="exportActiveChartPng()" title="Сохранить активное окно графика как PNG">🖼 PNG</button>
+                    <button class="btn-teal" onclick="exportAllChartsPdf()" title="Сохранить все графики с легендами в PDF">📄 PDF</button>
+                </div>
+                <!-- Мини-обзор текущего архивного окна (прореженного сервером)
+                     с подсветкой интервалов без данных. Показывается в режиме
+                     Archive над окнами графиков. -->
+                <div class="arch-overview" id="charts-arch-overview" style="display:none;">
+                    <div class="arch-overview-head">
+                        <span id="charts-arch-overview-title">Обзор окна (прорежено). Выделите мышью область и нажмите «⤓ Выбранное».</span>
+                        <button class="btn-action" onclick="applyArchOverviewSelection()" title="Начало окна загрузки = левая граница выделения">⤓ Выбранное</button>
+                    </div>
+                    <div class="arch-overview-note" id="charts-arch-overview-note"></div>
+                    <div class="chart-box" id="uplot-arch-overview"></div>
                 </div>
                 <div class="windows-toolbar">
                     <button class="btn-add" onclick="addChartWindow()">＋ Добавить график</button>
@@ -109,20 +126,20 @@
                     <label>Окно Live:</label>
                     <select id="bits-span" onchange="reloadBits(true)">
                         <option value="5 мин">5 мин</option>
-                        <option value="15 мин">15 мин</option>
+                        <option value="15 мин" selected>15 мин</option>
                         <option value="1 час">1 час</option>
                         <option value="4 часа">4 часа</option>
                         <option value="12 часов">12 часов</option>
-                        <option value="24 часа" selected>24 часа</option>
+                        <option value="24 часа">24 часа</option>
                         <option value="72 часа">72 часа</option>
                     </select>
                     <button id="btn-pause-bits" class="btn-action" onclick="togglePause('bits')">⏸ Пауза</button>
                 </span>
                 <span id="bits-arch-panel" style="display: none;">
                     <label>Начало:</label>
-                    <input type="datetime-local" id="bits-arch-start">
+                    <input type="datetime-local" id="bits-arch-start" onchange="userSetArchStart.add('bits')">
                     <label>Длительность:</label>
-                    <select id="bits-arch-dur">
+                    <select id="bits-arch-dur" onchange="reloadBits(true)">
                         <option value="5 мин">5 мин</option>
                         <option value="15 мин">15 мин</option>
                         <option value="1 час">1 час</option>
@@ -134,6 +151,7 @@
                     <button class="btn-action" onclick="shiftArchive('bits', -1)">◀</button>
                     <button class="btn-action" onclick="shiftArchive('bits', 1)">▶</button>
                     <button class="btn-load" onclick="reloadBits(true)">📥 Загрузить архив</button>
+                    <span class="arch-hint" id="bits-last-data" title="Метка самой свежей записи в базе — позже этого времени данных нет"></span>
                 </span>
                 <button id="btn-swap-bits" class="btn-action" onclick="toggleBitsSwap()" title="Порядок байт в 16-битном слове: Hi-Lo (старший байт первым, как отдаёт Siemens) / Lo-Hi (байты меняются местами)">↕ Hi-Lo</button>
                 <button class="btn-action" onclick="resetZoom(bitsChart)">🔍 100%</button>
@@ -182,7 +200,7 @@
                     </div>
                 </div>
                 <div class="io-filter">
-                    <input type="text" id="io-search" placeholder="Поиск по имени / адресу / группе / типу…" oninput="ioRenderTags()">
+                    <input type="text" id="io-search" placeholder="Поиск по имени / адресу / группе / типу…" oninput="ioRenderTags()" readonly onfocus="this.removeAttribute('readonly')" value="">
                     <select id="io-filter-mode" onchange="ioRenderTags()">
                         <option value="all">Все переменные</option>
                         <option value="changed">Изменившиеся</option>
@@ -246,6 +264,11 @@
     <!-- Модальные диалоги (общая подложка) -->
     <div id="modal-overlay" class="modal-overlay" style="display:none;">
         <div id="modal-box" class="modal-box"></div>
+    </div>
+    <!-- Сообщения (alertBox) — отдельная подложка: иначе окно «Готово»/«Ошибка»
+         затирало бы форму, открытую под ним (modal-box общий, innerHTML один). -->
+    <div id="modal-alert" class="modal-overlay" style="display:none;">
+        <div class="modal-box modal-box-narrow" id="alert-box"></div>
     </div>
     <div id="modal-confirm" class="modal-overlay" style="display:none;">
         <div class="modal-box modal-box-narrow">

@@ -19,16 +19,14 @@ use crate::models::{cfg_i64, cfg_str, Connection};
 use super::base::{
     fmt_poll_status, poll_period, submit_values, update_stats, DriverState, TagCache,
 };
-use super::s7_proto::{
-    AREA_DB, AREA_MK, AREA_PA, AREA_PE, MAX_VARS, S7Conn, S7Error, S7Item,
-};
+use super::s7_proto::{S7Conn, S7Error, S7Item, AREA_DB, AREA_MK, AREA_PA, AREA_PE, MAX_VARS};
 
 // ---------------------------------------------------------------------- адрес
 /// Области памяти по букве адреса.
 fn area_by_letter(letter: &str) -> Option<&'static str> {
     match letter {
-        "M" => Some("MK"), // Memory (Merker)
-        "I" | "E" => Some("PE"), // образ процесса входа
+        "M" => Some("MK"),             // Memory (Merker)
+        "I" | "E" => Some("PE"),       // образ процесса входа
         "Q" | "A" | "P" => Some("PA"), // образ процесса выхода
         _ => None,
     }
@@ -113,15 +111,19 @@ impl S7Address {
 
 /// '%MW230' (стиль TIA Portal) и 'mw 230' -> 'MW230'.
 pub fn normalize_address(address: &str) -> String {
-    address.trim().to_uppercase().replace('%', "").replace(' ', "").replace('\t', "")
+    address
+        .trim()
+        .to_uppercase()
+        .replace('%', "")
+        .replace(' ', "")
+        .replace('\t', "")
 }
 
 static RE_DB: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^DB(\d+)\.(DBD|DBW|DBB|DBX)(\d+)(?:\.(\d+))?$").unwrap());
 static RE_MNEMONIC: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^([MIEQAP])([WBXD]?)(\d+)(?:\.(\d+))?$").unwrap());
-static RE_V: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^V([WBXD]?)(\d+)(?:\.(\d+))?$").unwrap());
+static RE_V: Lazy<Regex> = Lazy::new(|| Regex::new(r"^V([WBXD]?)(\d+)(?:\.(\d+))?$").unwrap());
 
 fn parse_db_token(addr: &str) -> Option<S7Address> {
     let c = RE_DB.captures(addr)?;
@@ -132,7 +134,10 @@ fn parse_db_token(addr: &str) -> Option<S7Address> {
         db: c[1].parse().unwrap_or(0) as u16,
         size: SizeLetter::from_letter(&token[2..])?,
         offset: c[3].parse().unwrap_or(0),
-        bit: c.get(4).map(|m| m.as_str().parse().unwrap_or(0)).unwrap_or(0) as u8,
+        bit: c
+            .get(4)
+            .map(|m| m.as_str().parse().unwrap_or(0))
+            .unwrap_or(0) as u8,
         v_area: false,
     })
 }
@@ -218,7 +223,8 @@ pub fn parse_s200_address(address: &str, data_type: &str) -> Option<S7Address> {
 }
 
 // ------------------------------------------------------------- метаданные GUI
-const HINT_CLASSIC: &str = "Примеры: MW230, MD100, M3.4, I0.1, Q0.0, DB1.DBW4, DB1.DBD0, DB1.DBX0.0";
+const HINT_CLASSIC: &str =
+    "Примеры: MW230, MD100, M3.4, I0.1, Q0.0, DB1.DBW4, DB1.DBD0, DB1.DBX0.0";
 const HINT_S200: &str = "Примеры: VW100, VB5, VD20, V100.3, IW0, QW0, MW10";
 
 const FORMATS_CLASSIC: &str = "MW230, MB5, MD100, MX3.4, IW64, QW0, DB1.DBW4, DB5.DBD0, DB1.DBX0.0";
@@ -286,7 +292,11 @@ pub fn validate_address(address: &str, data_type: &str, is_s200: bool) -> Option
         parse_s7_address(address, data_type).is_some()
     };
     if !ok {
-        let hint = if is_s200 { FORMATS_S200 } else { FORMATS_CLASSIC };
+        let hint = if is_s200 {
+            FORMATS_S200
+        } else {
+            FORMATS_CLASSIC
+        };
         return Some(format!("Не понимаю адрес '{address}'. Форматы: {hint}"));
     }
     None
@@ -331,21 +341,32 @@ fn extract(buf: &[u8], rel: usize, a: &S7Address, data_type: &str) -> Option<f64
 /// Точка входа: цикл опроса одного подключения snap7 / snap7_s200.
 /// Запускается как tokio-задача; остановка — снятием флага state.running
 /// (менеджер при необходимости прерывает задачу снаружи).
-pub async fn run_snap7(conn_cfg: Arc<Connection>, registry: Arc<TagRegistry>, state: Arc<DriverState>) {
-    let is_s200 = crate::drivers::registry::normalize_driver_type(&conn_cfg.driver_type) == "snap7_s200";
+pub async fn run_snap7(
+    conn_cfg: Arc<Connection>,
+    registry: Arc<TagRegistry>,
+    state: Arc<DriverState>,
+) {
+    let is_s200 =
+        crate::drivers::registry::normalize_driver_type(&conn_cfg.driver_type) == "snap7_s200";
     let ip = cfg_str(&conn_cfg.config, "ip", "192.168.0.1");
     let port = cfg_i64(&conn_cfg.config, "port", 102).clamp(1, 65535) as u16;
     let rack = cfg_i64(&conn_cfg.config, "rack", 0).clamp(0, 7) as u8;
     let slot = cfg_i64(&conn_cfg.config, "slot", 1).clamp(0, 31) as u8;
     // TSAP: 1 (PG) для старших S7; для SMART — 3 (Basic) => удалённый 0x0301
-    let tsap_type = cfg_i64(&conn_cfg.config, "connection_type", if is_s200 { 3 } else { 1 })
-        .clamp(1, 7) as u8;
+    let tsap_type = cfg_i64(
+        &conn_cfg.config,
+        "connection_type",
+        if is_s200 { 3 } else { 1 },
+    )
+    .clamp(1, 7) as u8;
 
     let addr = match ip.parse::<IpAddr>() {
         Ok(a) => SocketAddr::new(a, port),
         Err(e) => {
             state.set_status(format!("Connect Error: неверный IP '{ip}' ({e})"));
-            state.running.store(false, std::sync::atomic::Ordering::SeqCst);
+            state
+                .running
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             return;
         }
     };
@@ -357,14 +378,20 @@ pub async fn run_snap7(conn_cfg: Arc<Connection>, registry: Arc<TagRegistry>, st
     let mut max_read_len: u16 = 200;
     let merge_gap: u32 = 16; // разрыв, выгоднее прочитать «заодно»
 
-    state.running.store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     while state.running.load(std::sync::atomic::Ordering::Relaxed) {
         // ------------------------------------------------ reconnect
         if client.is_none() {
             state.set_status("Connecting...");
             match S7Conn::connect(addr, rack, slot, tsap_type, Duration::from_millis(3000)).await {
                 Ok(mut c) => {
-                    c.set_timeout(period.max(Duration::from_millis(2000)).min(Duration::from_millis(5000)));
+                    c.set_timeout(
+                        period
+                            .max(Duration::from_millis(2000))
+                            .min(Duration::from_millis(5000)),
+                    );
                     // Ограничиваем длину пакета согласованным PDU
                     let pdu = c.pdu_size;
                     max_read_len = (pdu.saturating_sub(32)).clamp(48, 222);
@@ -394,7 +421,16 @@ pub async fn run_snap7(conn_cfg: Arc<Connection>, registry: Arc<TagRegistry>, st
         let mut values: HashMap<i64, f64> = HashMap::new();
         let mut c = client.take().expect("есть соединение");
         let mut req_count = 0usize;
-        match read_all_values(&mut c, &tags, is_s200, max_read_len, merge_gap, &mut req_count).await {
+        match read_all_values(
+            &mut c,
+            &tags,
+            is_s200,
+            max_read_len,
+            merge_gap,
+            &mut req_count,
+        )
+        .await
+        {
             Ok(Ok(v)) => values = v,
             Ok(Err(e)) => {
                 // ошибки пакетного чтения остаются «мягкими», но fault-код — переподключение
@@ -535,7 +571,11 @@ pub struct ReadBlock {
 
 /// Группирует теги по области и объединяет соседние адреса в пакеты
 /// (merge_gap=16, max_read_len из PDU).
-fn plan_reads(addrs: &[(i64, String, S7Address)], max_read_len: u32, merge_gap: u32) -> Vec<ReadBlock> {
+fn plan_reads(
+    addrs: &[(i64, String, S7Address)],
+    max_read_len: u32,
+    merge_gap: u32,
+) -> Vec<ReadBlock> {
     // Все теги одного DB группируются вместе (db_read читает любые размеры);
     // области M/I/Q — по (area). kind у S7Address — &'static, поэтому
     // ключ живёт столько же, сколько план.
@@ -543,14 +583,25 @@ fn plan_reads(addrs: &[(i64, String, S7Address)], max_read_len: u32, merge_gap: 
     let mut groups: HashMap<(&'static str, String, u16), Vec<(u32, u16, i64, String, S7Address)>> =
         HashMap::new();
     for (tid, dtype, a) in addrs {
-        let key = (a.kind, if a.kind == "DB" { String::new() } else { a.area.clone() }, a.db);
+        let key = (
+            a.kind,
+            if a.kind == "DB" {
+                String::new()
+            } else {
+                a.area.clone()
+            },
+            a.db,
+        );
         if !groups.contains_key(&key) {
             order.push(key.clone());
         }
-        groups
-            .entry(key)
-            .or_default()
-            .push((a.offset, a.byte_len(), *tid, dtype.clone(), a.clone()));
+        groups.entry(key).or_default().push((
+            a.offset,
+            a.byte_len(),
+            *tid,
+            dtype.clone(),
+            a.clone(),
+        ));
     }
 
     let mut plan: Vec<ReadBlock> = Vec::new();
@@ -583,7 +634,14 @@ fn plan_reads(addrs: &[(i64, String, S7Address)], max_read_len: u32, merge_gap: 
             }
         }
         if let Some(b) = block.take() {
-            plan.push(ReadBlock { kind, area, db, start: b.0, length: b.1 - b.0, members: b.2 });
+            plan.push(ReadBlock {
+                kind,
+                area,
+                db,
+                start: b.0,
+                length: b.1 - b.0,
+                members: b.2,
+            });
         }
     }
     plan
@@ -601,7 +659,8 @@ async fn read_plan(
         let read = if blk.kind == "DB" {
             c.db_read(blk.db, blk.start, blk.length as u16).await
         } else {
-            c.read_area(area_code(&blk.area), blk.start, blk.length as u16).await
+            c.read_area(area_code(&blk.area), blk.start, blk.length as u16)
+                .await
         };
         let buf = match read {
             Ok(b) => {
@@ -616,7 +675,8 @@ async fn read_plan(
                     let one = if blk.kind == "DB" {
                         c.db_read(a.db, a.offset, a.byte_len()).await
                     } else {
-                        c.read_area(area_code(&a.area), a.offset, a.byte_len()).await
+                        c.read_area(area_code(&a.area), a.offset, a.byte_len())
+                            .await
                     };
                     match one {
                         Ok(b) => {
@@ -739,30 +799,62 @@ mod tests {
         // INT16 big-endian: [0x00, 0xFF] = 255
         let buf = [0x00u8, 0xFF, 0x42, 0xF6, 0xA4, 0x5A];
         let a = S7Address {
-            kind: "DB", area: "DBW".into(), db: 1, size: SizeLetter::W, offset: 0, bit: 0, v_area: false,
+            kind: "DB",
+            area: "DBW".into(),
+            db: 1,
+            size: SizeLetter::W,
+            offset: 0,
+            bit: 0,
+            v_area: false,
         };
         assert_eq!(extract(&buf, 0, &a, "INT16").unwrap(), 255.0);
         // BOOL: бит 1 байта 0xFF (вторые два байта буфера — не наш случай)
-        let a = S7Address { size: SizeLetter::X, bit: 1, ..a };
+        let a = S7Address {
+            size: SizeLetter::X,
+            bit: 1,
+            ..a
+        };
         assert_eq!(extract(&buf[1..], 0, &a, "BOOL").unwrap(), 1.0); // 0xFF
         assert_eq!(extract(&buf, 0, &a, "BOOL").unwrap(), 0.0); // 0x00
-        // FLOAT big-endian: 0x42F6A45A = 123.321
+                                                                // FLOAT big-endian: 0x42F6A45A = 123.321
         let a = S7Address {
-            kind: "DB", area: "DBD".into(), db: 1, size: SizeLetter::D, offset: 2, bit: 0, v_area: false,
+            kind: "DB",
+            area: "DBD".into(),
+            db: 1,
+            size: SizeLetter::D,
+            offset: 2,
+            bit: 0,
+            v_area: false,
         };
         assert!((extract(&buf, 2, &a, "FLOAT").unwrap() - 123.32099914550781).abs() < 1e-3);
 
         // выход за границу буфера — None
-        let a = S7Address { size: SizeLetter::D, offset: 0, ..a };
+        let a = S7Address {
+            size: SizeLetter::D,
+            offset: 0,
+            ..a
+        };
         assert!(extract(&buf[0..3], 0, &a, "FLOAT").is_none());
     }
 
     #[test]
     fn plan_merges_neighbors() {
         let addrs = vec![
-            (1i64, "INT16".to_string(), parse_s7_address("DB1.DBW0", "INT16").unwrap()),
-            (2, "INT16".to_string(), parse_s7_address("DB1.DBW4", "INT16").unwrap()),
-            (3, "INT16".to_string(), parse_s7_address("DB1.DBW100", "INT16").unwrap()),
+            (
+                1i64,
+                "INT16".to_string(),
+                parse_s7_address("DB1.DBW0", "INT16").unwrap(),
+            ),
+            (
+                2,
+                "INT16".to_string(),
+                parse_s7_address("DB1.DBW4", "INT16").unwrap(),
+            ),
+            (
+                3,
+                "INT16".to_string(),
+                parse_s7_address("DB1.DBW100", "INT16").unwrap(),
+            ),
         ];
         let plan = plan_reads(&addrs, 200, 16);
         assert_eq!(plan.len(), 2);
@@ -776,8 +868,16 @@ mod tests {
     #[test]
     fn plan_respects_max_len() {
         let addrs = vec![
-            (1i64, "INT16".to_string(), parse_s7_address("DB1.DBW0", "INT16").unwrap()),
-            (2, "INT16".to_string(), parse_s7_address("DB1.DBW220", "INT16").unwrap()),
+            (
+                1i64,
+                "INT16".to_string(),
+                parse_s7_address("DB1.DBW0", "INT16").unwrap(),
+            ),
+            (
+                2,
+                "INT16".to_string(),
+                parse_s7_address("DB1.DBW220", "INT16").unwrap(),
+            ),
         ];
         let plan = plan_reads(&addrs, 200, 16);
         // зазор 220 > merge_gap 16 — два блока; даже если бы зазор позволял,

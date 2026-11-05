@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::config::JournalConfig;
 use crate::core::historian::Historian;
@@ -20,12 +20,28 @@ use crate::database::db_service::{DbConfigStore, DbWriter};
 use crate::models::Connection;
 
 use super::base::DriverState;
-use super::{modbus_client, modbus_server, registry, snap7};
+use super::{modbus_client, modbus_server, priority, registry, snap7};
 
 /// Запущенный драйвер: состояние + задача (аналог объекта BaseDriver).
 struct RunningDriver {
     state: Arc<DriverState>,
     handle: tokio::task::JoinHandle<()>,
+}
+
+/// Выделенный рантайм опроса. Драйверы PLC/Modbus крутятся здесь, а не в общем
+/// пуле с HTTP/WS/журналом: их потоки поднимаются до HIGHEST, поэтому целевой
+/// poll_interval_ms держится даже при загрузке сервера.
+fn poll_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("pda-poll")
+            .enable_all()
+            .on_thread_start(priority::set_thread_priority)
+            .build()
+            .expect("не удалось создать рантайм опроса")
+    })
 }
 
 pub struct DriverManager {
@@ -46,7 +62,12 @@ impl DriverManager {
         let jcfg = cfg.unwrap_or_default();
         let registry = Arc::new(TagRegistry::new());
         let historian = Historian::new(registry.clone(), writer, &jcfg);
-        Self { store, registry, historian, drivers: HashMap::new() }
+        Self {
+            store,
+            registry,
+            historian,
+            drivers: HashMap::new(),
+        }
     }
 
     // ---------------------------------------------------------------- tags
@@ -63,6 +84,13 @@ impl DriverManager {
     // -------------------------------------------------------------- drivers
     /// Запускает все включённые подключения (уже запущенные пропускаются) и журнал.
     pub async fn start_all(&mut self) {
+        self.start_drivers().await;
+        self.historian.start().await;
+    }
+
+    /// Запускает только драйверы опроса (журнал уже работает).
+    /// Используется при выходе из режима «только просмотр».
+    pub async fn start_drivers(&mut self) {
         let conns = match self.store.get_all_connections().await {
             Ok(c) => c,
             Err(exc) => {
@@ -78,8 +106,22 @@ impl DriverManager {
             }
             self.spawn_driver(&c);
         }
+    }
 
+    /// Запуск без опроса: реестр из БД + журнал. Это режим «только просмотр» —
+    /// приложение читает историю, но не опрашивает ПЛК и не занимает порты.
+    pub async fn start_journal(&mut self) {
+        self.reload_tags().await;
         self.historian.start().await;
+    }
+
+    /// Останавливает только драйверы опроса; журнал продолжает работать и
+    /// дописывает накопленные точки. Порты (Modbus-сервер) освобождаются.
+    pub async fn stop_drivers(&mut self) {
+        for (_id, d) in self.drivers.drain() {
+            d.state.stop();
+            d.handle.abort();
+        }
     }
 
     /// Аналог `driver_class(c, db, registry).start()` по каноническому типу.
@@ -99,11 +141,20 @@ impl DriverManager {
         let state = DriverState::new(c);
         let registry = self.registry.clone();
         let task_state = state.clone();
-        let handle = tokio::spawn(async move {
+        // Modbus-серверу нужен прямой доступ к очереди журнала: записанное
+        // Master'ом значение должно попадать в БД при приходе посылки.
+        let journal = self.historian.collector().clone();
+        // Опрос — на выделенном рантайме с повышенным приоритетом потоков.
+        let handle = poll_runtime().spawn(async move {
             match dt.as_str() {
                 "snap7" | "snap7_s200" => snap7::run_snap7(conn_cfg, registry, task_state).await,
-                "modbus_client" => modbus_client::run_modbus_client(conn_cfg, registry, task_state).await,
-                "modbus_server" => modbus_server::run_modbus_server(conn_cfg, registry, task_state).await,
+                "modbus_client" => {
+                    modbus_client::run_modbus_client(conn_cfg, registry, task_state).await
+                }
+                "modbus_server" => {
+                    modbus_server::run_modbus_server(conn_cfg, registry, task_state, Some(journal))
+                        .await
+                }
                 _ => {}
             }
         });
@@ -112,10 +163,7 @@ impl DriverManager {
 
     /// Останавливает драйверы, затем журнал: накопленные точки сольются в БД.
     pub async fn stop_all(&mut self) {
-        for (_id, d) in self.drivers.drain() {
-            d.state.stop();
-            d.handle.abort();
-        }
+        self.stop_drivers().await;
         self.historian.stop().await;
     }
 
@@ -176,9 +224,11 @@ impl DriverManager {
 
     /// Состояния всех драйверов для панели/веба.
     pub fn drivers_json(&self) -> serde_json::Value {
-        serde_json::json!(
-            self.drivers.values().map(|d| d.state.to_json()).collect::<Vec<_>>()
-        )
+        serde_json::json!(self
+            .drivers
+            .values()
+            .map(|d| d.state.to_json())
+            .collect::<Vec<_>>())
     }
 
     pub fn running_count(&self) -> usize {
@@ -231,7 +281,19 @@ mod tests {
             Ok(())
         }
         async fn get_all_tags(&self) -> DbResult<Vec<Tag>> {
-            Ok(vec![Tag::new(1, 7, "t", "C1", "BOOL", 1.0, 0.0, "", "Общие", 0, 0.0)])
+            Ok(vec![Tag::new(
+                1,
+                7,
+                "t",
+                "C1",
+                "BOOL",
+                1.0,
+                0.0,
+                "",
+                "Общие",
+                0,
+                0.0,
+            )])
         }
         async fn get_configured_tags(&self) -> DbResult<Vec<Tag>> {
             self.get_all_tags().await
@@ -314,7 +376,9 @@ mod tests {
         };
         let mut mgr = DriverManager::new(
             Arc::new(StoreStub),
-            Arc::new(WriterStub { written: written.clone() }),
+            Arc::new(WriterStub {
+                written: written.clone(),
+            }),
             Some(cfg),
         );
 
@@ -328,7 +392,11 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(mgr.running_count(), 1, "подключение modbus_server запущено");
-        assert!(mgr.driver_status(7).starts_with("Running"), "статус: {}", mgr.driver_status(7));
+        assert!(
+            mgr.driver_status(7).starts_with("Running"),
+            "статус: {}",
+            mgr.driver_status(7)
+        );
         assert_eq!(mgr.driver_status(999), "Stopped", "нет драйвера — Stopped");
 
         // Пауза на один цикл журнала, потом остановка — остаток сольётся в stub
@@ -347,7 +415,9 @@ mod tests {
         let cfg = JournalConfig::default();
         let mut mgr = DriverManager::new(
             Arc::new(StoreStub),
-            Arc::new(WriterStub { written: Arc::new(std::sync::atomic::AtomicUsize::new(0)) }),
+            Arc::new(WriterStub {
+                written: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
             Some(cfg),
         );
         // неизвестный тип не должен паниковать

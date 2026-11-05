@@ -8,6 +8,7 @@
 //!   live_tx   — broadcast-издатель снимков для WebSocket.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use pda_core::core::tag_registry::TagRegistry;
@@ -25,6 +26,10 @@ pub struct AppCore {
     pub registry: Arc<TagRegistry>,
     pub manager: RwLock<DriverManager>,
     pub live_tx: broadcast::Sender<String>,
+    /// Режим «только просмотр»: опрос модулей остановлен. Нужен, чтобы рядом
+    /// с рабочей копией можно было запустить вторую — она покажет историю и
+    /// графики, но не будет опрашивать ПЛК и занимать порт Modbus-сервера.
+    pub view_only: AtomicBool,
     /// Куда писать db_config.json при переключении БД (тот же каталог, откуда
     /// читали — аналог поведения Python-приложения на месте запуска).
     pub db_config_path: PathBuf,
@@ -44,7 +49,11 @@ impl AppCore {
     }
 
     /// То же, но с явным каталогом экспорта PNG (тесты пишут во временный).
-    pub fn with_config_and_exports(db: Arc<DatabaseService>, db_config_path: PathBuf, exports_dir: PathBuf) -> Arc<Self> {
+    pub fn with_config_and_exports(
+        db: Arc<DatabaseService>,
+        db_config_path: PathBuf,
+        exports_dir: PathBuf,
+    ) -> Arc<Self> {
         let manager = DriverManager::new(db.clone(), db.clone(), None);
         let registry = manager.registry.clone();
         let (live_tx, _) = broadcast::channel(64);
@@ -53,6 +62,7 @@ impl AppCore {
             registry,
             manager: RwLock::new(manager),
             live_tx,
+            view_only: AtomicBool::new(false),
             db_config_path,
             exports_dir,
         })
@@ -60,12 +70,45 @@ impl AppCore {
 
     /// Открытие БД из db_config.json и сборка ядра.
     pub async fn from_config(cfg: DbConfig, db_config_path: PathBuf) -> Arc<Self> {
+        // Поднимаем приоритет процесса (Windows: ABOVE_NORMAL) — опрос не конкурирует с HTTP/WS.
+        pda_core::drivers::priority::set_process_priority();
         let db = Arc::new(DatabaseService::open(cfg).await);
         Self::with_config_path(db, db_config_path)
     }
 
     pub async fn db_snapshot(&self) -> Arc<DatabaseService> {
         self.db.read().await.clone()
+    }
+
+    /// Запуск ядра: журнал стартует всегда, драйверы — только если это не
+    /// режим «только просмотр».
+    pub async fn start(&self, view_only: bool) {
+        self.view_only.store(view_only, Ordering::SeqCst);
+        let mut mgr = self.manager.write().await;
+        if view_only {
+            mgr.start_journal().await;
+        } else {
+            mgr.start_all().await;
+        }
+    }
+
+    /// true — опрос остановлен (только просмотр истории).
+    pub fn is_view_only(&self) -> bool {
+        self.view_only.load(Ordering::SeqCst)
+    }
+
+    /// Включить/выключить режим «только просмотр». При включении опрос
+    /// останавливается и порты освобождаются, при выключении — поднимается
+    /// заново из текущей конфигурации. Возвращает новое состояние.
+    pub async fn set_view_only(&self, on: bool) -> bool {
+        self.view_only.store(on, Ordering::SeqCst);
+        let mut mgr = self.manager.write().await;
+        if on {
+            mgr.stop_drivers().await;
+        } else {
+            mgr.start_drivers().await;
+        }
+        on
     }
 
     /// Переподключение на новую конфигурацию БД (аналог _reconnect_database):
@@ -77,13 +120,19 @@ impl AppCore {
             return Err(err.clone());
         }
         let new_db = Arc::new(candidate);
+        let view_only = self.is_view_only();
 
         {
             let mut mgr = self.manager.write().await;
             mgr.stop_all().await;
             mgr.set_store(new_db.clone());
             mgr.set_db(new_db.clone());
-            mgr.start_all().await;
+            // В «только просмотр» опрос не поднимаем и после смены базы.
+            if view_only {
+                mgr.start_journal().await;
+            } else {
+                mgr.start_all().await;
+            }
         }
         *self.db.write().await = new_db;
         Ok(())

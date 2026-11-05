@@ -20,14 +20,23 @@ pub const AREA_DISCRETE: &str = "DI";
 pub const MODBUS_AREAS: [(&str, &str); 4] = [
     (AREA_HOLDING, "HR — Holding Registers (читается/пишется)"),
     (AREA_INPUT, "IR — Input Registers (только чтение)"),
-    (AREA_COIL, "C — Coils / дискретные выходы (читается/пишется)"),
-    (AREA_DISCRETE, "DI — Discrete Inputs / дискретные входы (только чтение)"),
+    (
+        AREA_COIL,
+        "C — Coils / дискретные выходы (читается/пишется)",
+    ),
+    (
+        AREA_DISCRETE,
+        "DI — Discrete Inputs / дискретные входы (только чтение)",
+    ),
 ];
 
 /// Сервер эмулирует только записываемые карты — IR/DI наполнять нечем.
 pub const MODBUS_AREAS_SERVER: [(&str, &str); 2] = [
     (AREA_HOLDING, "HR — Holding Registers (читается/пишется)"),
-    (AREA_COIL, "C — Coils / дискретные выходы (читается/пишется)"),
+    (
+        AREA_COIL,
+        "C — Coils / дискретные выходы (читается/пишется)",
+    ),
 ];
 
 pub const MAX_REGS_PER_REQUEST: u32 = 125; // FC03/FC04
@@ -55,9 +64,12 @@ static PREFIXES: [(&str, &str); 11] = [
 ];
 
 static ADDR_RE: Lazy<Regex> = Lazy::new(|| {
-    let alts = PREFIXES.iter().map(|(p, _)| *p).collect::<Vec<_>>().join("|");
-    Regex::new(&format!(r"^(?:(?P<prefix>{alts})\s*)?(?P<offset>\d{{1,6}})$").to_string())
-        .unwrap()
+    let alts = PREFIXES
+        .iter()
+        .map(|(p, _)| *p)
+        .collect::<Vec<_>>()
+        .join("|");
+    Regex::new(&format!(r"^(?:(?P<prefix>{alts})\s*)?(?P<offset>\d{{1,6}})$").to_string()).unwrap()
 });
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +80,10 @@ pub struct ModbusAddress {
 
 impl ModbusAddress {
     pub fn new(area: impl Into<String>, offset: u32) -> Self {
-        Self { area: area.into(), offset }
+        Self {
+            area: area.into(),
+            offset,
+        }
     }
 
     pub fn is_bit(&self) -> bool {
@@ -106,7 +121,12 @@ pub fn parse_modbus_address(address: &str, _data_type: &str) -> Option<ModbusAdd
     }
     // Классическая запись области цифрами: 4x/3x/0x/1x
     let mut area: Option<&str> = None;
-    for (pre, a) in [("4X", AREA_HOLDING), ("3X", AREA_INPUT), ("1X", AREA_DISCRETE), ("0X", AREA_COIL)] {
+    for (pre, a) in [
+        ("4X", AREA_HOLDING),
+        ("3X", AREA_INPUT),
+        ("1X", AREA_DISCRETE),
+        ("0X", AREA_COIL),
+    ] {
         if text.starts_with(pre) {
             area = Some(a);
             text = text[pre.len()..].to_string();
@@ -128,7 +148,10 @@ pub fn parse_modbus_address(address: &str, _data_type: &str) -> Option<ModbusAdd
     if offset > MAX_OFFSET {
         return None;
     }
-    Some(ModbusAddress { area: area.unwrap().to_string(), offset })
+    Some(ModbusAddress {
+        area: area.unwrap().to_string(),
+        offset,
+    })
 }
 
 /// Текст ошибки для адреса либо `None`, если всё корректно.
@@ -163,26 +186,62 @@ mod tests {
 
     #[test]
     fn bare_number_is_holding() {
-        assert_eq!(parse_modbus_address("100", ""), Some(ModbusAddress::new(AREA_HOLDING, 100)));
-        assert_eq!(parse_modbus_address("40001", ""), Some(ModbusAddress::new(AREA_HOLDING, 40001)));
+        assert_eq!(
+            parse_modbus_address("100", ""),
+            Some(ModbusAddress::new(AREA_HOLDING, 100))
+        );
+        assert_eq!(
+            parse_modbus_address("40001", ""),
+            Some(ModbusAddress::new(AREA_HOLDING, 40001))
+        );
     }
 
     #[test]
     fn prefixes_and_aliases() {
-        assert_eq!(parse_modbus_address("HR100", ""), Some(ModbusAddress::new(AREA_HOLDING, 100)));
-        assert_eq!(parse_modbus_address("hr 100", ""), Some(ModbusAddress::new(AREA_HOLDING, 100)));
-        assert_eq!(parse_modbus_address("INPUT10", ""), Some(ModbusAddress::new(AREA_INPUT, 10)));
-        assert_eq!(parse_modbus_address("COIL3", ""), Some(ModbusAddress::new(AREA_COIL, 3)));
-        assert_eq!(parse_modbus_address("DISC2", ""), Some(ModbusAddress::new(AREA_DISCRETE, 2)));
-        assert_eq!(parse_modbus_address("%C7", ""), Some(ModbusAddress::new(AREA_COIL, 7)));
+        assert_eq!(
+            parse_modbus_address("HR100", ""),
+            Some(ModbusAddress::new(AREA_HOLDING, 100))
+        );
+        assert_eq!(
+            parse_modbus_address("hr 100", ""),
+            Some(ModbusAddress::new(AREA_HOLDING, 100))
+        );
+        assert_eq!(
+            parse_modbus_address("INPUT10", ""),
+            Some(ModbusAddress::new(AREA_INPUT, 10))
+        );
+        assert_eq!(
+            parse_modbus_address("COIL3", ""),
+            Some(ModbusAddress::new(AREA_COIL, 3))
+        );
+        assert_eq!(
+            parse_modbus_address("DISC2", ""),
+            Some(ModbusAddress::new(AREA_DISCRETE, 2))
+        );
+        assert_eq!(
+            parse_modbus_address("%C7", ""),
+            Some(ModbusAddress::new(AREA_COIL, 7))
+        );
     }
 
     #[test]
     fn numeric_area_forms() {
-        assert_eq!(parse_modbus_address("4x100", ""), Some(ModbusAddress::new(AREA_HOLDING, 100)));
-        assert_eq!(parse_modbus_address("3X7", ""), Some(ModbusAddress::new(AREA_INPUT, 7)));
-        assert_eq!(parse_modbus_address("0X15", ""), Some(ModbusAddress::new(AREA_COIL, 15)));
-        assert_eq!(parse_modbus_address("1X15", ""), Some(ModbusAddress::new(AREA_DISCRETE, 15)));
+        assert_eq!(
+            parse_modbus_address("4x100", ""),
+            Some(ModbusAddress::new(AREA_HOLDING, 100))
+        );
+        assert_eq!(
+            parse_modbus_address("3X7", ""),
+            Some(ModbusAddress::new(AREA_INPUT, 7))
+        );
+        assert_eq!(
+            parse_modbus_address("0X15", ""),
+            Some(ModbusAddress::new(AREA_COIL, 15))
+        );
+        assert_eq!(
+            parse_modbus_address("1X15", ""),
+            Some(ModbusAddress::new(AREA_DISCRETE, 15))
+        );
     }
 
     #[test]

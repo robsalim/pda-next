@@ -124,6 +124,15 @@ button[disabled] { opacity: .5; cursor: default; }
 .legend-del:hover { color: var(--text-strong); background: transparent; border: none; }
 .chart-box { flex: 1; width: 100%; height: 100%; background: var(--plot-bg); border: 1px solid var(--border); border-radius: 4px; position: relative; overflow: hidden; }
 
+/* ===== Обзор архива (мини-график текущего окна в режиме Archive) ===== */
+.arch-hint { font-size: 11px; color: var(--text-faint); white-space: nowrap; margin-left: 4px; }
+.arch-hint.st-warn { color: var(--warn, #FF9F40); }
+.arch-overview { flex: 0 0 auto; display: flex; flex-direction: column; gap: 4px; }
+.arch-overview-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--text-faint); }
+.arch-overview-note { font-size: 11px; color: #ff3b30; min-height: 0; }
+.arch-overview-note:empty { display: none; }
+.arch-overview .chart-box { flex: none; height: 110px; }
+
 /* ===== BITS ===== */
 #page-bits { flex-direction: row; width: 100%; height: 100%; }
 .bits-right { flex: 1; display: flex; flex-direction: column; padding: 8px; gap: 8px; min-width: 0; }
@@ -175,6 +184,7 @@ table.io-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .io-table .v-good { color: var(--ok); font-weight: bold; }
 .io-table .v-bad { color: var(--error); font-weight: bold; }
 .io-drv { font-size: 11px; color: var(--text-dim); }
+.io-poll { font-size: 11px; color: var(--text-faint); flex-shrink: 0; min-width: 0; text-overflow: ellipsis; white-space: nowrap; overflow: hidden; max-width: 160px; }
 .io-drv .st-err { color: var(--error); }
 .io-drv .st-ok { color: var(--ok); }
 

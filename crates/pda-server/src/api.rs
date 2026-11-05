@@ -15,7 +15,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use serde_json::{json, Value};
 
-use pda_core::database::db_service::{DbConfig, DbConfigStore, DatabaseService};
+use pda_core::database::db_service::{DatabaseService, DbConfig, DbConfigStore};
 use pda_core::models::{Connection, Tag};
 
 use crate::state::AppCore;
@@ -85,7 +85,14 @@ fn points_payload(points: Vec<pda_core::models::DataPoint>) -> Vec<(f64, f64)> {
     points
         .into_iter()
         .map(|p| {
-            let ts = p.timestamp.and_local_timezone(Local).single().map(|d| d.timestamp() as f64).unwrap_or(0.0);
+            // Python: p.timestamp.timestamp() → float с микросекундами.
+            // Rust: timestamp_millis() / 1000.0 — миллисекунды как float секунд.
+            let ts = p
+                .timestamp
+                .and_local_timezone(Local)
+                .single()
+                .map(|d| d.timestamp_millis() as f64 / 1000.0)
+                .unwrap_or(0.0);
             (ts, p.value)
         })
         .collect()
@@ -109,7 +116,13 @@ pub async fn tags(State(core): State<Arc<AppCore>>) -> ApiResult<Json<Value>> {
     let db = core.db_snapshot().await;
     let tags = db.get_all_tags().await?;
     let conns = db.get_all_connections().await?;
-    let name_of = |cid: i64| conns.iter().find(|c| c.id == cid).map(|c| c.name.clone()).unwrap_or_default();
+    let name_of = |cid: i64| {
+        conns
+            .iter()
+            .find(|c| c.id == cid)
+            .map(|c| c.name.clone())
+            .unwrap_or_default()
+    };
     let out: Vec<Value> = tags
         .iter()
         .map(|t| {
@@ -144,14 +157,22 @@ pub async fn points(
     let delta_ms = parse_span_ms(&q.span);
     let (points, t_start, t_end) = db.get_data_points_by_span(tag_id, delta_ms).await?;
     let (times, values): (Vec<f64>, Vec<f64>) = points_payload(points).into_iter().unzip();
-    Ok(Json(json!({ "times": times, "values": values, "t_start": t_start, "t_end": t_end })))
+    Ok(Json(
+        json!({ "times": times, "values": values, "t_start": t_start, "t_end": t_end }),
+    ))
 }
 
 #[derive(serde::Deserialize)]
 pub struct ArchiveQuery {
+    /// Начало окна (datetime-local). Не нужен, если заданы t0/t1.
+    #[serde(default)]
     start: String,
     #[serde(default = "default_span")]
     duration: String,
+    /// Точное окно в epoch-секундах (выбор на мини-обзоре архива).
+    /// Когда заданы оба — имеют приоритет над start/duration.
+    t0: Option<f64>,
+    t1: Option<f64>,
 }
 
 /// Исторический диапазон (Python /api/archive).
@@ -161,9 +182,23 @@ pub async fn archive(
     Query(q): Query<ArchiveQuery>,
 ) -> ApiResult<Json<Value>> {
     let db = core.db_snapshot().await;
-    let start_dt = parse_iso_local(&q.start).unwrap_or_else(|| Local::now() - chrono::Duration::hours(1));
-    let dur_ms = parse_span_ms(&q.duration);
-    let end_dt = start_dt + chrono::Duration::milliseconds(dur_ms);
+    let (start_dt, end_dt) = match (q.t0, q.t1) {
+        (Some(t0), Some(t1)) if t1 > t0 => {
+            let start_dt = chrono::TimeZone::timestamp_millis_opt(&Local, (t0 * 1000.0).round() as i64)
+                .single()
+                .unwrap_or_else(|| Local::now() - chrono::Duration::hours(1));
+            let end_dt = chrono::TimeZone::timestamp_millis_opt(&Local, (t1 * 1000.0).round() as i64)
+                .single()
+                .unwrap_or_else(|| Local::now());
+            (start_dt, end_dt)
+        }
+        _ => {
+            let start_dt = parse_iso_local(&q.start)
+                .unwrap_or_else(|| Local::now() - chrono::Duration::hours(1));
+            let dur_ms = parse_span_ms(&q.duration);
+            (start_dt, start_dt + chrono::Duration::milliseconds(dur_ms))
+        }
+    };
     let points = db.get_data_points_range(tag_id, start_dt, end_dt).await?;
     let (times, values): (Vec<f64>, Vec<f64>) = points_payload(points).into_iter().unzip();
     Ok(Json(json!({
@@ -174,6 +209,181 @@ pub async fn archive(
     })))
 }
 
+/// Пакетное чтение истории для окна графика.
+///
+/// Возвращает выровненные серии: все теги получают одинаковую сетку времени,
+/// иначе uPlot сдвинет значения одного сигнала относительно другого.
+/// Решение о прореживании принимается один раз на окно, а не на тег.
+#[derive(serde::Deserialize)]
+pub struct SeriesQuery {
+    /// Теги через запятую.
+    tags: String,
+    /// Окно относительно последней записи (Live). Игнорируется, если есть start.
+    #[serde(default = "default_span")]
+    span: String,
+    /// Начало окна (Archive).
+    start: Option<String>,
+    /// Длительность окна (Archive).
+    duration: Option<String>,
+    /// Явное окно зума: начало и конец в epoch-секундах (float). Когда заданы
+    /// оба, имеют приоритет над start/duration/span — фронт присылает их после
+    /// setScale, чтобы не зависеть от текстовых форматов span.
+    t0: Option<f64>,
+    t1: Option<f64>,
+}
+
+/// Метка самой свежей записи в базе (epoch, сек. float) — /api/last.
+/// Режим Archive показывает её во фронтенде, чтобы пользователь видел,
+/// до какого момента вообще есть история.
+pub async fn last_data(State(core): State<Arc<AppCore>>) -> ApiResult<Json<Value>> {
+    let db = core.db_snapshot().await;
+    let t_last = db.get_last_data_time().await?;
+    Ok(Json(json!({
+        "t_last": t_last.map(|ms| ms as f64 / 1000.0),
+    })))
+}
+
+/// Пустые интервалы истории (для подсветки «дыр» на обзоре архива).
+///
+/// Возвращает интервалы БЕЗ данных по выбранным тегам: сетка окна режется на
+/// `buckets` бакетов, занятые бакеты находятся одним DISTINCT-запросом, а
+/// промежутки между ними склеиваются здесь. Ответ маленький (десятки пар
+/// чисел) при любом окне, поэтому обзор суток не тормозит.
+#[derive(serde::Deserialize)]
+pub struct GapsQuery {
+    tags: String,
+    t0: f64,
+    t1: f64,
+    /// Число бакетов сетки (по умолчанию 600 — на сутки это ~2.4 мин).
+    buckets: Option<usize>,
+}
+
+pub async fn data_gaps(
+    State(core): State<Arc<AppCore>>,
+    Query(q): Query<GapsQuery>,
+) -> ApiResult<Json<Value>> {
+    let tag_ids: Vec<i64> = q
+        .tags
+        .split(',')
+        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .collect();
+    if tag_ids.is_empty() || !(q.t1 > q.t0) {
+        return Ok(Json(json!({ "gaps": [], "bucket_ms": 0 })));
+    }
+    let start_ms = (q.t0 * 1000.0).round() as i64;
+    let end_ms = (q.t1 * 1000.0).round() as i64;
+    let buckets = q.buckets.unwrap_or(600).clamp(20, 2000) as i64;
+    let span_ms = (end_ms - start_ms).max(1);
+    // Шаг бакета — целое число миллисекунд: дробный разъехался бы с сеткой БД.
+    let bucket_ms = ((span_ms + buckets - 1) / buckets).max(1);
+
+    let start_dt = chrono::TimeZone::timestamp_millis_opt(&Local, start_ms)
+        .single()
+        .unwrap_or_else(Local::now);
+    let end_dt = chrono::TimeZone::timestamp_millis_opt(&Local, end_ms)
+        .single()
+        .unwrap_or_else(Local::now);
+
+    let db = core.db_snapshot().await;
+    let busy = db
+        .get_busy_buckets(&tag_ids, start_dt, end_dt, bucket_ms)
+        .await?;
+    let busy: std::collections::HashSet<i64> = busy.into_iter().collect();
+
+    // Обходим сетку и склеиваем подряд идущие пустые бакеты в один интервал.
+    let mut gaps: Vec<[f64; 2]> = Vec::new();
+    let mut run: Option<i64> = None;
+    let mut b = start_ms.div_euclid(bucket_ms) * bucket_ms;
+    while b < end_ms {
+        if busy.contains(&b) {
+            if let Some(from) = run.take() {
+                gaps.push([from as f64 / 1000.0, b.min(end_ms) as f64 / 1000.0]);
+            }
+        } else if run.is_none() {
+            run = Some(b.max(start_ms));
+        }
+        b += bucket_ms;
+    }
+    if let Some(from) = run {
+        gaps.push([from as f64 / 1000.0, end_ms as f64 / 1000.0]);
+    }
+
+    Ok(Json(json!({
+        "gaps": gaps,
+        "bucket_ms": bucket_ms,
+        "t0": q.t0,
+        "t1": q.t1,
+    })))
+}
+
+pub async fn series(
+    State(core): State<Arc<AppCore>>,
+    Query(q): Query<SeriesQuery>,
+) -> ApiResult<Json<Value>> {
+    let tag_ids: Vec<i64> = q
+        .tags
+        .split(',')
+        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .collect();
+    if tag_ids.is_empty() {
+        return Ok(Json(json!({ "series": [], "t_start": 0.0, "t_end": 0.0 })));
+    }
+
+    let db = core.db_snapshot().await;
+    // Приоритет: явное окно зума (t0/t1) -> start+duration -> Live по span.
+    // t0/t1 приходят в секундах (float) из uPlot; переводим в миллисекунды —
+    // разрешение журнала всё равно мс, а наносекундная арифметика опасна
+    // округлением (nanos == 1_000_000_000 -> None, и окно молча съехал бы).
+    let (start_dt, end_dt) = match (q.t0, q.t1) {
+        (Some(t0), Some(t1)) if t1 > t0 => {
+            let start_dt =
+                chrono::TimeZone::timestamp_millis_opt(&Local, (t0 * 1000.0).round() as i64)
+                    .single()
+                    .unwrap_or_else(|| Local::now() - chrono::Duration::hours(1));
+            let end_dt =
+                chrono::TimeZone::timestamp_millis_opt(&Local, (t1 * 1000.0).round() as i64)
+                    .single()
+                    .unwrap_or_else(|| Local::now());
+            (start_dt, end_dt)
+        }
+        _ => match (&q.start, &q.duration) {
+            (Some(s), Some(d)) => {
+                let start_dt =
+                    parse_iso_local(s).unwrap_or_else(|| Local::now() - chrono::Duration::hours(1));
+                (
+                    start_dt,
+                    start_dt + chrono::Duration::milliseconds(parse_span_ms(d)),
+                )
+            }
+            _ => {
+                // Live: окно относительно последней записи самого свежего тега.
+                let delta_ms = parse_span_ms(&q.span);
+                let now = Local::now();
+                (now - chrono::Duration::milliseconds(delta_ms), now)
+            }
+        },
+    };
+
+    let window = db.get_series_window(&tag_ids, start_dt, end_dt).await?;
+    let series: Vec<Value> = window
+        .into_iter()
+        .map(|(tag_id, points)| {
+            let (times, values): (Vec<f64>, Vec<f64>) = points_payload(points).into_iter().unzip();
+            json!({ "tag_id": tag_id, "times": times, "values": values })
+        })
+        .collect();
+
+    // t_last — момент самой свежей записи во всей базе. Фронт в режиме Archive
+    // показывает его рядом с полем «Начало»: видно, до какой даты грузить.
+    let t_last = db.get_last_data_time().await.ok().flatten();
+    Ok(Json(json!({
+        "series": series,
+        "t_start": start_dt.timestamp_millis() as f64 / 1000.0,
+        "t_end": end_dt.timestamp_millis() as f64 / 1000.0,
+        "t_last": t_last.map(|ms| ms as f64 / 1000.0),
+    })))
+}
+
 /// Текущие значения из реестра (Python /api/live), с именами для таблиц IO.
 pub async fn live(State(core): State<Arc<AppCore>>) -> Json<Value> {
     let rows: Vec<Value> = core
@@ -181,7 +391,11 @@ pub async fn live(State(core): State<Arc<AppCore>>) -> Json<Value> {
         .live_snapshot()
         .into_iter()
         .map(|lv| {
-            let name = core.registry.get(lv.tag_id).map(|p| p.name()).unwrap_or_default();
+            let name = core
+                .registry
+                .get(lv.tag_id)
+                .map(|p| p.name())
+                .unwrap_or_default();
             json!({
                 "id": lv.tag_id,
                 "name": name,
@@ -200,16 +414,25 @@ pub async fn live(State(core): State<Arc<AppCore>>) -> Json<Value> {
 pub async fn status(State(core): State<Arc<AppCore>>) -> Json<Value> {
     let mgr = core.manager.read().await;
     let db = core.db_snapshot().await;
+    // Размер базы и число тегов для панели статуса (вкладка Database).
+    // На недоступной БД поля остаются null/0 — статус-панель не должна падать.
+    let (size_bytes, tags) = match db.get_db_info().await {
+        Ok(v) => v,
+        Err(_) => (None, 0),
+    };
     Json(json!({
         "app": { "name": pda_core::config::APP_NAME, "version": pda_core::config::APP_VERSION },
         "drivers": mgr.drivers_json(),
         "running": mgr.running_count(),
+        "view_only": core.is_view_only(),
         "journal": mgr.journal_stats(),
         "db": {
             "available": db.is_available,
             "engine": format!("{:?}", db.config().engine).to_lowercase(),
             "error": db.last_error.clone(),
             "config": db.config().to_json(),
+            "size_bytes": size_bytes,
+            "tags": tags,
         },
     }))
 }
@@ -219,10 +442,40 @@ pub struct RetentionBody {
     pub days: f64,
 }
 
-pub async fn set_retention(State(core): State<Arc<AppCore>>, Json(b): Json<RetentionBody>) -> Json<Value> {
+pub async fn set_retention(
+    State(core): State<Arc<AppCore>>,
+    Json(b): Json<RetentionBody>,
+) -> Json<Value> {
     let mgr = core.manager.read().await;
     mgr.set_retention_days(b.days);
     Json(json!({ "ok": true, "days": b.days }))
+}
+
+// ---------------------------------------------------------------- режим опроса
+
+#[derive(serde::Deserialize)]
+pub struct PollingBody {
+    /// true — опрос включён, false — «только просмотр» (опрос остановлен).
+    pub enabled: bool,
+}
+
+/// Включить/остановить опрос всех модулей.
+///
+/// Остановка нужна, чтобы запустить вторую копию приложения рядом с рабочей:
+/// она читает историю и рисует графики, но не опрашивает ПЛК и не занимает
+/// порт встроенного Modbus-сервера.
+pub async fn set_polling(
+    State(core): State<Arc<AppCore>>,
+    Json(b): Json<PollingBody>,
+) -> Json<Value> {
+    let view_only = core.set_view_only(!b.enabled).await;
+    let running = core.manager.read().await.running_count();
+    Json(json!({
+        "ok": true,
+        "polling": !view_only,
+        "view_only": view_only,
+        "running": running,
+    }))
 }
 
 // ---------------------------------------------------------------- IO: подключения
@@ -230,7 +483,9 @@ pub async fn set_retention(State(core): State<Arc<AppCore>>, Json(b): Json<Reten
 pub async fn connections(State(core): State<Arc<AppCore>>) -> ApiResult<Json<Value>> {
     let db = core.db_snapshot().await;
     let conns = db.get_all_connections().await?;
-    Ok(Json(serde_json::to_value(&conns).map_err(|e| ApiError(e.to_string()))?))
+    Ok(Json(
+        serde_json::to_value(&conns).map_err(|e| ApiError(e.to_string()))?,
+    ))
 }
 
 /// Форма подключения (создание — без id; изменение — PUT /connections/:id).
@@ -251,10 +506,20 @@ fn conn_from_body(id: i64, b: ConnBody) -> Connection {
         Value::Object(map) => map.into_iter().collect(),
         _ => Default::default(),
     };
-    Connection::new(id, b.name, b.driver_type, b.enabled, b.poll_interval_ms, config)
+    Connection::new(
+        id,
+        b.name,
+        b.driver_type,
+        b.enabled,
+        b.poll_interval_ms,
+        config,
+    )
 }
 
-pub async fn add_connection(State(core): State<Arc<AppCore>>, Json(b): Json<ConnBody>) -> ApiResult<Json<Value>> {
+pub async fn add_connection(
+    State(core): State<Arc<AppCore>>,
+    Json(b): Json<ConnBody>,
+) -> ApiResult<Json<Value>> {
     let db = core.db_snapshot().await;
     let conn = conn_from_body(0, b);
     let id = db.add_connection(&conn).await?;
@@ -275,7 +540,10 @@ pub async fn update_connection(
     Ok(Json(json!({ "ok": true })))
 }
 
-pub async fn delete_connection(State(core): State<Arc<AppCore>>, UrlPath(id): UrlPath<i64>) -> ApiResult<Json<Value>> {
+pub async fn delete_connection(
+    State(core): State<Arc<AppCore>>,
+    UrlPath(id): UrlPath<i64>,
+) -> ApiResult<Json<Value>> {
     let db = core.db_snapshot().await;
     db.delete_connection(id).await?;
     {
@@ -288,7 +556,10 @@ pub async fn delete_connection(State(core): State<Arc<AppCore>>, UrlPath(id): Ur
 }
 
 /// Перезапуск одного модуля (Python: «Перезапустить» в контекстном меню).
-pub async fn restart_connection(State(core): State<Arc<AppCore>>, UrlPath(id): UrlPath<i64>) -> ApiResult<Json<Value>> {
+pub async fn restart_connection(
+    State(core): State<Arc<AppCore>>,
+    UrlPath(id): UrlPath<i64>,
+) -> ApiResult<Json<Value>> {
     core.manager.write().await.restart_connection(id).await;
     Ok(Json(json!({ "ok": true })))
 }
@@ -313,7 +584,10 @@ pub struct DeleteGroupBody {
     pub with_tags: bool,
 }
 
-pub async fn list_groups(State(core): State<Arc<AppCore>>, UrlPath(id): UrlPath<i64>) -> ApiResult<Json<Value>> {
+pub async fn list_groups(
+    State(core): State<Arc<AppCore>>,
+    UrlPath(id): UrlPath<i64>,
+) -> ApiResult<Json<Value>> {
     let db = core.db_snapshot().await;
     let groups = db.get_groups_by_connection(id).await?;
     let counts = db.get_group_counts(id).await?;
@@ -362,13 +636,21 @@ pub struct IdsBody {
     pub ids: Vec<i64>,
 }
 
-pub async fn tags_by_conn(State(core): State<Arc<AppCore>>, UrlPath(id): UrlPath<i64>) -> ApiResult<Json<Value>> {
+pub async fn tags_by_conn(
+    State(core): State<Arc<AppCore>>,
+    UrlPath(id): UrlPath<i64>,
+) -> ApiResult<Json<Value>> {
     let db = core.db_snapshot().await;
     let tags = db.get_tags_by_connection(id).await?;
-    Ok(Json(serde_json::to_value(&tags).map_err(|e| ApiError(e.to_string()))?))
+    Ok(Json(
+        serde_json::to_value(&tags).map_err(|e| ApiError(e.to_string()))?,
+    ))
 }
 
-pub async fn add_tag(State(core): State<Arc<AppCore>>, Json(tag): Json<Tag>) -> ApiResult<Json<Value>> {
+pub async fn add_tag(
+    State(core): State<Arc<AppCore>>,
+    Json(tag): Json<Tag>,
+) -> ApiResult<Json<Value>> {
     let db = core.db_snapshot().await;
     let mut tag = tag;
     tag.id = 0;
@@ -390,7 +672,10 @@ pub async fn update_tag(
     Ok(Json(json!({ "ok": true })))
 }
 
-pub async fn delete_tags(State(core): State<Arc<AppCore>>, Json(b): Json<IdsBody>) -> ApiResult<Json<Value>> {
+pub async fn delete_tags(
+    State(core): State<Arc<AppCore>>,
+    Json(b): Json<IdsBody>,
+) -> ApiResult<Json<Value>> {
     let db = core.db_snapshot().await;
     db.delete_tags(&b.ids).await?;
     core.manager.read().await.reload_tags().await;
@@ -406,9 +691,13 @@ pub struct MoveTagsBody {
 }
 
 /// Перенос переменных в другую группу/модуль (drag&drop дерева I/O).
-pub async fn move_tags(State(core): State<Arc<AppCore>>, Json(b): Json<MoveTagsBody>) -> ApiResult<Json<Value>> {
+pub async fn move_tags(
+    State(core): State<Arc<AppCore>>,
+    Json(b): Json<MoveTagsBody>,
+) -> ApiResult<Json<Value>> {
     let db = core.db_snapshot().await;
-    db.move_tags(&b.ids, b.target_connection_id, &b.target_group).await?;
+    db.move_tags(&b.ids, b.target_connection_id, &b.target_group)
+        .await?;
     core.manager.read().await.reload_tags().await;
     Ok(Json(json!({ "ok": true })))
 }
@@ -439,19 +728,28 @@ pub struct ValidateBody {
 }
 
 pub async fn validate_address(Json(b): Json<ValidateBody>) -> Json<Value> {
-    let err = pda_core::drivers::registry::validate_address(&b.driver_type, &b.address, &b.data_type);
+    let err =
+        pda_core::drivers::registry::validate_address(&b.driver_type, &b.address, &b.data_type);
     Json(json!({ "ok": err.is_none(), "error": err }))
 }
 
 // ---------------------------------------------------------------- База данных
 
-pub async fn db_status(State(core): State<Arc<AppCore>>) -> Json<Value> {
+pub async fn db_status(State(core): State<Arc<AppCore>>) -> ApiResult<Json<Value>> {
     let db = core.db_snapshot().await;
-    Json(json!({
+    // Размер и число тегов — для панели статуса. На недоступной базе не
+    // рвём ответ: поля просто остаются null/0.
+    let (size_bytes, tags) = match db.get_db_info().await {
+        Ok(v) => v,
+        Err(_) => (None, 0),
+    };
+    Ok(Json(json!({
         "available": db.is_available,
         "error": db.last_error.clone(),
         "config": db.config().to_json(),
-    }))
+        "size_bytes": size_bytes,
+        "tags": tags,
+    })))
 }
 
 #[derive(serde::Deserialize)]
@@ -504,7 +802,11 @@ pub async fn db_test(Json(b): Json<DbSwitchBody>) -> Json<Value> {
     match &candidate.last_error {
         Some(err) => Json(json!({ "ok": false, "error": err })),
         None => {
-            let n = candidate.get_all_connections().await.map(|c| c.len()).unwrap_or(0);
+            let n = candidate
+                .get_all_connections()
+                .await
+                .map(|c| c.len())
+                .unwrap_or(0);
             Json(json!({ "ok": true, "connections": n }))
         }
     }
@@ -514,7 +816,9 @@ pub async fn db_test(Json(b): Json<DbSwitchBody>) -> Json<Value> {
 /// автоматически при применении; MariaDB/MySQL пока не перенесены.
 pub async fn db_create(Json(b): Json<DbSwitchBody>) -> ApiResult<Json<Value>> {
     match b.engine.as_str() {
-        "sqlite" => Ok(Json(json!({ "ok": true, "created": false, "info": "Для SQLite база создаётся автоматически при применении подключения." }))),
+        "sqlite" => Ok(Json(
+            json!({ "ok": true, "created": false, "info": "Для SQLite база создаётся автоматически при применении подключения." }),
+        )),
         "postgres" => {
             let cfg = b.into_cfg();
             match DatabaseService::create_postgres_database(&cfg).await {
@@ -522,18 +826,29 @@ pub async fn db_create(Json(b): Json<DbSwitchBody>) -> ApiResult<Json<Value>> {
                 Err(e) => Err(ApiError(e)),
             }
         }
-        _ => Err(ApiError("Создание базы через GUI доступно только для PostgreSQL".into())),
+        _ => Err(ApiError(
+            "Создание базы через GUI доступно только для PostgreSQL".into(),
+        )),
     }
 }
 
 /// Применить и переключить (Python _save_and_reconnect): пишем db_config.json,
 /// останавливаем драйверы, открываем новую базу, перезапускаем.
-pub async fn db_switch(State(core): State<Arc<AppCore>>, Json(b): Json<DbSwitchBody>) -> ApiResult<Json<Value>> {
+pub async fn db_switch(
+    State(core): State<Arc<AppCore>>,
+    Json(b): Json<DbSwitchBody>,
+) -> ApiResult<Json<Value>> {
     let body_cfg = b.to_json();
     let cfg = b.into_cfg();
     core.switch_database(cfg).await.map_err(ApiError)?;
-    if let Err(e) = std::fs::write(&core.db_config_path, serde_json::to_string_pretty(&body_cfg).unwrap()) {
-        tracing::warn!("Не удалось сохранить {}: {e}", core.db_config_path.display());
+    if let Err(e) = std::fs::write(
+        &core.db_config_path,
+        serde_json::to_string_pretty(&body_cfg).unwrap(),
+    ) {
+        tracing::warn!(
+            "Не удалось сохранить {}: {e}",
+            core.db_config_path.display()
+        );
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -544,7 +859,7 @@ pub async fn db_switch(State(core): State<Arc<AppCore>>, Json(b): Json<DbSwitchB
 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
 /// Разумный предел: график 4K в PNG весит единицы мегабайт.
-const MAX_PNG_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PNG_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(serde::Deserialize)]
 pub struct ExportNameQuery {
@@ -558,28 +873,57 @@ const SEPARATORS: [char; 2] = ['/', '\u{5c}'];
 
 /// Безопасное имя файла для сохранения: вырезается путь (в том числе с
 /// обратным слэшем), остаются только латиница/цифры/._-, расширение всегда .png.
-fn safe_export_name(raw: Option<&str>) -> String {
-    let base = raw.unwrap_or_default().rsplit(SEPARATORS).next().unwrap_or("");
-    let cleaned: String = base.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).collect();
-    let stem = cleaned.trim_matches('.').trim_end_matches(".png").trim_end_matches(".PNG").trim_matches('.');
+fn safe_export_name(raw: Option<&str>, ext: &str) -> String {
+    let ext = ext.trim_start_matches('.').to_lowercase();
+    let base = raw
+        .unwrap_or_default()
+        .rsplit(SEPARATORS)
+        .next()
+        .unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .collect();
+    // Убираем любое «хвостовое» расширение, чтобы не получить «name.pdf.png».
+    let stem = cleaned
+        .trim_matches('.')
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(&cleaned)
+        .trim_matches('.');
     // Ограничение на длину — чтобы уложиться в MAX_PATH даже во вложенных папках.
     let stem: String = stem.chars().take(80).collect();
     if stem.is_empty() {
-        format!("pda_chart_{}.png", chrono::Local::now().format("%Y%m%d_%H%M%S"))
+        format!(
+            "pda_chart_{}.{}",
+            chrono::Local::now().format("%Y%m%d_%H%M%S"),
+            ext
+        )
     } else {
-        format!("{stem}.png")
+        format!("{stem}.{}", ext)
     }
 }
 
 /// Не перезаписывать прежний экспорт: chart.png, chart-1.png, chart-2.png...
+/// Расширение сохраняется тем же, что у запрошенного имени (png, pdf, json, csv).
 fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     let first = dir.join(name);
     if !first.exists() {
         return first;
     }
-    let stem = name.trim_end_matches(".png");
+    let path = std::path::Path::new(name);
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name)
+        .to_string();
     for i in 1..1000 {
-        let candidate = dir.join(format!("{stem}-{i}.png"));
+        let candidate = if ext.is_empty() {
+            dir.join(format!("{stem}-{i}"))
+        } else {
+            dir.join(format!("{stem}-{i}.{ext}"))
+        };
         if !candidate.exists() {
             return candidate;
         }
@@ -599,19 +943,359 @@ pub async fn export_png(
     body: axum::body::Bytes,
 ) -> ApiResult<Json<Value>> {
     if body.len() < PNG_MAGIC.len() || body[..PNG_MAGIC.len()] != PNG_MAGIC {
-        return Err(ApiError("Тело запроса не является PNG (пустое или повреждённое изображение)".into()));
+        return Err(ApiError(
+            "Тело запроса не является PNG (пустое или повреждённое изображение)".into(),
+        ));
     }
     if body.len() > MAX_PNG_BYTES {
-        return Err(ApiError(format!("Изображение слишком большое: {} МБ", body.len() / 1024 / 1024)));
+        return Err(ApiError(format!(
+            "Изображение слишком большое: {} МБ",
+            body.len() / 1024 / 1024
+        )));
     }
     let dir = core.exports_dir.clone();
-    std::fs::create_dir_all(&dir).map_err(|e| ApiError(format!("Не удалось создать каталог {}: {e}", dir.display())))?;
-    let path = unique_path(&dir, &safe_export_name(q.name.as_deref()));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ApiError(format!("Не удалось создать каталог {}: {e}", dir.display())))?;
+    let path = unique_path(&dir, &safe_export_name(q.name.as_deref(), "png"));
     // Файл маленький и запись одноразовая по клику — блокирующий write здесь
     // уместнее, чем отдельная блокирующая задача (как в db_switch).
-    std::fs::write(&path, &body).map_err(|e| ApiError(format!("Не удалось записать {}: {e}", path.display())))?;
-    tracing::info!("PNG сохранён: {} ({} КБ)", path.display(), body.len() / 1024);
-    Ok(Json(json!({ "ok": true, "path": path.to_string_lossy(), "bytes": body.len() })))
+    std::fs::write(&path, &body)
+        .map_err(|e| ApiError(format!("Не удалось записать {}: {e}", path.display())))?;
+    tracing::info!(
+        "PNG сохранён: {} ({} КБ)",
+        path.display(),
+        body.len() / 1024
+    );
+    Ok(Json(
+        json!({ "ok": true, "path": path.to_string_lossy(), "bytes": body.len() }),
+    ))
+}
+
+// ---------------------------------------------------------------- экспорт файлов
+
+/// Разрешённые расширения текстовых выгрузок (дерево I/O, CSV переменных).
+const TEXT_EXPORT_EXT: [&str; 3] = ["json", "csv", "txt"];
+
+/// Имя файла для текстовой выгрузки: путь вырезается, недопустимые для файловой
+/// системы символы отбрасываются (кириллица сохраняется — имена модулей у нас
+/// русские), расширение — из белого списка (иначе .json по умолчанию).
+fn safe_text_export_name(raw: Option<&str>) -> String {
+    let base = raw
+        .unwrap_or_default()
+        .rsplit(SEPARATORS)
+        .next()
+        .unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | ' '))
+        .collect();
+    let cleaned = cleaned.trim().replace(' ', "_");
+    let (stem, ext) = match cleaned.rsplit_once('.') {
+        Some((s, e)) if TEXT_EXPORT_EXT.iter().any(|x| x.eq_ignore_ascii_case(e)) => {
+            (s.to_string(), e.to_ascii_lowercase())
+        }
+        _ => (cleaned, "json".to_string()),
+    };
+    let stem: String = stem.trim_matches('.').chars().take(80).collect();
+    if stem.is_empty() {
+        format!(
+            "pda_export_{}.{ext}",
+            chrono::Local::now().format("%Y%m%d_%H%M%S")
+        )
+    } else {
+        format!("{stem}.{ext}")
+    }
+}
+
+/// Сохранить текстовую выгрузку (JSON-дерево I/O, CSV переменных) на диск и
+/// вернуть путь. Как и PNG, файл пишет сервер: в WebView2 скачивание по
+/// `<a download>` молча не доходит до пользователя.
+pub async fn export_file(
+    State(core): State<Arc<AppCore>>,
+    Query(q): Query<ExportNameQuery>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<Value>> {
+    if body.len() > MAX_PNG_BYTES {
+        return Err(ApiError(format!(
+            "Файл слишком большой: {} МБ",
+            body.len() / 1024 / 1024
+        )));
+    }
+    let dir = core.exports_dir.clone();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ApiError(format!("Не удалось создать каталог {}: {e}", dir.display())))?;
+    let path = unique_path(&dir, &safe_text_export_name(q.name.as_deref()));
+    std::fs::write(&path, &body)
+        .map_err(|e| ApiError(format!("Не удалось записать {}: {e}", path.display())))?;
+    tracing::info!("Файл сохранён: {} ({} КБ)", path.display(), body.len() / 1024);
+    Ok(Json(
+        json!({ "ok": true, "path": path.to_string_lossy(), "bytes": body.len() }),
+    ))
+}
+
+// ---------------------------------------------------------------- экспорт PDF
+
+/// Цвет RGB из строки CSS: rgb(r, g, b) → (r/255, g/255, b/255).
+fn css_rgb(s: &str) -> printpdf::Color {
+    let nums: Vec<u8> = s
+        .split(['(', ',', ')'])
+        .filter_map(|n| n.trim().parse::<u8>().ok())
+        .collect();
+    if nums.len() >= 3 {
+        printpdf::Color::Rgb(printpdf::Rgb::new(
+            nums[0] as f32 / 255.0,
+            nums[1] as f32 / 255.0,
+            nums[2] as f32 / 255.0,
+            None,
+        ))
+    } else {
+        printpdf::Color::Rgb(printpdf::Rgb::new(0.0, 0.0, 0.0, None))
+    }
+}
+
+/// Одна страница PDF: PNG графика + заголовок окна + легенда.
+struct ChartPage {
+    png: Vec<u8>,
+    title: String,
+    legend_names: Vec<String>,
+    legend_colors: Vec<String>,
+}
+
+/// Разбор имени поля multipart: "chart_2" / "legend_name_2[]" -> ("chart", Some(2)),
+/// "chart" -> ("chart", None). Индекс — номер окна графика на фронтенде.
+fn split_field_index(name: &str) -> (&str, Option<usize>) {
+    let trimmed = name.strip_suffix("[]").unwrap_or(name);
+    match trimmed.rfind('_') {
+        Some(pos) => match trimmed[pos + 1..].parse::<usize>() {
+            Ok(i) => (&trimmed[..pos], Some(i)),
+            Err(_) => (trimmed, None),
+        },
+        None => (trimmed, None),
+    }
+}
+
+/// Экспорт PDF: клиент присылает PNG всех окон графиков + легенды.
+/// Каждое окно — отдельная страница A4 landscape: график по центру,
+/// под ним заголовок окна и легенда.
+///
+/// Поля multipart: `chart_{i}`, `title_{i}`, `legend_name_{i}[]`,
+/// `legend_color_{i}[]`; `title` без индекса — общий заголовок (имя файла).
+/// Все координаты в PDF: Pt (1pt = 1/72"), origin — левый НИЖНИЙ угол.
+pub async fn export_pdf(
+    State(core): State<Arc<AppCore>>,
+    mut payload: axum::extract::Multipart,
+) -> ApiResult<Json<Value>> {
+    let dir = core.exports_dir.clone();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ApiError(format!("Не удалось создать каталог {}: {e}", dir.display())))?;
+
+    // 1) Разбираем multipart в карту «номер окна -> страница».
+    let mut pages: std::collections::BTreeMap<usize, ChartPage> = Default::default();
+    let mut doc_title = String::new();
+
+    while let Some(field) = payload
+        .next_field()
+        .await
+        .map_err(|e| ApiError(e.to_string()))?
+    {
+        let raw_name = field.name().unwrap_or("").to_string();
+        let bytes = field.bytes().await.map_err(|e| ApiError(e.to_string()))?;
+
+        // Общий заголовок документа (он же имя файла) приходит без индекса.
+        if raw_name == "title" {
+            doc_title = String::from_utf8_lossy(&bytes).to_string();
+            continue;
+        }
+
+        let (key, idx) = split_field_index(&raw_name);
+        let page = pages.entry(idx.unwrap_or(0)).or_insert_with(|| ChartPage {
+            png: Vec::new(),
+            title: String::new(),
+            legend_names: Vec::new(),
+            legend_colors: Vec::new(),
+        });
+        match key {
+            "chart" => page.png = bytes.to_vec(),
+            "title" => page.title = String::from_utf8_lossy(&bytes).to_string(),
+            "legend_name" => page
+                .legend_names
+                .push(String::from_utf8_lossy(&bytes).to_string()),
+            "legend_color" => page
+                .legend_colors
+                .push(String::from_utf8_lossy(&bytes).to_string()),
+            _ => {}
+        }
+    }
+
+    if pages.is_empty() {
+        return Err(ApiError("Не загружен ни один график".into()));
+    }
+    if doc_title.is_empty() {
+        doc_title = "PDA".to_string();
+    }
+
+    // 2) Параметры страницы: A4 landscape 297×210 мм.
+    let mm_to_pt = 2.834_646_f32;
+    let page_w_mm = 297_f32;
+    let page_h_mm = 210_f32;
+    let page_w = page_w_mm * mm_to_pt;
+    let page_h = page_h_mm * mm_to_pt;
+    let margin = 15_f32 * mm_to_pt;
+
+    let mut doc = printpdf::PdfDocument::new(&format!("PDA Next — {doc_title}"));
+
+    // 3) Каждое окно графика — отдельная страница.
+    for (idx, page) in pages.iter() {
+        if page.png.len() < PNG_MAGIC.len() || page.png[..PNG_MAGIC.len()] != PNG_MAGIC {
+            return Err(ApiError(format!("chart_{idx} не является PNG")));
+        }
+        let img_rgba = image::load_from_memory(&page.png)
+            .map_err(|e| ApiError(format!("Не удалось декодировать PNG {idx}: {e}")))?
+            .to_rgba8();
+        let (img_w, img_h) = (img_rgba.width() as usize, img_rgba.height() as usize);
+
+        // Высота легенды зависит от числа строк: заголовок окна + строки.
+        let rows = page.legend_names.len().min(page.legend_colors.len());
+        let legend_h = 18.0 + rows as f32 * 12.0 + 6.0;
+        let chart_area_w = page_w - 2.0 * margin;
+        let chart_area_h = (page_h - 2.0 * margin - legend_h).max(60.0);
+
+        // Масштаб изображения (px → pt), с сохранением пропорций
+        let scale = (chart_area_w / img_w as f32).min(chart_area_h / img_h as f32);
+        let draw_x = margin + (chart_area_w - img_w as f32 * scale) / 2.0;
+        // PDF origin — снизу; график сверху, легенда снизу
+        let draw_y = margin + legend_h + (chart_area_h - img_h as f32 * scale) / 2.0;
+
+        let raw = printpdf::RawImage {
+            pixels: printpdf::RawImageData::U8(img_rgba.into_raw()),
+            width: img_w,
+            height: img_h,
+            data_format: printpdf::RawImageFormat::RGBA8,
+            tag: Vec::new(),
+        };
+        let img_id = doc.add_image(&raw);
+
+        let mut ops: Vec<printpdf::Op> = Vec::new();
+
+        // Белый фон страницы
+        ops.push(printpdf::Op::SetFillColor {
+            col: printpdf::Color::Rgb(printpdf::Rgb::new(1.0, 1.0, 1.0, None)),
+        });
+        ops.push(printpdf::Op::DrawRectangle {
+            rectangle: printpdf::Rect {
+                x: printpdf::Pt(0.0),
+                y: printpdf::Pt(0.0),
+                width: printpdf::Pt(page_w),
+                height: printpdf::Pt(page_h),
+                mode: None,
+                winding_order: None,
+            },
+        });
+
+        // График
+        ops.push(printpdf::Op::UseXobject {
+            id: img_id,
+            transform: printpdf::XObjectTransform {
+                translate_x: Some(printpdf::Pt(draw_x)),
+                translate_y: Some(printpdf::Pt(draw_y)),
+                rotate: None,
+                scale_x: Some(scale),
+                scale_y: Some(scale),
+                dpi: Some(72.0),
+                no_auto_scale: true,
+            },
+        });
+
+        // 4) Легенда под графиком
+        let mut ly = margin + legend_h - 8.0; // отсчёт сверху вниз
+
+        // Название графика
+        let page_title = if page.title.is_empty() {
+            format!("График {}", idx + 1)
+        } else {
+            page.title.clone()
+        };
+        ops.push(printpdf::Op::StartTextSection);
+        ops.push(printpdf::Op::SetFillColor {
+            col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
+        });
+        ops.push(printpdf::Op::SetFont {
+            font: printpdf::PdfFontHandle::Builtin(printpdf::BuiltinFont::HelveticaBold),
+            size: printpdf::Pt(11.0),
+        });
+        ops.push(printpdf::Op::SetTextCursor {
+            pos: printpdf::Point {
+                x: printpdf::Pt(margin),
+                y: printpdf::Pt(ly),
+            },
+        });
+        ops.push(printpdf::Op::ShowText {
+            items: vec![printpdf::TextItem::Text(page_title)],
+        });
+        ops.push(printpdf::Op::EndTextSection);
+
+        ly -= 14.0;
+
+        // Строки легенды
+        for (name, color_str) in page.legend_names.iter().zip(page.legend_colors.iter()) {
+            // Квадрат цвета
+            ops.push(printpdf::Op::SetFillColor {
+                col: css_rgb(color_str),
+            });
+            ops.push(printpdf::Op::DrawRectangle {
+                rectangle: printpdf::Rect {
+                    x: printpdf::Pt(margin),
+                    y: printpdf::Pt(ly - 3.0),
+                    width: printpdf::Pt(8.0),
+                    height: printpdf::Pt(8.0),
+                    mode: None,
+                    winding_order: None,
+                },
+            });
+            // Текст
+            ops.push(printpdf::Op::StartTextSection);
+            ops.push(printpdf::Op::SetFillColor {
+                col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
+            });
+            ops.push(printpdf::Op::SetFont {
+                font: printpdf::PdfFontHandle::Builtin(printpdf::BuiltinFont::Helvetica),
+                size: printpdf::Pt(9.0),
+            });
+            ops.push(printpdf::Op::SetTextCursor {
+                pos: printpdf::Point {
+                    x: printpdf::Pt(margin + 11.0),
+                    y: printpdf::Pt(ly),
+                },
+            });
+            ops.push(printpdf::Op::ShowText {
+                items: vec![printpdf::TextItem::Text(name.clone())],
+            });
+            ops.push(printpdf::Op::EndTextSection);
+            ly -= 12.0;
+        }
+
+        // 5) Добавляем страницу
+        doc.pages.push(printpdf::PdfPage::new(
+            printpdf::Mm(page_w_mm),
+            printpdf::Mm(page_h_mm),
+            ops,
+        ));
+    } // конец цикла по окнам графиков
+
+    // 6) Сохраняем
+    let path = unique_path(&dir, &safe_export_name(Some(&doc_title), "pdf"));
+    let mut warnings = Vec::new();
+    let bytes = doc.save(&printpdf::PdfSaveOptions::default(), &mut warnings);
+    std::fs::write(&path, &bytes)
+        .map_err(|e| ApiError(format!("Не удалось записать {}: {e}", path.display())))?;
+    tracing::info!(
+        "PDF сохранён: {} ({} КБ)",
+        path.display(),
+        bytes.len() / 1024
+    );
+    Ok(Json(
+        json!({ "ok": true, "path": path.to_string_lossy(), "bytes": bytes.len() }),
+    ))
 }
 
 // ---------------------------------------------------------------- маршруты
@@ -624,12 +1308,19 @@ pub fn router(core: Arc<AppCore>) -> Router {
         .route("/tags/move", post(move_tags))
         .route("/points/:tag_id", get(points))
         .route("/archive/:tag_id", get(archive))
+        .route("/series", get(series))
+        .route("/gaps", get(data_gaps))
+        .route("/last", get(last_data))
         .route("/live", get(live))
         .route("/live/ws", get(crate::ws::live_ws))
         .route("/status", get(status))
         .route("/retention", post(set_retention))
+        .route("/polling", post(set_polling))
         .route("/connections", get(connections).post(add_connection))
-        .route("/connections/:id", put(update_connection).delete(delete_connection))
+        .route(
+            "/connections/:id",
+            put(update_connection).delete(delete_connection),
+        )
         .route("/connections/:id/restart", post(restart_connection))
         .route("/connections/:id/tags", get(tags_by_conn))
         .route("/connections/:id/groups", get(list_groups).post(add_group))
@@ -642,6 +1333,8 @@ pub fn router(core: Arc<AppCore>) -> Router {
         .route("/db/create", post(db_create))
         .route("/db/switch", post(db_switch))
         .route("/export/png", post(export_png))
+        .route("/export/file", post(export_file))
+        .route("/export/pdf", post(export_pdf))
         .with_state(core.clone())
         // Лимит тела по умолчанию в axum — 2 МБ, чемтёжный график в PNG может
         // быть больше. Свой порог (32 МБ) проверяет сам export_png.
@@ -652,7 +1345,11 @@ pub fn router(core: Arc<AppCore>) -> Router {
     let web_root = crate::web_root();
     let static_router = tower_http::services::ServeDir::new(&web_root)
         .append_index_html_on_directories(false)
-        .fallback(tower_http::services::ServeFile::new(format!("{web_root}/index.html")));
+        .fallback(tower_http::services::ServeFile::new(format!(
+            "{web_root}/index.html"
+        )));
 
-    Router::new().nest("/api", api).fallback_service(static_router)
+    Router::new()
+        .nest("/api", api)
+        .fallback_service(static_router)
 }

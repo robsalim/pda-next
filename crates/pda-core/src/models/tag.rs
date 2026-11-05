@@ -64,7 +64,9 @@ impl Default for Tag {
             offset_val: 0.0,
             unit: String::new(),
             group_name: "Общие".into(),
-            log_interval_ms: 1000,
+            // 0 = писать только по изменению (COV); периодический heartbeat включается
+            // явным значением интервала в карточке тега или CSV-колонкой LogIntervalMs.
+            log_interval_ms: 0,
             deadband: 0.0,
         }
     }

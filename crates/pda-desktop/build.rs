@@ -29,7 +29,11 @@ fn main() {
     let cargo_home = std::env::var("CARGO_HOME").unwrap_or_default();
     let src_root = Path::new(&cargo_home).join("registry").join("src");
     for idx in std::fs::read_dir(&src_root).into_iter().flatten().flatten() {
-        for pkg in std::fs::read_dir(idx.path()).into_iter().flatten().flatten() {
+        for pkg in std::fs::read_dir(idx.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             let name = pkg.file_name().to_string_lossy().into_owned();
             if !name.starts_with("webview2-com-sys-") {
                 continue;
@@ -37,12 +41,17 @@ fn main() {
             let dll = pkg.path().join("x64").join("WebView2Loader.dll");
             if dll.is_file() {
                 if std::fs::copy(&dll, &dest).is_ok() {
-                    println!("cargo:warning=WebView2Loader.dll скопирован в {}", profile_dir.display());
+                    println!(
+                        "cargo:warning=WebView2Loader.dll скопирован в {}",
+                        profile_dir.display()
+                    );
                 }
                 return;
             }
         }
     }
-    println!("cargo:warning=WebView2Loader.dll не найден в реестре cargo — окно WebView2 не запустится");
+    println!(
+        "cargo:warning=WebView2Loader.dll не найден в реестре cargo — окно WebView2 не запустится"
+    );
     let _ = PathBuf::new();
 }

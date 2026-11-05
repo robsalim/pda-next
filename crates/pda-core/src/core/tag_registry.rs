@@ -33,7 +33,10 @@ impl TagRegistry {
         Self {
             points: RwLock::new(HashMap::new()),
             by_conn: RwLock::new(HashMap::new()),
-            dirty: Mutex::new(DirtyState { ids: HashSet::new(), at: 0.0 }),
+            dirty: Mutex::new(DirtyState {
+                ids: HashSet::new(),
+                at: 0.0,
+            }),
         }
     }
 
@@ -153,14 +156,20 @@ impl TagRegistry {
             std::mem::take(&mut dirty.ids)
         };
         let points = self.points.read();
-        ids.into_iter().filter_map(|i| points.get(&i).map(|p| (i, p.clone()))).collect()
+        ids.into_iter()
+            .filter_map(|i| points.get(&i).map(|p| (i, p.clone())))
+            .collect()
     }
 
     /// Текущие значения всех сигналов.
     /// Заменяет собой запрос последних значений из истории — GUI больше не
     /// зависит от скорости записи в БД.
     pub fn live_snapshot(&self) -> Vec<LiveValue> {
-        self.points.read().values().map(|p| LiveValue::from_point(p)).collect()
+        self.points
+            .read()
+            .values()
+            .map(|p| LiveValue::from_point(p))
+            .collect()
     }
 
     /// Текущие значения только запрошенных тегов.
@@ -187,27 +196,26 @@ impl TagRegistry {
         let points: Vec<Arc<TagPoint>> = self.points.read().values().cloned().collect();
         let mut out = Vec::new();
         for point in points {
-            let mut samples = point.drain_samples();
-            if samples.is_empty() && point.due_for_log(now) {
-                // первая точка / смена качества / heartbeat: отдаём текущее значение
-                let (ts, value, quality) = point.live_triple();
-                if let Some(value) = value {
-                    samples.push((ts.unwrap_or(now), value, quality));
-                }
-            }
-            if !samples.is_empty() {
-                let last = samples[samples.len() - 1].clone();
-                for (ts, value, quality) in samples {
-                    out.push(DuePoint {
-                        timestamp: ts,
-                        tag_id: point.tag_id,
-                        value,
-                        quality,
-                    });
-                }
-                point.mark_logged(now, Some(&last));
-            } else if point.needs_first_mark() {
-                point.mark_logged(now, None);
+            collect_point(&point, now, &mut out);
+        }
+        out
+    }
+
+    /// То же, но только для перечисленных тегов — быстрый путь драйверов,
+    /// которым нужна запись сразу при приходе данных (Modbus-сервер: значение
+    /// пришло от Master'а, точка должна уйти в БД, не дожидаясь общего скана).
+    /// Логика отбора одна и та же, поэтому дублей с общим сканом не будет:
+    /// забранные переходы помечаются зарегистрированными.
+    pub fn collect_due_for(
+        &self,
+        now: DateTime<Local>,
+        tag_ids: impl IntoIterator<Item = i64>,
+    ) -> Vec<DuePoint> {
+        let points = self.points.read();
+        let mut out = Vec::new();
+        for tid in tag_ids {
+            if let Some(point) = points.get(&tid) {
+                collect_point(point, now, &mut out);
             }
         }
         out
@@ -217,6 +225,35 @@ impl TagRegistry {
 impl Default for TagRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Отбор точек одного тега по тем же правилам, что и общий скан журнала:
+/// все накопленные переходы, а если их нет — первая точка / смена качества /
+/// heartbeat по log_interval_ms. Забранные переходы помечаются
+/// зарегистрированными, поэтому повторный скан их не отдаст.
+fn collect_point(point: &Arc<TagPoint>, now: DateTime<Local>, out: &mut Vec<DuePoint>) {
+    let mut samples = point.drain_samples();
+    if samples.is_empty() && point.due_for_log(now) {
+        // первая точка / смена качества / heartbeat: отдаём текущее значение
+        let (ts, value, quality) = point.live_triple();
+        if let Some(value) = value {
+            samples.push((ts.unwrap_or(now), value, quality));
+        }
+    }
+    if !samples.is_empty() {
+        let last = samples[samples.len() - 1].clone();
+        for (ts, value, quality) in samples {
+            out.push(DuePoint {
+                timestamp: ts,
+                tag_id: point.tag_id,
+                value,
+                quality,
+            });
+        }
+        point.mark_logged(now, Some(&last));
+    } else if point.needs_first_mark() {
+        point.mark_logged(now, None);
     }
 }
 
@@ -232,7 +269,12 @@ pub struct LiveValue {
 impl LiveValue {
     fn from_point(p: &TagPoint) -> Self {
         let (timestamp, value, quality) = p.live_triple();
-        Self { tag_id: p.tag_id, timestamp, value, quality }
+        Self {
+            tag_id: p.tag_id,
+            timestamp,
+            value,
+            quality,
+        }
     }
 }
 

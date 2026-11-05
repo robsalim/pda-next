@@ -110,17 +110,39 @@ impl S7Conn {
     async fn cotp_connect(&mut self, rack: u8, slot: u8, tsap_type: u8) -> Result<(), S7Error> {
         // COTP Connection Request: LI=17, E0, dst_ref, src_ref, class, параметры
         let cr: [u8; 18] = [
-            0x11, 0xE0, 0x00, 0x00, 0x00, 0x01, 0x00, // LI, CR, dst_ref, src_ref, class 0
-            0xC1, 0x02, 0x01, 0x00, // src TSAP: PG (0x01 0x00)
-            0xC2, 0x02, tsap_type, ((rack & 0x07) << 5) | (slot & 0x1F), // dst TSAP
-            0xC0, 0x01, 0x0A, // tpdu size 1024
+            0x11,
+            0xE0,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00, // LI, CR, dst_ref, src_ref, class 0
+            0xC1,
+            0x02,
+            0x01,
+            0x00, // src TSAP: PG (0x01 0x00)
+            0xC2,
+            0x02,
+            tsap_type,
+            ((rack & 0x07) << 5) | (slot & 0x1F), // dst TSAP
+            0xC0,
+            0x01,
+            0x0A, // tpdu size 1024
         ];
         self.send(&tpkt(&cr)).await?;
         let resp = self.recv().await?;
-        // CC: TPKT(4) + LI + код D0
+        // CC: TPKT(4) + LI(1) + код D0
         let iso = resp.as_slice();
-        if iso.len() < 6 || iso[4] & 0xF0 != 0xD0 {
-            let code = iso.get(4).copied().unwrap_or(0);
+        if iso.len() < 6 {
+            return Err(S7Error::BadResponse("короткий COTP CC".into()));
+        }
+        let code = iso[5];
+        if code == 0x80 {
+            return Err(S7Error::BadResponse(
+                "COTP: контроллер отверг соединение (DR) — проверьте Rack/Slot (0/1 для S7-1500) и Protection в TIA Portal".into()
+            ));
+        }
+        if code != 0xD0 {
             return Err(S7Error::BadResponse(format!(
                 "COTP: ожидал CC (0xD0), получил 0x{code:02X}"
             )));
@@ -148,7 +170,12 @@ impl S7Conn {
     // -------------------------------------------------------------- запросы
     /// Чтение байтов из DB (db_read).
     pub async fn db_read(&mut self, db: u16, start: u32, len: u16) -> Result<Vec<u8>, S7Error> {
-        let items = [S7Item { area: AREA_DB, db, start, len }];
+        let items = [S7Item {
+            area: AREA_DB,
+            db,
+            start,
+            len,
+        }];
         let mut res = self.read_multi(&items).await?;
         match res.pop() {
             Some(Ok(data)) => Ok(data),
@@ -159,7 +186,12 @@ impl S7Conn {
 
     /// Чтение байтов из именованной области MK/PE/PA.
     pub async fn read_area(&mut self, area: u8, start: u32, len: u16) -> Result<Vec<u8>, S7Error> {
-        let items = [S7Item { area, db: 0, start, len }];
+        let items = [S7Item {
+            area,
+            db: 0,
+            start,
+            len,
+        }];
         let mut res = self.read_multi(&items).await?;
         match res.pop() {
             Some(Ok(data)) => Ok(data),
@@ -172,12 +204,18 @@ impl S7Conn {
     /// Возвращает по элементу: Ok(данные) либо Err(return_code PLC) —
     /// элемент с ошибкой не роняет весь запрос (в отличие от snap7,
     /// где сбойный item исключается из значений).
-    pub async fn read_multi(&mut self, items: &[S7Item]) -> Result<Vec<Result<Vec<u8>, u8>>, S7Error> {
+    pub async fn read_multi(
+        &mut self,
+        items: &[S7Item],
+    ) -> Result<Vec<Result<Vec<u8>, u8>>, S7Error> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
         if items.len() > MAX_VARS {
-            return Err(S7Error::BadResponse(format!("multi-read: >{} элементов", MAX_VARS)));
+            return Err(S7Error::BadResponse(format!(
+                "multi-read: >{} элементов",
+                MAX_VARS
+            )));
         }
         // param: 04 <кол-во> + по 9 байт на any-type элемент
         let mut param = Vec::with_capacity(2 + items.len() * 10);
@@ -347,7 +385,10 @@ impl S7Header {
 
 fn decode_s7(buf: &[u8]) -> Result<(S7Header, &[u8]), S7Error> {
     if buf.len() < 12 {
-        return Err(S7Error::BadResponse(format!("короткий S7 PDU: {} байт", buf.len())));
+        return Err(S7Error::BadResponse(format!(
+            "короткий S7 PDU: {} байт",
+            buf.len()
+        )));
     }
     if buf[0] != 0x32 {
         return Err(S7Error::BadResponse(format!("S7 magic 0x{:02X}", buf[0])));
@@ -368,7 +409,9 @@ fn check_ack(h: &S7Header) -> Result<(), S7Error> {
         return Err(S7Error::BadResponse(h.text()));
     }
     if h.error_class != 0 || h.error_code != 0 {
-        return Err(S7Error::Plc(((h.error_class as u32) << 8) | h.error_code as u32));
+        return Err(S7Error::Plc(
+            ((h.error_class as u32) << 8) | h.error_code as u32,
+        ));
     }
     Ok(())
 }
@@ -403,10 +446,24 @@ mod tests {
 
     fn build_cr_for_test(rack: u8, slot: u8, tsap_type: u8) -> [u8; 18] {
         [
-            0x11, 0xE0, 0x00, 0x00, 0x00, 0x01, 0x00,
-            0xC1, 0x02, 0x01, 0x00,
-            0xC2, 0x02, tsap_type, ((rack & 0x07) << 5) | (slot & 0x1F),
-            0xC0, 0x01, 0x0A,
+            0x11,
+            0xE0,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0xC1,
+            0x02,
+            0x01,
+            0x00,
+            0xC2,
+            0x02,
+            tsap_type,
+            ((rack & 0x07) << 5) | (slot & 0x1F),
+            0xC0,
+            0x01,
+            0x0A,
         ]
     }
 }

@@ -81,6 +81,24 @@ function ioDotClass(connId) {
     return 'run';
 }
 
+/// Краткая строка опроса для дерева модулей — как в Python-версии, где напротив
+/// S7 и Modbus-клиента было видно фактическое время цикла. Собирается из
+/// метрик драйвера (stats), а не парсится из текстового статуса.
+/// «Период опроса» в диалоге — это цель, а не факт; без этих чисел реальный
+/// цикл (упор в отклик ЦПУ, ПЕРЕГРУЗ) не увидеть.
+function ioPollSummary(connId) {
+    const d = ioStatus[connId];
+    const s = d && d.stats;
+    if (!d || !d.running || !s || !s.cycle_ms) return '';
+    let txt = `${s.cycle_ms.toFixed(1)} мс/цикл · ${Math.round(s.hz)} Гц`;
+    if (s.tags) txt = `${s.tags} сигн · ${txt}`;
+    if (s.requests) txt += ` · ${s.requests} запр`;
+    // ПЕРЕГРУЗ: чтение дольше заданного периода — реальная частота ниже цели.
+    const period = (ioConns.find(c => c.id === connId) || {}).poll_interval_ms || 0;
+    if (period > 0 && s.cycle_ms > period * 1.05) txt += ' · ПЕРЕГРУЗ';
+    return txt;
+}
+
 function ioRenderTree() {
     const root = document.getElementById('io-tree');
     if (!ioConns.length) { root.innerHTML = `<div class="tree-empty">Нет модулей</div>`; return; }
@@ -93,6 +111,7 @@ function ioRenderTree() {
             <span class="dot ${ioDotClass(c.id)}"></span>
             <span class="io-conn-name">🔌 ${escHtml(c.name)}</span>
             <span class="io-drv">${escHtml(c.driver_type)}${c.enabled ? '' : ' · выкл'}</span>
+            <span class="io-poll" data-poll="${c.id}" title="Фактическое время цикла опроса и частота (не целевой период из настроек)">${escHtml(ioPollSummary(c.id))}</span>
         </div>`;
         if (c.id !== ioSelConn) continue;
         const groups = [...new Set([...ioGroups, ...ioTags.map(t => t.group_name || 'Общие')])].sort();
@@ -336,6 +355,30 @@ setInterval(() => {
     if (ioRecent.size && ioTrackRecentChanged()) ioRenderTags();
 }, 500);
 
+// Раз в секунду подтягиваем состояние драйверов и обновляем дерево НА МЕСТЕ:
+// в Python-версии время цикла опроса было видно у модуля в дереве и обновлялось
+// по таймеру. Перерисовывать всё дерево нельзя — слетает прокрутка и выделение,
+// поэтому правим только индикатор и текст.
+setInterval(async () => {
+    if (activeTab !== 'io') return;
+    let st;
+    try { st = await apiGet('/api/status'); } catch (e) { return; }
+    ioStatus = {};
+    (st.drivers || []).forEach(d => { ioStatus[d.conn_id] = d; });
+    const root = document.getElementById('io-tree');
+    if (!root) return;
+    for (const node of root.querySelectorAll('.io-conn[data-conn]')) {
+        const id = Number(node.dataset.conn);
+        const dot = node.querySelector('.dot');
+        if (dot) dot.className = `dot ${ioDotClass(id)}`;
+        const poll = node.querySelector('.io-poll');
+        if (poll) {
+            const txt = ioPollSummary(id);
+            if (poll.textContent !== txt) poll.textContent = txt;
+        }
+    }
+}, 1000);
+
 function ioTrackRecentChanged() {
     const before = ioRecent.size;
     ioTrackRecent();
@@ -521,7 +564,7 @@ function ioTagForm(tag, conn) {
         <div class="modal-form-row"><label>Масштаб (Scale):</label><input id="t-scale" type="number" step="0.0001" value="${t.scale ?? 1.0}"></div>
         <div class="modal-form-row"><label>Смещение (Offset):</label><input id="t-offset" type="number" step="0.01" value="${t.offset_val ?? 0.0}"></div>
         <div class="modal-form-row"><label>Ед. изм.:</label><input id="t-unit" type="text" value="${escAttr(t.unit || '')}"></div>
-        <div class="modal-form-row"><label>Период записи (мс):</label><input id="t-log" type="number" min="0" step="50" value="${t.log_interval_ms ?? 1000}"></div>
+        <div class="modal-form-row"><label>Период записи (мс):</label><input id="t-log" type="number" min="0" step="50" value="${t.log_interval_ms ?? 0}"></div>
         <div class="modal-form-row"><label>Мёртвая зона:</label><input id="t-dead" type="number" step="0.001" value="${t.deadband ?? 0.0}"></div>
         <div class="modal-btns"><button class="btn-del" onclick="closeModal()">Отмена</button>
         <button class="btn-action" onclick="ioTagSave(${tag ? tag.id : 0}, ${conn.id})">Сохранить</button></div>`;
@@ -719,7 +762,7 @@ async function ioCopyTag(id) {
         data_type: source.data_type,
         scale: source.scale, offset_val: source.offset_val, unit: source.unit,
         group_name: source.group_name || 'Общие',
-        log_interval_ms: source.log_interval_ms ?? 1000, deadband: source.deadband ?? 0.0,
+        log_interval_ms: source.log_interval_ms ?? 0, deadband: source.deadband ?? 0.0,
     };
     try {
         await apiPost('/api/tags', body);
@@ -729,6 +772,27 @@ async function ioCopyTag(id) {
 }
 
 // ------------------------------------------------------------------ экспорт/импорт дерева
+// Файл сохраняет сервер (POST /api/export/file): в WebView2 оболочки
+// pda-desktop скачивание по <a download> молча не доходит до пользователя.
+// Возвращает реальный путь, который показываем в статусе.
+async function ioExportFile(name, content) {
+    const r = await fetch(`/api/export/file?name=${encodeURIComponent(name)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: content,
+    });
+    const text = await r.text();
+    if (!r.ok) throw new Error(text || `HTTP ${r.status}`);
+    return JSON.parse(text);
+}
+
+/// Безопасное имя файла: убираем только то, что нельзя в имени файла
+/// (кириллица в названиях модулей сохраняется).
+function ioSafeFileName(name, ext) {
+    const stem = String(name || '')
+        .replace(/[\/:*?"<>|]+/g, '_')
+        .replace(/^[.\s]+|[.\s]+$/g, '');
+    return `${stem || 'pda_export'}.${ext}`;
+}
+
 async function ioExportTree() {
     try {
         const conns = await apiGet('/api/connections');
@@ -746,8 +810,8 @@ async function ioExportTree() {
                     log_interval_ms: t.log_interval_ms, deadband: t.deadband })),
             });
         }
-        downloadFile('pda_io_tree_backup.json', JSON.stringify(out, null, 2));
-        ioStatusLine(`Экспортировано модулей: ${out.connections.length}`);
+        const j = await ioExportFile('pda_io_tree_backup.json', JSON.stringify(out, null, 2));
+        ioStatusLine(`Экспортировано модулей: ${out.connections.length} → ${j.path}`);
     } catch (e) { ioStatusLine(`Ошибка экспорта: ${e.message}`, true); }
 }
 
@@ -771,7 +835,7 @@ async function ioImportTree(file) {
                 await apiPost('/api/tags', { id: 0, connection_id: cid, name: t.name, address_str: String(t.address_str ?? '0'),
                     data_type: t.data_type ?? 'FLOAT', scale: t.scale ?? 1.0, offset_val: t.offset_val ?? 0.0,
                     unit: t.unit ?? '', group_name: t.group_name ?? 'Общие',
-                    log_interval_ms: t.log_interval_ms ?? 1000, deadband: t.deadband ?? 0.0 });
+                    log_interval_ms: t.log_interval_ms ?? 0, deadband: t.deadband ?? 0.0 });
                 nTags++;
             }
         }
@@ -787,12 +851,20 @@ function csvSplit(sample) { return sample.includes(';') ? ';' : ','; }
 
 function ioExportCsv() {
     if (!ioSelConn) return ioStatusLine('Сначала выберите модуль', true);
-    const lines = [['Name', 'Group', 'Address', 'Type', 'Scale', 'Offset', 'Unit'].join(';')];
-    for (const t of ioTags) lines.push([t.name, t.group_name || 'Общие', t.address_str, t.data_type, t.scale, t.offset_val, t.unit || ''].map(csvCell).join(';'));
+    const lines = [['Name', 'Group', 'Address', 'Type', 'Scale', 'Offset', 'Unit', 'LogIntervalMs'].join(';')];
+    for (const t of ioTags) lines.push([t.name, t.group_name || 'Общие', t.address_str, t.data_type, t.scale, t.offset_val, t.unit || '', t.log_interval_ms ?? 0].map(csvCell).join(';'));
     const conn = ioConns.find(c => c.id === ioSelConn);
-    downloadFile(`${conn.name}_tags.csv`, '\ufeff' + lines.join('\r\n'));
+    // BOM нужен Excel: иначе кириллица в CSV откроется «кракозябрами».
+    ioExportFile(ioSafeFileName(conn.name + '_tags', 'csv'), '\ufeff' + lines.join('\r\n'))
+        .then(j => ioStatusLine(`CSV сохранён: ${j.path}`))
+        .catch(e => ioStatusLine(`Ошибка экспорта CSV: ${e.message}`, true));
 }
 function csvCell(v) { v = String(v ?? ''); return /[;"]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }
+// Период записи из CSV: пустое/некорректное значение = 0 (писать только по изменению).
+function parseLogInterval(s) {
+    const n = Number(String(s).replace(',', '.'));
+    return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+}
 
 async function ioImportCsv(file) {
     if (!file) return;
@@ -802,8 +874,10 @@ async function ioImportCsv(file) {
         const rows = parseCsv(text, csvSplit(text.slice(0, 2048)));
         const header = rows.shift().map(h => h.trim().toLowerCase());
         const idx = (keys) => header.findIndex(h => keys.includes(h));
+        const idxLoose = (parts) => header.findIndex(h => parts.some(p => h.includes(p)));
         const col = { name: idx(['name']), group: idx(['group', 'группа']), addr: idx(['address', 'адрес']),
-            type: idx(['type', 'тип']), scale: idx(['scale', 'масштаб']), off: idx(['offset', 'смещение']), unit: idx(['unit', 'ед']) };
+            type: idx(['type', 'тип']), scale: idx(['scale', 'масштаб']), off: idx(['offset', 'смещение']), unit: idx(['unit', 'ед']),
+            log: idxLoose(['loginterval', 'log_interval', 'interval', 'период']) };
         const existing = Object.fromEntries(ioTags.map(t => [t.name, t]));
         let n = 0;
         for (const r of rows) {
@@ -813,7 +887,8 @@ async function ioImportCsv(file) {
                 address_str: get(col.addr) || '0', data_type: get(col.type) || 'FLOAT',
                 scale: Number(get(col.scale)) || 1.0, offset_val: Number(get(col.off)) || 0.0,
                 unit: get(col.unit), group_name: get(col.group) || 'Общие',
-                log_interval_ms: 1000, deadband: 0.0 };
+                // Период записи из CSV; без колонки/пустое — 0 (только по изменению)
+                log_interval_ms: parseLogInterval(get(col.log)), deadband: existing[name] ? existing[name].deadband ?? 0.0 : 0.0 };
             if (existing[name]) await apiPut(`/api/tags/${body.id}`, body);
             else await apiPost('/api/tags', body);
             n++;
@@ -836,11 +911,4 @@ function parseCsv(text, delim) {
     }
     if (field || row.length) { row.push(field); out.push(row); }
     return out;
-}
-
-function downloadFile(name, content) {
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([content], { type: 'application/octet-stream' }));
-    a.download = name; a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }

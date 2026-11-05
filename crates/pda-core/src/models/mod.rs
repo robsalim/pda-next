@@ -4,13 +4,13 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-pub mod tag;
 pub mod connection;
 pub mod data_point;
+pub mod tag;
 
-pub use tag::Tag;
 pub use connection::Connection;
 pub use data_point::DataPoint;
+pub use tag::Tag;
 
 /// Конфигурация подключения — map произвольных JSON-значений.
 pub type ConnConfig = HashMap<String, serde_json::Value>;

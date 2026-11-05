@@ -65,6 +65,16 @@ function dbSetStatus(text, cls = '') {
     el.className = 'db-status-line' + (cls ? ' ' + cls : '');
 }
 
+/// Человекочитаемый размер базы (Байты -> КБ/МБ/ГБ).
+function fmtDbSize(bytes) {
+    if (!Number.isFinite(bytes) || bytes < 0) return '—';
+    if (bytes < 1024) return `${bytes} Б`;
+    const units = ['КБ', 'МБ', 'ГБ', 'ТБ'];
+    let v = bytes / 1024, i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return `${v.toFixed(v >= 100 ? 0 : 1)} ${units[i]}`;
+}
+
 async function dbTest() {
     dbSetStatus('Тестирование соединения...', 'warn');
     try {
@@ -121,7 +131,11 @@ async function dbRefreshPanel() {
         const eng = (db.engine || '').toUpperCase();
         const c = db.config || {};
         const target = c.engine === 'sqlite' ? c.sqlite_path : `${c.host}:${c.port}/${c.dbname}`;
-        p1.innerHTML = `<span class="st-ok">БД: подключена</span> [${eng}] ${escHtml(target || '')}`;
+        // Размер и число тегов из /api/db/status (size_bytes null — недоступен).
+        const parts = [`<span class="st-ok">БД: подключена</span> [${eng}] ${escHtml(target || '')}`];
+        if (typeof db.size_bytes === 'number') parts.push(`размер: ${fmtDbSize(db.size_bytes)}`);
+        if (typeof db.tags === 'number') parts.push(`тегов: ${db.tags}`);
+        p1.innerHTML = parts.join(' · ');
     } else {
         p1.innerHTML = `<span class="st-error">БД: недоступна${db.error ? ': ' + escHtml(db.error) : ''}</span>`;
     }

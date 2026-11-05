@@ -21,6 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::core::tag_point::TagPoint;
 use crate::core::tag_registry::{now_mono, TagRegistry};
+use crate::database::collector::Collector;
 use crate::models::{cfg_i64, cfg_str, Connection};
 
 use super::base::{address_json, submit_values, DriverState};
@@ -32,7 +33,11 @@ pub const ADDRESS_HINT: &str = "Адрес Modbus (сервер): 100 (HR), HR10
 
 /// Примеры для конструктора в интерфейсе: (адрес, тип, описание).
 pub const ADDRESS_EXAMPLES: [(&str, &str, &str); 4] = [
-    ("0", "INT16", "Holding register №0 (число без префикса = HR)"),
+    (
+        "0",
+        "INT16",
+        "Holding register №0 (число без префикса = HR)",
+    ),
     ("HR100", "UINT16", "Holding register №100 (FC03/06/16)"),
     ("HR40001", "FLOAT", "Занимает 2 регистра: HR40001 и HR40002"),
     ("C7", "BOOL", "Coil №7 (FC01/05/15)"),
@@ -83,7 +88,11 @@ struct AddrTags {
 
 impl AddrTags {
     fn new() -> Self {
-        Self { ttl: 2.0, at: 0.0, map: HashMap::new() }
+        Self {
+            ttl: 2.0,
+            at: 0.0,
+            map: HashMap::new(),
+        }
     }
 }
 
@@ -129,7 +138,10 @@ fn refresh_addr_tags(cache: &mut AddrTags, registry: &TagRegistry, conn_id: i64)
             Some(a) => a,
             None => continue,
         };
-        mapping.entry((a.area.clone(), a.offset)).or_default().push(t.clone());
+        mapping
+            .entry((a.area.clone(), a.offset))
+            .or_default()
+            .push(t.clone());
         if !a.is_bit() && t.data_type().to_uppercase() == "FLOAT" {
             // FLOAT занимает второй регистр: запись в него тоже важна
             mapping
@@ -143,8 +155,7 @@ fn refresh_addr_tags(cache: &mut AddrTags, registry: &TagRegistry, conn_id: i64)
 }
 
 /// После записи карт памяти: декодируем затронутые теги и публикуем их в
-/// реестр с меткой времени прихода посылки. Журнал запишет в БД сам, поэтому
-/// сетевой цикл не блокируется доступом к базе.
+/// реестр с меткой времени прихода посылки.
 fn apply_write(
     area: &str,
     start_addr: u32,
@@ -169,6 +180,34 @@ fn apply_write(
     }
 }
 
+/// Функционалы записи: после них значение реально поменялось в памяти сервера.
+fn is_write_fc(fc: u8) -> bool {
+    matches!(fc, 5 | 6 | 15 | 16)
+}
+
+/// Быстрый путь в историю для сервера: пришло значение от Master'а — точка
+/// должна уйти в БД сразу, а не ждать общего скана журнала (и тем более
+/// «периода опроса»).
+///
+/// Забираем подлежащие записи переходы именно этого подключения тем же
+/// механизмом, что и журнал (`collect_due_for`: COV, мёртвая зона, heartbeat),
+/// поэтому дублей не появляется — забранное помечается зарегистрированным.
+/// Сетевой цикл при этом не ждёт базу: точки кладутся в ограниченную очередь
+/// писателя, а тот лишь просыпается раньше обычного.
+fn flush_written_now(
+    registry: &TagRegistry,
+    journal: &Collector,
+    conn_id: i64,
+    ts: DateTime<Local>,
+) {
+    let points = registry.points_for(conn_id);
+    let due = registry.collect_due_for(ts, points.iter().map(|p| p.tag_id));
+    if !due.is_empty() {
+        journal.submit_many(&due);
+        journal.flush_now();
+    }
+}
+
 // ---------------------------------------------------------------- traffic
 /// PDU исключения: 0x80|fc + код.
 fn exception(fc: u8, code: u8) -> Vec<u8> {
@@ -177,7 +216,12 @@ fn exception(fc: u8, code: u8) -> Vec<u8> {
 
 /// (byte_count, payload) для ответа FC01/03 либо код исключения.
 /// bitwise=true — coils (LSB-first), иначе — holding registers (big-endian).
-fn read_cells(mem: &ServerMemory, start: u32, count: u32, bitwise: bool) -> Result<(u8, Vec<u8>), u8> {
+fn read_cells(
+    mem: &ServerMemory,
+    start: u32,
+    count: u32,
+    bitwise: bool,
+) -> Result<(u8, Vec<u8>), u8> {
     if count < 1 {
         return Err(EX_ILLEGAL_DATA_VALUE);
     }
@@ -212,7 +256,13 @@ fn read_cells(mem: &ServerMemory, start: u32, count: u32, bitwise: bool) -> Resu
 /// Чтение: FC01 (coils) / FC03 (holding). Запись: FC05/15 (coils),
 /// FC06/16 (holding). Остальное — Illegal function.
 /// `cache` должен быть обновлён вызывающим (handle_client) до входа сюда.
-fn handle_pdu(pdu: &[u8], mem: &mut ServerMemory, cache: &mut AddrTags, registry: &TagRegistry, rx: DateTime<Local>) -> Vec<u8> {
+fn handle_pdu(
+    pdu: &[u8],
+    mem: &mut ServerMemory,
+    cache: &mut AddrTags,
+    registry: &TagRegistry,
+    rx: DateTime<Local>,
+) -> Vec<u8> {
     if pdu.is_empty() {
         return Vec::new();
     }
@@ -313,6 +363,7 @@ async fn handle_client(
     mem: Arc<Mutex<ServerMemory>>,
     cache: Arc<Mutex<AddrTags>>,
     registry: Arc<TagRegistry>,
+    journal: Option<Arc<Collector>>,
     state: Arc<DriverState>,
 ) {
     let mut header = [0u8; 7];
@@ -347,6 +398,15 @@ async fn handle_client(
             refresh_addr_tags(&mut c, &registry, conn_id);
             handle_pdu(&pdu, &mut m, &mut c, &registry, rx_timestamp)
         };
+
+        // Запись от Master'а -> точка уходит в историю сразу, с меткой времени
+        // прихода посылки. Чтение ничего не меняет, его не трогаем.
+        if let Some(j) = &journal {
+            if is_write_fc(pdu[0]) {
+                flush_written_now(&registry, j, conn_id, rx_timestamp);
+            }
+        }
+
         if resp_pdu.is_empty() {
             continue;
         }
@@ -367,9 +427,17 @@ async fn handle_client(
 
 /// Читает 7-байтный заголовок, возвращает время прихода. Таймаут нужен, чтобы
 /// остановка драйвера не зависела в idle-соединении.
-async fn read_header(stream: &mut TcpStream, buf: &mut [u8; 7], state: &DriverState) -> Option<DateTime<Local>> {
+async fn read_header(
+    stream: &mut TcpStream,
+    buf: &mut [u8; 7],
+    state: &DriverState,
+) -> Option<DateTime<Local>> {
     loop {
-        let r = tokio::time::timeout(std::time::Duration::from_millis(500), stream.read_exact(buf)).await;
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            stream.read_exact(buf),
+        )
+        .await;
         match r {
             Ok(Ok(_)) => return Some(Local::now()),
             Ok(Err(_)) => return None,
@@ -385,13 +453,21 @@ async fn read_header(stream: &mut TcpStream, buf: &mut [u8; 7], state: &DriverSt
 // ------------------------------------------------------------------- driver
 /// Точка входа: слушает `host:port`, принимает подключения (задача на каждое),
 /// пока `state.running`. Аналог `start()` + `_run_server()` в Python.
+///
+/// `journal` — очередь писателя истории. Нужна, чтобы записанное Master'ом
+/// значение попадало в БД сразу при приходе посылки (см. `flush_written_now`).
 pub async fn run_modbus_server(
     conn_cfg: Arc<Connection>,
     registry: Arc<TagRegistry>,
     state: Arc<DriverState>,
+    journal: Option<Arc<Collector>>,
 ) {
-    let port = cfg_i64(&conn_cfg.config, "port", crate::config::DEFAULT_MODBUS_SERVER_PORT as i64)
-        .clamp(1, 65535) as u16;
+    let port = cfg_i64(
+        &conn_cfg.config,
+        "port",
+        crate::config::DEFAULT_MODBUS_SERVER_PORT as i64,
+    )
+    .clamp(1, 65535) as u16;
     let host = cfg_str(&conn_cfg.config, "host", "0.0.0.0");
     let bind: SocketAddr = match format!("{host}:{port}").parse() {
         Ok(a) => a,
@@ -436,9 +512,10 @@ pub async fn run_modbus_server(
         let mem = mem.clone();
         let cache = cache.clone();
         let registry = registry.clone();
+        let journal = journal.clone();
         let state = state.clone();
         tokio::spawn(async move {
-            handle_client(stream, conn_id, mem, cache, registry, state).await;
+            handle_client(stream, conn_id, mem, cache, registry, journal, state).await;
         });
     }
 
@@ -452,7 +529,19 @@ mod tests {
     use crate::models::Tag;
 
     fn tag(id: i64, address: &str, data_type: &str) -> Tag {
-        Tag::new(id, 1, format!("t{id}"), address, data_type, 1.0, 0.0, "", "Общие", 1000, 0.0)
+        Tag::new(
+            id,
+            1,
+            format!("t{id}"),
+            address,
+            data_type,
+            1.0,
+            0.0,
+            "",
+            "Общие",
+            1000,
+            0.0,
+        )
     }
 
     /// Реестр + карта адресов из одних и тех же тегов (аналог кэша с ttl=∞).
@@ -466,12 +555,23 @@ mod tests {
                 None => continue,
             };
             let p = reg.get(t.id).unwrap();
-            map.entry((a.area.clone(), a.offset)).or_default().push(p.clone());
+            map.entry((a.area.clone(), a.offset))
+                .or_default()
+                .push(p.clone());
             if !a.is_bit() && t.data_type.to_uppercase() == "FLOAT" {
-                map.entry((a.area.clone(), a.offset + 1)).or_default().push(p);
+                map.entry((a.area.clone(), a.offset + 1))
+                    .or_default()
+                    .push(p);
             }
         }
-        (reg, AddrTags { ttl: f64::INFINITY, at: 0.0, map })
+        (
+            reg,
+            AddrTags {
+                ttl: f64::INFINITY,
+                at: 0.0,
+                map,
+            },
+        )
     }
 
     #[test]
@@ -513,7 +613,10 @@ mod tests {
         let mut mem = ServerMemory::default();
 
         let on = vec![5, 0, 7, 0xFF, 0x00];
-        assert_eq!(handle_pdu(&on, &mut mem, &mut cache, &reg, Local::now()), on);
+        assert_eq!(
+            handle_pdu(&on, &mut mem, &mut cache, &reg, Local::now()),
+            on
+        );
         assert_eq!(*mem.coil.get(&7).unwrap(), true);
         assert_eq!(reg.read_values([2])[0].value, Some(1.0));
 
@@ -527,15 +630,36 @@ mod tests {
         let mut mem = ServerMemory::default();
 
         // FC05 с невалидным значением (не 0x0000/0xFF00)
-        assert_eq!(handle_pdu(&[5, 0, 1, 0x12, 0x34], &mut mem, &mut cache, &reg, Local::now()), vec![0x85, EX_ILLEGAL_DATA_VALUE]);
+        assert_eq!(
+            handle_pdu(
+                &[5, 0, 1, 0x12, 0x34],
+                &mut mem,
+                &mut cache,
+                &reg,
+                Local::now()
+            ),
+            vec![0x85, EX_ILLEGAL_DATA_VALUE]
+        );
         // FC03 с count = 0
-        assert_eq!(handle_pdu(&[3, 0, 0, 0, 0], &mut mem, &mut cache, &reg, Local::now()), vec![0x83, EX_ILLEGAL_DATA_VALUE]);
+        assert_eq!(
+            handle_pdu(&[3, 0, 0, 0, 0], &mut mem, &mut cache, &reg, Local::now()),
+            vec![0x83, EX_ILLEGAL_DATA_VALUE]
+        );
         // FC03 с count = 126 (> 125)
-        assert_eq!(handle_pdu(&[3, 0, 0, 0, 126], &mut mem, &mut cache, &reg, Local::now()), vec![0x83, EX_ILLEGAL_DATA_VALUE]);
+        assert_eq!(
+            handle_pdu(&[3, 0, 0, 0, 126], &mut mem, &mut cache, &reg, Local::now()),
+            vec![0x83, EX_ILLEGAL_DATA_VALUE]
+        );
         // Неизвестный функционал
-        assert_eq!(handle_pdu(&[23, 0, 0], &mut mem, &mut cache, &reg, Local::now()), vec![0x97, EX_ILLEGAL_FUNCTION]);
+        assert_eq!(
+            handle_pdu(&[23, 0, 0], &mut mem, &mut cache, &reg, Local::now()),
+            vec![0x97, EX_ILLEGAL_FUNCTION]
+        );
         // Короткий PDU
-        assert_eq!(handle_pdu(&[3, 0, 0], &mut mem, &mut cache, &reg, Local::now()), vec![0x83, EX_ILLEGAL_DATA_VALUE]);
+        assert_eq!(
+            handle_pdu(&[3, 0, 0], &mut mem, &mut cache, &reg, Local::now()),
+            vec![0x83, EX_ILLEGAL_DATA_VALUE]
+        );
         // Пустой PDU — не отвечаем
         assert!(handle_pdu(&[], &mut mem, &mut cache, &reg, Local::now()).is_empty());
     }
@@ -545,7 +669,13 @@ mod tests {
         let (reg, mut cache) = world(&[]);
         let mut mem = ServerMemory::default();
         // start+count > 0x10000 — Illegal data address
-        let resp = handle_pdu(&[3, 0xFF, 0xFF, 0, 2], &mut mem, &mut cache, &reg, Local::now());
+        let resp = handle_pdu(
+            &[3, 0xFF, 0xFF, 0, 2],
+            &mut mem,
+            &mut cache,
+            &reg,
+            Local::now(),
+        );
         assert_eq!(resp, vec![0x83, EX_ILLEGAL_ADDRESS]);
     }
 
@@ -554,7 +684,13 @@ mod tests {
         let (reg, mut cache) = world(&[]);
         let mut mem = ServerMemory::default();
         // старт 0, 10 бит, 2 байта данных: 0b0000_0101, 0b0000_0010
-        let resp = handle_pdu(&[15, 0, 0, 0, 10, 2, 0b101, 0b10], &mut mem, &mut cache, &reg, Local::now());
+        let resp = handle_pdu(
+            &[15, 0, 0, 0, 10, 2, 0b101, 0b10],
+            &mut mem,
+            &mut cache,
+            &reg,
+            Local::now(),
+        );
         assert_eq!(resp, vec![15, 0, 0, 0, 10]);
         assert_eq!(*mem.coil.get(&0).unwrap(), true);
         assert_eq!(*mem.coil.get(&1).unwrap(), false);
@@ -567,6 +703,15 @@ mod tests {
         let (reg, mut cache) = world(&[]);
         let mut mem = ServerMemory::default();
         // reg_cnt=2 требует 4 байта, а в PDU 3 — Illegal data value
-        assert_eq!(handle_pdu(&[16, 0, 0, 0, 2, 3, 1, 2, 3], &mut mem, &mut cache, &reg, Local::now()), vec![0x90, EX_ILLEGAL_DATA_VALUE]);
+        assert_eq!(
+            handle_pdu(
+                &[16, 0, 0, 0, 2, 3, 1, 2, 3],
+                &mut mem,
+                &mut cache,
+                &reg,
+                Local::now()
+            ),
+            vec![0x90, EX_ILLEGAL_DATA_VALUE]
+        );
     }
 }

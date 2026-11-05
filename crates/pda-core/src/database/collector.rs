@@ -1,16 +1,18 @@
-//! Буферизованная запись точек данных в фоне.
+//! Буферизованная запись точек данных в фоне с двойной буферизацией.
 //!
-//! Драйверы опроса складывают значения в очередь, а отдельная фоновая задача
-//! пачками пишет их в базу. Такое разделение нужно, чтобы запись не блокировала
-//! цикл опроса: время ожидания БД перестаёт влиять на периодичность опроса,
-//! а кратковременное пропадание базы не роняет опрос.
+//! Двойная буферизация (ping-pong): пока writer пишет буфер A в БД, collect()
+//! накапливает новые точки в буфер B. Когда writer закончил — буферы меняются
+//! ролями. Это позволяет не терять записи во время долгих записей в БД.
+//!
+//! Историк вызывает `submit_many()` — один lock на всю пачку (не на каждую
+//! запись, как в mpsc-канале). Writer забирает буфер swap-ом — один lock на
+//! батч, запись в БД идёт без блокировки.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, Local};
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
 use tokio::sync::Notify;
 
 use super::super::config::JournalConfig;
@@ -23,19 +25,88 @@ pub type Record = (DateTime<Local>, i64, f64, i32);
 /// Колбэк статуса для панели/веба.
 pub type OnStatus = Arc<dyn Fn(serde_json::Value) + Send + Sync + 'static>;
 
-/// Очередь записей и фоновая задача, которая пишет их в базу.
+/// Двойная буферизация (ping-pong).
+///
+/// `active` — буфер накопления: в него пишет историк (`push_batch`) и из него
+/// writer забирает данные (`take_into`). Забранные точки writer пишет в БД
+/// БЕЗ блокировки, а историк в это время копит в новый активный буфер —
+/// поэтому пиковая нагрузка не приводит к потере записей.
+///
+/// `mem::swap` векторов — O(1): ёмкость переходит из руки в руку, аллокаций в
+/// установившемся режиме нет. Lock (`parking_lot`, ~20 нс) удерживается только
+/// на время swap, никогда через await.
+struct DoubleBuffer {
+    active: Mutex<Vec<Record>>,
+    /// Предельная глубина накопления: защита памяти, когда БД недоступна.
+    capacity: usize,
+}
+
+impl DoubleBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            active: Mutex::new(Vec::with_capacity(capacity.min(8192))),
+            capacity,
+        }
+    }
+
+    /// Добавить пачку точек данных. Один lock на всю пачку.
+    /// Возвращает количество принятых (остальные уходят в dropped).
+    fn push_batch(&self, records: &[DuePoint]) -> usize {
+        let mut buf = self.active.lock();
+        let room = self.capacity.saturating_sub(buf.len());
+        let accepted = records.len().min(room);
+        for r in &records[..accepted] {
+            buf.push((r.timestamp, r.tag_id, r.value, r.quality));
+        }
+        accepted
+    }
+
+    /// Добавить одну запись.
+    fn push_one(&self, timestamp: DateTime<Local>, tag_id: i64, value: f64, quality: i32) -> bool {
+        let mut buf = self.active.lock();
+        if buf.len() >= self.capacity {
+            return false;
+        }
+        buf.push((timestamp, tag_id, value, quality));
+        true
+    }
+
+    /// Забрать до `limit` записей в `scratch` (освободив место в активном
+    /// буфере). Возвращает число забранных. Lock удерживается только здесь.
+    ///
+    /// ВАЖНО: `scratch` очищается ДО swap. Иначе в активный буфер попадали бы
+    /// записи предыдущей пачки (swap меняет содержимое местами), и writer писал
+    /// бы их в БД повторно — дубли росли бы с каждой итерацией.
+    fn take_into(&self, scratch: &mut Vec<Record>, limit: usize) -> usize {
+        let mut buf = self.active.lock();
+        scratch.clear();
+        if buf.len() <= limit {
+            // Весь буфер уходит writer'у; ему достаётся и его ёмкость.
+            std::mem::swap(&mut *buf, scratch);
+            scratch.len()
+        } else {
+            scratch.extend(buf.drain(..limit));
+            limit
+        }
+    }
+
+    /// Число точек, ожидающих записи.
+    fn len(&self) -> usize {
+        self.active.lock().len()
+    }
+}
+
+/// Очередь записей + двойная буферизация + фоновая задача, которая пишет в базу.
 pub struct Collector {
-    /// База для истории. Может быть заменена на лету —
-    /// поэтому RwLock, а не фиксированный Arc.
+    /// База для истории. Может быть заменена на лету.
     writer: parking_lot::RwLock<Arc<dyn DbWriter>>,
-    flush_interval: AtomicU64, // наносекунды (потокобезопасная настройка на лету)
+    flush_interval: AtomicU64, // наносекунды
     batch_limit: usize,
-    retention_days: AtomicU64, // ф64 в битовом виде; 0 = хранить вечно
+    retention_days: AtomicU64,
 
-    tx: Mutex<Option<mpsc::Sender<Record>>>,
-    rx: Mutex<Option<mpsc::Receiver<Record>>>,
+    /// Двойная буферизация.
+    double_buf: Arc<DoubleBuffer>,
 
-    queued: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     wake: Arc<Notify>,
     handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -52,15 +123,12 @@ pub struct Collector {
 
 impl Collector {
     pub fn new(writer: Arc<dyn DbWriter>, cfg: &JournalConfig) -> Self {
-        let (tx, rx) = mpsc::channel(cfg.journal_queue.max(16));
         Self {
             writer: parking_lot::RwLock::new(writer),
             flush_interval: AtomicU64::new(cfg.journal_flush_ms.max(50) * 1_000_000),
             batch_limit: cfg.journal_batch.max(1),
             retention_days: AtomicU64::new(cfg.retention_days.max(0.0).to_bits()),
-            tx: Mutex::new(Some(tx)),
-            rx: Mutex::new(Some(rx)),
-            queued: Arc::new(AtomicUsize::new(0)),
+            double_buf: Arc::new(DoubleBuffer::new(cfg.journal_queue)),
             stop: Arc::new(AtomicBool::new(false)),
             wake: Arc::new(Notify::new()),
             handle: tokio::sync::Mutex::new(None),
@@ -111,30 +179,29 @@ impl Collector {
     }
 
     // ------------------------------------------------------------------ api
-    /// Ставит одно значение в очередь. Не блокируется и не бросает исключений.
-    pub fn submit(&self, timestamp: DateTime<Local>, tag_id: i64, value: f64, quality: i32) -> bool {
-        let tx = self.tx.lock();
-        let Some(tx) = tx.as_ref() else { return false };
-        match tx.try_send((timestamp, tag_id, value, quality)) {
-            Ok(()) => {
-                self.queued.fetch_add(1, Ordering::Relaxed);
-                true
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-                false
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
+    /// Ставит одно значение в буфер. Не блокируется и не бросает исключений.
+    pub fn submit(
+        &self,
+        timestamp: DateTime<Local>,
+        tag_id: i64,
+        value: f64,
+        quality: i32,
+    ) -> bool {
+        if self.double_buf.push_one(timestamp, tag_id, value, quality) {
+            true
+        } else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            false
         }
     }
 
     /// Ставит много значений; возвращает сколько принято.
+    /// Один lock на всю пачку (в отличие от mpsc — lock на каждую запись).
     pub fn submit_many(&self, records: &[DuePoint]) -> usize {
-        let mut accepted = 0;
-        for r in records {
-            if self.submit(r.timestamp, r.tag_id, r.value, r.quality) {
-                accepted += 1;
-            }
+        let accepted = self.double_buf.push_batch(records);
+        if accepted < records.len() {
+            self.dropped
+                .fetch_add((records.len() - accepted) as u64, Ordering::Relaxed);
         }
         accepted
     }
@@ -145,7 +212,8 @@ impl Collector {
     }
 
     pub fn set_flush_interval_ms(&self, ms: u64) {
-        self.flush_interval.store(ms.max(50) * 1_000_000, Ordering::Relaxed);
+        self.flush_interval
+            .store(ms.max(50) * 1_000_000, Ordering::Relaxed);
         self.wake.notify_waiters();
     }
 
@@ -156,7 +224,8 @@ impl Collector {
     }
 
     pub fn set_retention_days(&self, days: f64) {
-        self.retention_days.store(days.max(0.0).to_bits(), Ordering::Relaxed);
+        self.retention_days
+            .store(days.max(0.0).to_bits(), Ordering::Relaxed);
         self.wake.notify_waiters();
     }
 
@@ -165,10 +234,20 @@ impl Collector {
         self.flush_interval.load(Ordering::Relaxed) / 1_000_000
     }
 
+    /// Сколько точек ещё не записано.
+    pub fn queued(&self) -> usize {
+        self.double_buf.len()
+    }
+
+    /// Максимум точек в одной пачке INSERT.
+    pub fn batch_limit(&self) -> usize {
+        self.batch_limit
+    }
+
     /// Статистика для панели/веба.
     pub fn stats_json(&self) -> serde_json::Value {
         serde_json::json!({
-            "queued": self.queued.load(Ordering::Relaxed),
+            "queued": self.double_buf.len(),
             "written": self.written.load(Ordering::Relaxed),
             "batches": self.batches.load(Ordering::Relaxed),
             "dropped": self.dropped.load(Ordering::Relaxed),
@@ -183,17 +262,15 @@ impl Collector {
 
     // ------------------------------------------------------------------ work
     async fn run(&self) {
-        // Писатель держит rx; submit() работает через tx
-        let mut rx = match self.rx.lock().take() {
-            Some(rx) => rx,
-            None => return, // уже запущен повторно — не должно случиться
-        };
-
         let mut next_purge = if self.retention_days() > 0.0 {
             Some(tokio::time::Instant::now() + std::time::Duration::from_secs(300))
         } else {
             None
         };
+
+        // scratch — вектор для writer'а: swap забирает данные из active,
+        // а scratch используется для записи в БД без блокировок.
+        let mut scratch = Vec::with_capacity(self.batch_limit);
 
         loop {
             let timeout = tokio::time::sleep(std::time::Duration::from_nanos(
@@ -202,42 +279,29 @@ impl Collector {
             tokio::pin!(timeout);
 
             tokio::select! {
-                maybe = rx.recv() => {
-                    // Пришла первая запись — собираем пачку и пишем
-                    let mut batch: Vec<Record> = Vec::with_capacity(64);
-                    if let Some(first) = maybe {
-                        self.queued.fetch_sub(1, Ordering::Relaxed);
-                        batch.push(first);
-                        while batch.len() < self.batch_limit {
-                            match rx.try_recv() {
-                                Ok(r) => { self.queued.fetch_sub(1, Ordering::Relaxed); batch.push(r); }
-                                Err(_) => break,
-                            }
-                        }
-                        self.write(batch).await;
-                    }
-                }
-                _ = &mut timeout, if self.queued.load(Ordering::Relaxed) > 0 => {
-                    let batch = self.drain(&mut rx, self.batch_limit);
-                    if !batch.is_empty() {
-                        self.write(batch).await;
+                _ = &mut timeout => {
+                    let n = self.double_buf.take_into(&mut scratch, self.batch_limit);
+                    if n > 0 {
+                        self.write(&scratch).await;
                     }
                 }
                 _ = self.wake.notified() => {
-                    let batch = self.drain(&mut rx, self.batch_limit);
-                    if !batch.is_empty() {
-                        self.write(batch).await;
+                    let n = self.double_buf.take_into(&mut scratch, self.batch_limit);
+                    if n > 0 {
+                        self.write(&scratch).await;
                     }
                 }
             }
 
             if let Some(at) = next_purge {
                 if tokio::time::Instant::now() >= at {
-                    next_purge = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(300));
+                    next_purge =
+                        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(300));
                     self.purge_expired().await;
                 }
             } else if self.retention_days() > 0.0 {
-                next_purge = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(300));
+                next_purge =
+                    Some(tokio::time::Instant::now() + std::time::Duration::from_secs(300));
             }
 
             if self.stop.load(Ordering::SeqCst) {
@@ -246,43 +310,19 @@ impl Collector {
         }
 
         // При остановке терять накопленное нельзя: сливаем всё до последней точки.
-        self.drain_final_with(&mut rx).await;
-        // Возвращаем приёмник в слот: иначе повторный start() найдёт None,
-        // и после первого restart_all писатель уже никогда не оживёт
-        // (submit() молча упрётся в закрытый канал — история перестанет писаться).
-        *self.rx.lock() = Some(rx);
+        self.drain_final().await;
     }
 
-    fn drain(&self, rx: &mut mpsc::Receiver<Record>, limit: usize) -> Vec<Record> {
-        let mut batch = Vec::with_capacity(limit.min(64));
-        while batch.len() < limit {
-            match rx.try_recv() {
-                Ok(r) => {
-                    self.queued.fetch_sub(1, Ordering::Relaxed);
-                    batch.push(r);
-                }
-                Err(_) => break,
-            }
-        }
-        batch
-    }
-
-    /// Финальный слив очереди (вызывается задачей Historian при остановке).
+    /// Финальный слив буфера (вызывается задачей Historian при остановке).
     pub async fn drain_final(&self) {
-        // Guard не должен переживать await — иначе future не Send для tokio::spawn
-        let rx = self.rx.lock().take();
-        if let Some(mut rx) = rx {
-            self.drain_final_with(&mut rx).await;
-        }
-    }
-
-    async fn drain_final_with(&self, rx: &mut mpsc::Receiver<Record>) {
+        let mut scratch = Vec::with_capacity(self.batch_limit);
         loop {
-            let batch = self.drain(rx, self.batch_limit.saturating_mul(20).max(1));
-            if batch.is_empty() {
+            scratch.clear();
+            let n = self.double_buf.take_into(&mut scratch, usize::MAX);
+            if n == 0 {
                 break;
             }
-            self.write(batch).await;
+            self.write(&scratch).await;
         }
     }
 
@@ -290,14 +330,15 @@ impl Collector {
         f64::from_bits(self.retention_days.load(Ordering::Relaxed))
     }
 
-    async fn write(&self, batch: Vec<Record>) -> usize {
+    async fn write(&self, batch: &[Record]) -> usize {
         if batch.is_empty() {
             return 0;
         }
         let writer = self.writer.read().clone();
-        match writer.insert_batch(&batch).await {
+        match writer.insert_batch(batch).await {
             Ok(_) => {
-                self.written.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                self.written
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
                 self.batches.fetch_add(1, Ordering::Relaxed);
                 *self.last_flush.lock() = Some(Local::now());
                 self.publish();

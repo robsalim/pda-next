@@ -29,15 +29,37 @@ enum UiEvent {
 }
 
 fn theme_to_ui(dark: bool) -> Theme {
-    if dark { Theme::Dark } else { Theme::Light }
+    if dark {
+        Theme::Dark
+    } else {
+        Theme::Light
+    }
+}
+
+/// Режим «только просмотр»: --view-only или PDA_VIEW_ONLY=1.
+/// Нужен, чтобы рядом с рабочей копией запустить вторую — без опроса ПЛК
+/// и без занятия порта Modbus-сервера.
+fn view_only_requested() -> bool {
+    if std::env::var("PDA_VIEW_ONLY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    std::env::args().skip(1).any(|a| a == "--view-only")
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .init();
 
     // --- Сервер в отдельном потоке с собственным tokio-рантаймом ---
+    // Флаг читаем здесь, до потока: он нужен и заголовку окна, чтобы две копии
+    // (рабочая и «только просмотр») различались на панели задач.
+    let view_only = view_only_requested();
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::Builder::new()
         .name("pda-server".into())
@@ -52,7 +74,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rt.block_on(async move {
                 let (cfg, cfg_path) = load_db_config();
                 let core = AppCore::from_config(cfg, cfg_path).await;
-                core.manager.write().await.start_all().await;
+                if view_only {
+                    tracing::info!("Режим «только просмотр»: опрос модулей не запускается");
+                }
+                core.start(view_only).await;
                 core.spawn_live_pump();
 
                 // 127.0.0.1:0 -> ОС выдаёт свободный порт; фронтенд берёт host
@@ -82,22 +107,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // EventLoop типизирован UiEvent: через прокси из IPC-обработчика приходит
     // смена темы страницы (см. UiEvent). EventLoop::new() умеет только (),
     // пользовательские события требуют builder.
+    // Тема сохраняется между запусками в файле (origin меняется из-за
+    // эфемерального порта, поэтому localStorage не подходит).
+    let theme_file = std::env::var("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("PDA Next")
+        .join("theme.txt");
+    let _ = std::fs::create_dir_all(theme_file.parent().unwrap());
+    let initial_dark = std::fs::read_to_string(&theme_file)
+        .map(|s| s.trim() != "light")
+        .unwrap_or(true);
+    let init_script = format!(
+        "try{{localStorage.setItem('pda_web_theme','{}');}}catch(e){{}}",
+        if initial_dark { "dark" } else { "light" }
+    );
+
     let event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
     // Тёмная шапка по умолчанию: тема страницы тоже тёмная, если в браузере
     // ещё не переключали. Дальше тему синхронизирует app.js при загрузке.
     let window = WindowBuilder::new()
-        .with_title(APP_NAME)
+        .with_title(if view_only {
+            format!("{APP_NAME} — только просмотр")
+        } else {
+            APP_NAME.to_string()
+        })
         .with_inner_size(tao::dpi::LogicalSize::new(1360.0, 860.0))
-        .with_theme(Some(Theme::Dark))
+        .with_theme(Some(theme_to_ui(initial_dark)))
         .build(&event_loop)?;
 
     let proxy = event_loop.create_proxy();
+    // Постоянное хранилище WebView2 (localStorage и т.п.): по умолчанию wry
+    // использует временный профиль, из-за чего выбор темы не сохраняется.
+    // Фиксированный идентификатор делает профиль постоянным.
     let webview = WebViewBuilder::new()
         .with_url(&url)
         // Тема страницы переключается в JS, а заголовок окна рисует Windows.
         // tao сам прокидывает DWMWA_USE_IMMERSIVE_DARK_MODE по set_theme.
+        .with_initialization_script(&init_script)
         .with_ipc_handler(move |req| {
             let dark = !req.body().contains("light");
+            let _ = std::fs::write(&theme_file, if dark { "dark" } else { "light" });
             let _ = proxy.send_event(UiEvent::Theme(dark));
         })
         .build(&window)?;
@@ -107,7 +157,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = (&window, &webview);
         *control_flow = ControlFlow::Wait;
         match event {
-            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => *control_flow = ControlFlow::Exit,
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => *control_flow = ControlFlow::Exit,
             Event::UserEvent(UiEvent::Theme(dark)) => window.set_theme(Some(theme_to_ui(dark))),
             _ => {}
         }

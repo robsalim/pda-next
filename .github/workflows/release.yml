@@ -45,7 +45,8 @@ jobs:
           Copy-Item target\release\pda-desktop.exe "$out\"
           Copy-Item target\release\WebView2Loader.dll "$out\"
           Copy-Item web\* "$out\web\" -Recurse
-          "PDA Next $($env:REL_TAG)`r`n`r`nЗапуск: pda-desktop.exe (окно) или pda-server.exe + браузер на http://127.0.0.1:8082`r`nБаза настраивается файлом db_config.json рядом с exe (без него - SQLite в data/pda_local.db)." | Set-Content "$out\README.txt" -Encoding UTF8
+          Copy-Item make_shortcut.ps1 "$out\"
+          "PDA Next $($env:REL_TAG)`r`n`r`nЗапуск: pda-desktop.exe (окно) или pda-server.exe + браузер на http://127.0.0.1:8082`r`nРежим только просмотра: pda-desktop.exe --view-only (опрос не запускается, порты свободны).`r`nЯрлыки: powershell -ExecutionPolicy Bypass -File .\make_shortcut.ps1 (ключ -Desktop положит ярлык на рабочий стол).`r`nБаза настраивается файлом db_config.json рядом с exe (без него - SQLite в data/pda_local.db)." | Set-Content "$out\README.txt" -Encoding UTF8
           Compress-Archive -Path "$out" -DestinationPath "$name.zip"
       - uses: actions/upload-artifact@v4
         with:

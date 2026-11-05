@@ -82,11 +82,24 @@ impl DriverState {
 
 /// Сглаживание метрик по EMA (k = 0.2):
 /// первый цикл пишется без сглаживания.
-pub fn update_stats(state: &DriverState, cycle_s: f64, read_s: f64, db_s: f64, requests: usize, tags: usize) {
+pub fn update_stats(
+    state: &DriverState,
+    cycle_s: f64,
+    read_s: f64,
+    db_s: f64,
+    requests: usize,
+    tags: usize,
+) {
     const K: f64 = 0.2;
     let mut s = state.stats.lock();
     let first = s.cycle_ms == 0.0;
-    let ema = |prev: f64, next: f64| if first { next } else { prev * (1.0 - K) + next * K };
+    let ema = |prev: f64, next: f64| {
+        if first {
+            next
+        } else {
+            prev * (1.0 - K) + next * K
+        }
+    };
     s.read_ms = ema(s.read_ms, read_s * 1000.0);
     s.db_ms = ema(s.db_ms, db_s * 1000.0);
     s.cycle_ms = ema(s.cycle_ms, cycle_s * 1000.0);
@@ -99,7 +112,11 @@ pub fn update_stats(state: &DriverState, cycle_s: f64, read_s: f64, db_s: f64, r
 /// `Polling · 12 сигн./3 запр. · 8.4 мс/цикл (119 Гц)`.
 pub fn fmt_poll_status(state: &DriverState, period: Duration, cycle_s: f64) -> String {
     let s = state.stats.lock();
-    let over = if cycle_s > period.as_secs_f64() * 1.05 { " ПЕРЕГРУЗ" } else { "" };
+    let over = if cycle_s > period.as_secs_f64() * 1.05 {
+        " ПЕРЕГРУЗ"
+    } else {
+        ""
+    };
     format!(
         "Polling · {} сигн./{} запр. · {:.1} мс/цикл ({:.0} Гц){}",
         s.tags, s.requests, s.cycle_ms, s.hz, over
@@ -116,7 +133,11 @@ pub struct TagCache {
 
 impl TagCache {
     pub fn new() -> Self {
-        Self { ttl: 2.0, at: 0.0, points: Vec::new() }
+        Self {
+            ttl: 2.0,
+            at: 0.0,
+            points: Vec::new(),
+        }
     }
 
     pub fn invalidate(&mut self) {

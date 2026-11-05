@@ -30,17 +30,33 @@ pub const ADDRESS_HINT: &str = "Адрес Modbus: 100 (HR), HR100, IR200, C7, D
 
 /// Примеры для конструктора в интерфейсе: (адрес, тип, описание).
 pub const ADDRESS_EXAMPLES: [(&str, &str, &str); 6] = [
-    ("0", "INT16", "Holding register №0 (число без префикса = HR)"),
+    (
+        "0",
+        "INT16",
+        "Holding register №0 (число без префикса = HR)",
+    ),
     ("HR100", "UINT16", "Holding register №100"),
     ("HR40001", "FLOAT", "Занимает 2 регистра: HR40001 и HR40002"),
-    ("IR200", "UINT16", "Input register №200 (FC04, только чтение)"),
+    (
+        "IR200",
+        "UINT16",
+        "Input register №200 (FC04, только чтение)",
+    ),
     ("C7", "BOOL", "Coil №7 — дискретный выход (FC01)"),
-    ("DI15", "BOOL", "Discrete input №15 — дискретный вход (FC02)"),
+    (
+        "DI15",
+        "BOOL",
+        "Discrete input №15 — дискретный вход (FC02)",
+    ),
 ];
 
 /// Подпись адреса для диалога переменной.
 pub fn address_info() -> serde_json::Value {
-    super::base::address_json(ADDRESS_HINT, &super::modbus_address::MODBUS_AREAS, &ADDRESS_EXAMPLES)
+    super::base::address_json(
+        ADDRESS_HINT,
+        &super::modbus_address::MODBUS_AREAS,
+        &ADDRESS_EXAMPLES,
+    )
 }
 
 pub fn validate_address(address: &str, data_type: &str) -> Option<String> {
@@ -247,36 +263,43 @@ pub async fn run_modbus_client(
         Ok(a) => SocketAddr::new(a, port),
         Err(e) => {
             state.set_status(format!("Connect Error: неверный IP '{ip}' ({e})"));
-            state.running.store(false, std::sync::atomic::Ordering::SeqCst);
+            state
+                .running
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             return;
         }
     };
 
     let period = poll_period(&conn_cfg);
-    let timeout = period.max(Duration::from_millis(2000)).min(Duration::from_millis(5000));
+    let timeout = period
+        .max(Duration::from_millis(2000))
+        .min(Duration::from_millis(5000));
     let mut cache = TagCache::new();
     let merge_gap: u32 = 8; // разрыв, выгоднее прочитать «заодно»
 
-    state.running.store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let mut ctx: Option<MbContext> = None;
 
     while state.running.load(std::sync::atomic::Ordering::Relaxed) {
         // ------------------------------------------------ reconnect
         if ctx.is_none() {
             state.set_status("Connecting...");
-            let opened = match tokio::time::timeout(timeout, mb_tcp::connect_slave(addr, Slave(slave_id)))
-                .await
-            {
-                Ok(Ok(c)) => Some(c),
-                Ok(Err(e)) => {
-                    *state.last_error.lock() = Some(e.to_string());
-                    None
-                }
-                Err(_) => {
-                    *state.last_error.lock() = Some(format!("TCP connect {addr}: timeout"));
-                    None
-                }
-            };
+            let opened =
+                match tokio::time::timeout(timeout, mb_tcp::connect_slave(addr, Slave(slave_id)))
+                    .await
+                {
+                    Ok(Ok(c)) => Some(c),
+                    Ok(Err(e)) => {
+                        *state.last_error.lock() = Some(e.to_string());
+                        None
+                    }
+                    Err(_) => {
+                        *state.last_error.lock() = Some(format!("TCP connect {addr}: timeout"));
+                        None
+                    }
+                };
             match opened {
                 Some(c) => {
                     cache.invalidate(); // теги/адреса могли измениться
@@ -311,7 +334,7 @@ pub async fn run_modbus_client(
         let transport_fault = last_error
             .as_deref()
             .map(|e| e.contains("timeout") || e.contains("connection") || e.contains("Connection"))
-                .unwrap_or(false);
+            .unwrap_or(false);
 
         let now = Local::now();
         let mut values: HashMap<i64, f64> = HashMap::new();
@@ -362,7 +385,19 @@ mod tests {
     use crate::models::Tag;
 
     fn tag(id: i64, address: &str, data_type: &str) -> Arc<TagPoint> {
-        let t = Tag::new(id, 1, format!("t{id}"), address, data_type, 1.0, 0.0, "", "Общие", 1000, 0.0);
+        let t = Tag::new(
+            id,
+            1,
+            format!("t{id}"),
+            address,
+            data_type,
+            1.0,
+            0.0,
+            "",
+            "Общие",
+            1000,
+            0.0,
+        );
         Arc::new(TagPoint::from_tag(&t))
     }
 

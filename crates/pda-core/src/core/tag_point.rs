@@ -312,7 +312,11 @@ fn state_from_tag(tag: &Tag) -> PointState {
 }
 
 fn norm_group(g: &str) -> String {
-    if g.is_empty() { "Общие".into() } else { g.to_string() }
+    if g.is_empty() {
+        "Общие".into()
+    } else {
+        g.to_string()
+    }
 }
 
 /// Кладёт показание в буфер журнала. Пропускает повтор подряд и дрейф

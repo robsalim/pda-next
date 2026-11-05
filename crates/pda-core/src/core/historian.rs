@@ -36,11 +36,7 @@ pub struct Historian {
 }
 
 impl Historian {
-    pub fn new(
-        registry: Arc<TagRegistry>,
-        writer: Arc<dyn DbWriter>,
-        cfg: &JournalConfig,
-    ) -> Self {
+    pub fn new(registry: Arc<TagRegistry>, writer: Arc<dyn DbWriter>, cfg: &JournalConfig) -> Self {
         Self {
             registry,
             collector: Arc::new(Collector::new(writer, cfg)),
@@ -80,6 +76,10 @@ impl Historian {
         *guard = Some(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_millis(scan_ms));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Как в Python-версии: очередь «трясём» не на каждом скане (20 мс),
+            // а раз в journal_flush_ms. Иначе writer делает в разы больше
+            // мелких транзакций, чем нужно, и грузит БД впустую.
+            let mut next_flush = std::time::Instant::now();
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {}
@@ -96,7 +96,11 @@ impl Historian {
                     collector.submit_many(&due);
                 }
                 // Периодически тряхнём очередь, чтобы данные уходили в БД вовремя
-                collector.flush_now();
+                if std::time::Instant::now() >= next_flush {
+                    next_flush = std::time::Instant::now()
+                        + std::time::Duration::from_millis(collector.flush_interval_ms());
+                    collector.flush_now();
+                }
 
                 // Пауза до следующего скана с учётом времени самого скана
                 let elapsed = started.elapsed().as_millis() as u64;
@@ -131,7 +135,10 @@ impl Historian {
     pub fn stats(&self) -> serde_json::Value {
         let mut s = self.collector.stats_json();
         if let Some(o) = s.as_object_mut() {
-            o.insert("selected".into(), serde_json::json!(self.points_selected.load(Ordering::Relaxed)));
+            o.insert(
+                "selected".into(),
+                serde_json::json!(self.points_selected.load(Ordering::Relaxed)),
+            );
             o.insert("scan_interval_ms".into(), serde_json::json!(self.scan_ms));
         }
         s

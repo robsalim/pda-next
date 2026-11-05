@@ -10,6 +10,7 @@ pub mod driver_manager;
 pub mod modbus_address;
 pub mod modbus_client;
 pub mod modbus_server;
+pub mod priority;
 pub mod registry;
 pub mod s7_proto;
 pub mod snap7;
