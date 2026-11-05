@@ -736,3 +736,92 @@ async fn series_respects_explicit_zoom_window() {
     h.stop().await;
     let _ = h.tmp.path();
 }
+
+/// Экспорт PDF: страница обязана содержать график в реальную величину.
+/// Регрессия на «пустой PDF»: printpdf 0.12 по умолчанию рисует изображение в
+/// квадрате 1×1 и сам подставляет масштаб px→pt, только если
+/// `no_auto_scale = false`. С true картинка сжималась до ~1 pt, и на странице
+/// оставался белый лист. Тест проверяет, что cm-матрица перед вставкой
+/// XObject-картинки (Do) имеет масштаб порядка размеров графика, а не единицы.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_pdf_places_chart_at_real_size() {
+    let h = Harness::start().await;
+
+    // PNG «как с canvas»: 1500×700 px, непрозрачный.
+    let img = image::RgbaImage::from_pixel(1500, 700, image::Rgba([20, 120, 200, 255]));
+    let mut png = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let png = png.into_inner();
+
+    let form = reqwest::multipart::Form::new()
+        .text("title", "smoke-pdf")
+        .part(
+            "chart_0",
+            reqwest::multipart::Part::bytes(png)
+                .file_name("chart_0.png")
+                .mime_str("image/png")
+                .unwrap(),
+        )
+        .text("title_0", "Тепло +1")
+        .text("legend_name_0[]", "Температура")
+        .text("legend_color_0[]", "rgb(255, 59, 48)");
+
+    let r = h
+        .http
+        .post(format!("{}/api/export/pdf?count=1", h.base))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let text = r.text().await.unwrap();
+    assert!(status.is_success(), "pdf export -> {status}: {text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+
+    // Файл на диске — валидный PDF с одной страницей.
+    let path = std::path::PathBuf::from(v["path"].as_str().unwrap());
+    assert_eq!(path.parent().unwrap(), h.exports.as_path());
+    let bytes = std::fs::read(&path).unwrap();
+    let doc = lopdf::Document::load_mem(&bytes).expect("PDF читается");
+    let pages: Vec<_> = doc.page_iter().collect();
+    assert_eq!(pages.len(), 1, "одно окно = одна страница");
+
+    // Картинка-ресурс на месте (1500×700).
+    let has_img = doc.objects.values().any(|o| {
+        let dict = match o {
+            lopdf::Object::Dictionary(d) => d,
+            lopdf::Object::Stream(s) => &s.dict,
+            _ => return false,
+        };
+        dict.get(b"Subtype").ok().and_then(|s| s.as_name().ok()) == Some(b"Image")
+            && dict.get(b"Width").ok().and_then(|w| w.as_i64().ok()) == Some(1500)
+    });
+    assert!(has_img, "в PDF есть Image XObject 1500 px");
+
+    // В потоке содержимого перед Do масштаб cm обязан быть ~757×353 pt
+    // (область A4 минус поля), а не 0.5 pt — признак сжатого в точку рисунка.
+    let content = doc.get_and_decode_page_content(pages[0]).expect("content stream");
+    let ops = &content.operations;
+    let mut found = false;
+    for i in 0..ops.len() {
+        if ops[i].operator != "Do" {
+            continue;
+        }
+        let Some(cm) = ops[..i].iter().rev().find(|o| o.operator == "cm") else {
+            continue;
+        };
+        let a = cm.operands[0].as_float().unwrap_or_default();
+        let d = cm.operands[3].as_float().unwrap_or_default();
+        assert!(
+            (700.0..800.0).contains(&a) && (320.0..400.0).contains(&d),
+            "график вписан в страницу в реальную величину, а не сжат в точку: cm=[{a},{d}]"
+        );
+        found = true;
+    }
+    assert!(found, "на странице есть вставка XObject (Do)");
+
+
+    h.stop().await;
+    let _ = h.tmp.path();
+}
+

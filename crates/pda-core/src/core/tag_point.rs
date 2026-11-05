@@ -154,7 +154,13 @@ impl TagPoint {
         // Журнал выбирается реже опроса: запоминаем изменения значения,
         // чтобы короткий импульс (100->101->100 между сканами) не потерялся.
         // Мёртвую зону отсекает track_sample (накопленный дрейф пишется).
-        let track = st.value.map_or(true, |prev| value != prev);
+        // При log_interval_ms = 0 (COV) регистрируем каждое пришедшее
+        // значение, включая повторяющееся.
+        let track = if st.log_interval_ms == 0 {
+            true
+        } else {
+            st.value.map_or(true, |prev| value != prev)
+        };
         if track {
             track_sample(&mut st, ts, value, quality);
         }
@@ -328,7 +334,9 @@ fn track_sample(st: &mut PointState, ts: DateTime<Local>, value: f64, quality: i
         (st.last_logged_value, st.last_logged_quality)
     } else {
         let last = st.pending.back().unwrap();
-        if value == last.1 && quality == last.2 {
+        // При log_interval_ms = 0 (COV-режим) всё равно регистрируем
+        // каждое пришедшее значение, даже повторяющееся.
+        if st.log_interval_ms > 0 && value == last.1 && quality == last.2 {
             return;
         }
         (Some(last.1), Some(last.2))

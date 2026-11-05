@@ -1192,7 +1192,11 @@ pub async fn export_pdf(
             },
         });
 
-        // График
+        // График. ВАЖНО: printpdf 0.12 рисует изображение в квадрате 1×1 и
+        // сам подставляет масштаб (px → pt по dpi) только при
+        // no_auto_scale = false. С true картинка сжималась до ~1 pt —
+        // страница выглядела пустой. dpi = 72 даёт 1 px = 1 pt, дальше
+        // scale_x/y — наш вписывающий масштаб, translate — позиция.
         ops.push(printpdf::Op::UseXobject {
             id: img_id,
             transform: printpdf::XObjectTransform {
@@ -1202,9 +1206,10 @@ pub async fn export_pdf(
                 scale_x: Some(scale),
                 scale_y: Some(scale),
                 dpi: Some(72.0),
-                no_auto_scale: true,
+                no_auto_scale: false,
             },
         });
+
 
         // 4) Легенда под графиком
         let mut ly = margin + legend_h - 8.0; // отсчёт сверху вниз

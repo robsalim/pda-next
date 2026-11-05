@@ -27,6 +27,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
 tempfile = "3"
 tokio-modbus = { version = "0.11", default-features = false, features = ["tcp"] }
+# Для регресс-теста PDF-экспорта: читаем содержимое сгенерированного файла.
+lopdf = { version = "0.44", default-features = false }
+
+
