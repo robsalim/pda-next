@@ -154,7 +154,7 @@ jobs:
           path: PDA-Next-*.tar.gz
 
   release:
-    needs: [windows, linux, linux-desktop, macos]
+    needs: [windows, linux, linux-desktop]
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
