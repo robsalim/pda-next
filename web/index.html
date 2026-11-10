@@ -84,7 +84,13 @@
                     </span>
 
                     <button class="btn-action" onclick="resetZoom(getActiveWindow()?.chart)">🔍 100%</button>
+                    <!-- Отдельные автомасштабы, как кнопки «A» у pyqtgraph:
+                         ↑y — вписать кривые в текущее окно по времени,
+                         x→ — вернуть весь загруженный интервал. -->
+                    <button class="btn-action" onclick="autoScaleY()" title="Автомасштаб по значению (Y) для текущего окна по времени">↑y 100%</button>
+                    <button class="btn-action" onclick="autoScaleX()" title="Автомасштаб по времени (X) — весь загруженный интервал">x→ 100%</button>
                     <button class="btn-action" onclick="clearCharts()">✕ Очистить</button>
+
                     <button class="btn-teal" onclick="exportActiveChartPng()" title="Сохранить активное окно графика как PNG">🖼 PNG</button>
                     <button class="btn-teal" onclick="exportAllChartsPdf()" title="Сохранить все графики с легендами в PDF">📄 PDF</button>
                 </div>
@@ -155,6 +161,10 @@
                 </span>
                 <button id="btn-swap-bits" class="btn-action" onclick="toggleBitsSwap()" title="Порядок байт в 16-битном слове: Hi-Lo (старший байт первым, как отдаёт Siemens) / Lo-Hi (байты меняются местами)">↕ Hi-Lo</button>
                 <button class="btn-action" onclick="resetZoom(bitsChart)">🔍 100%</button>
+                <!-- Шкала Y на Bits фиксирована (дорожки бит), поэтому автомат
+                     нужен только по времени. -->
+                <button class="btn-action" onclick="autoScaleXBits()" title="Автомасштаб по времени (X) — весь загруженный интервал">x→ 100%</button>
+
             </div>
             <div class="chart-box" id="uplot-bits"></div>
             </div>

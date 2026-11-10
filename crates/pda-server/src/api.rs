@@ -423,6 +423,7 @@ pub async fn status(State(core): State<Arc<AppCore>>) -> Json<Value> {
     Json(json!({
         "app": { "name": pda_core::config::APP_NAME, "version": pda_core::config::APP_VERSION },
         "drivers": mgr.drivers_json(),
+        "manually_stopped": mgr.manually_stopped_ids(),
         "running": mgr.running_count(),
         "view_only": core.is_view_only(),
         "journal": mgr.journal_stats(),
@@ -551,6 +552,8 @@ pub async fn delete_connection(
         mgr.restart_all().await;
         // Реестр не должен хранить точки удалённого модуля даже после сбоя запуска.
         mgr.registry.forget_connection(id);
+        // Удалённый модуль вычёркивается из сохранённых ручных пауз (id больше нет).
+        mgr.forget_connection(id);
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -562,6 +565,24 @@ pub async fn restart_connection(
 ) -> ApiResult<Json<Value>> {
     core.manager.write().await.restart_connection(id).await;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Остановить опрос одного модуля, не трогая остальные (дерево I/O: «⏸»).
+pub async fn stop_connection(
+    State(core): State<Arc<AppCore>>,
+    UrlPath(id): UrlPath<i64>,
+) -> ApiResult<Json<Value>> {
+    let ok = core.manager.write().await.stop_connection(id).await;
+    Ok(Json(json!({ "ok": ok, "manually_stopped": true })))
+}
+
+/// Запустить опрос одного модуля (снимает ручную паузу; дерево I/O: «▶»).
+pub async fn start_connection(
+    State(core): State<Arc<AppCore>>,
+    UrlPath(id): UrlPath<i64>,
+) -> ApiResult<Json<Value>> {
+    let ok = core.manager.write().await.start_connection(id).await;
+    Ok(Json(json!({ "ok": ok })))
 }
 
 // ---------------------------------------------------------------- IO: группы
@@ -1327,6 +1348,8 @@ pub fn router(core: Arc<AppCore>) -> Router {
             put(update_connection).delete(delete_connection),
         )
         .route("/connections/:id/restart", post(restart_connection))
+        .route("/connections/:id/stop", post(stop_connection))
+        .route("/connections/:id/start", post(start_connection))
         .route("/connections/:id/tags", get(tags_by_conn))
         .route("/connections/:id/groups", get(list_groups).post(add_group))
         .route("/connections/:id/groups/rename", post(rename_group))

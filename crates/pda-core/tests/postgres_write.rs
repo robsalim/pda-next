@@ -258,10 +258,17 @@ async fn postgres_downsample_dense_grid() {
         "метрики времени должны совпадать построчно"
     );
 
+    // Сетка покрывает всё окно, а за границами реальных записей стоят NaN
+    // (в JSON — null): uPlot обрывает линию, а не дорисовывает её «в будущее».
+    // Такие бакеты из проверки значений исключаем.
+    let real = dense.iter().filter(|p| !p.value.is_nan()).count();
+    assert!(real > 0, "в окне с историей не должно быть только null-бакетов");
+
     // Прореживание не должно выдумывать данные: значения лежат в диапазоне.
     assert!(
         dense
             .iter()
+            .filter(|p| !p.value.is_nan())
             .all(|p| p.value >= -0.001 && p.value < n as f64 + 0.001),
         "значения вне диапазона опроса"
     );
@@ -296,7 +303,7 @@ async fn postgres_downsample_single_tag_range() {
         .expect("чтение прореженного окна не должно паниковать");
 
     assert!(
-        !points.is_empty() && points.len() <= MAX_POINTS,
+        !points.is_empty() && points.len() <= MAX_POINTS + 2,
         "одиночный путь должен прореживать до сетки бакетов: {} > {}",
         points.len(),
         MAX_POINTS

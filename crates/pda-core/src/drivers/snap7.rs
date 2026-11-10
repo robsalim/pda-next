@@ -225,7 +225,7 @@ pub fn parse_s200_address(address: &str, data_type: &str) -> Option<S7Address> {
 // ------------------------------------------------------------- метаданные GUI
 const HINT_CLASSIC: &str =
     "Примеры: MW230, MD100, M3.4, I0.1, Q0.0, DB1.DBW4, DB1.DBD0, DB1.DBX0.0";
-const HINT_S200: &str = "Примеры: VW100, VB5, VD20, V100.3, IW0, QW0, MW10";
+const HINT_S200: &str = "Примеры: VW100, VB5, VD20, V100.3, IW0, QW0, MW10; LOGO! 8: V1024 (входы), VW1032 (аналог AI1, WORD 0..1000), V1064 (выходы), VW1072 (аналог AQ1), VW1118 (AM1), M100";
 
 const FORMATS_CLASSIC: &str = "MW230, MB5, MD100, MX3.4, IW64, QW0, DB1.DBW4, DB5.DBD0, DB1.DBX0.0";
 const FORMATS_S200: &str =
@@ -252,6 +252,11 @@ pub fn address_info(is_s200: bool) -> serde_json::Value {
                 ["QW0", "INT16", "Образ выхода (Q), 2 байта с QW0"],
                 ["M10.0", "BOOL", "Merker, бит 0 в байте MB10"],
                 ["MW10", "INT16", "Merker word — 2 байта MB10"],
+                ["V1024", "BYTE", "LOGO! 8: образ входов (1 байт = 8 дискретных)"],
+                ["VW1032", "INT16", "LOGO! 8: аналоговый вход AI1 — WORD 0..1000 (DB1.DBW1032)"],
+                ["VW1034", "INT16", "LOGO! 8: аналоговый вход AI2 (2 байта на канал)"],
+                ["VW1072", "INT16", "LOGO! 8: аналоговый выход AQ1 (DB1.DBW1072)"],
+                ["VW1118", "INT16", "LOGO! 8: аналоговый флаг AM1 (DB1.DBW1118)"],
             ],
         })
     } else {

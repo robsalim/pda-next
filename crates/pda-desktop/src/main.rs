@@ -12,7 +12,7 @@
 
 use std::sync::mpsc;
 
-use pda_core::config::APP_NAME;
+use pda_core::config::{APP_NAME, APP_VERSION};
 use pda_server::{api, load_db_config, AppCore};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -128,9 +128,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ещё не переключали. Дальше тему синхронизирует app.js при загрузке.
     let window = WindowBuilder::new()
         .with_title(if view_only {
-            format!("{APP_NAME} — только просмотр")
+            format!("{APP_NAME} {APP_VERSION} — только просмотр")
         } else {
-            APP_NAME.to_string()
+            format!("{APP_NAME} {APP_VERSION}")
         })
         .with_inner_size(tao::dpi::LogicalSize::new(1360.0, 860.0))
         .with_theme(Some(theme_to_ui(initial_dark)))

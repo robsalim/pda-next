@@ -3,6 +3,7 @@
 
 let ioConns = [];            // /api/connections
 let ioStatus = {};           // drivers_json по conn_id
+let ioPaused = new Set();    // conn_id модулей, остановленных вручную (из /api/status)
 let ioGroups = [];           // группы выбранного подключения [{group,tags}]
 let ioTags = [];             // теги выбранного подключения
 let ioSelConn = null;        // id выбранного подключения
@@ -34,6 +35,7 @@ async function ioRefreshAll() {
         const st = await apiGet('/api/status');
         ioStatus = {};
         (st.drivers || []).forEach(d => { ioStatus[d.conn_id] = d; });
+        ioPaused = new Set(st.manually_stopped || []);
     } catch (e) {
         ioStatusLine(`Ошибка загрузки: ${e.message}`, true);
         return;
@@ -73,12 +75,25 @@ async function ioSelectConn(connId, clearGroup = false) {
 
 // ------------------------------------------------------------------ дерево
 function ioDotClass(connId) {
+    if (ioPaused.has(connId)) return 'stopped';
     const d = ioStatus[connId];
     if (!d) return '';
     const s = (d.status || '').toLowerCase();
     if (s.startsWith('error') || s.includes('failed') || s.includes('connect error') || s.includes('poll error')) return 'err';
     if (d.running && (s.startsWith('running') || s.startsWith('connected') || s.startsWith('polling') || s.startsWith('listen'))) return 'ok';
     return 'run';
+}
+
+/// Кнопка точечного стопа/старта модуля на узле дерева.
+/// Остановленный в конфигурации (enabled=false) модуль драйвером не управляет —
+/// кнопки нет: его «пуск» это правка конфига, а не runtime-пауза.
+function ioToggleBtn(conn) {
+    if (!conn.enabled) return '';
+    const paused = ioPaused.has(conn.id);
+    const icon = paused ? '▶' : '⏸';
+    const title = paused ? 'Запустить опрос модуля' : 'Остановить опрос модуля';
+    return `<button class="io-toggle" data-toggle="${conn.id}" title="${title}"
+        onclick="event.stopPropagation(); ioToggleConn(${conn.id})">${icon}</button>`;
 }
 
 /// Краткая строка опроса для дерева модулей — как в Python-версии, где напротив
@@ -112,6 +127,7 @@ function ioRenderTree() {
             <span class="io-conn-name">🔌 ${escHtml(c.name)}</span>
             <span class="io-drv">${escHtml(c.driver_type)}${c.enabled ? '' : ' · выкл'}</span>
             <span class="io-poll" data-poll="${c.id}" title="Фактическое время цикла опроса и частота (не целевой период из настроек)">${escHtml(ioPollSummary(c.id))}</span>
+            ${ioToggleBtn(c)}
         </div>`;
         if (c.id !== ioSelConn) continue;
         const groups = [...new Set([...ioGroups, ...ioTags.map(t => t.group_name || 'Общие')])].sort();
@@ -156,6 +172,26 @@ function ioBindTreeDrops(root) {
     }
 }
 
+/// Точечный стоп/старт опроса одного модуля (аналог контекстного меню
+/// «Приостановить/Возобновить» в дереве десктопной версии). Пауза живёт в
+/// менеджере драйверов и не меняет enabled в конфигурации.
+async function ioToggleConn(connId) {
+    const c = ioConns.find(x => x.id === connId);
+    if (!c) return;
+    const paused = ioPaused.has(connId);
+    const url = `/api/connections/${connId}/${paused ? 'start' : 'stop'}`;
+    ioStatusLine(paused ? `Запуск модуля «${c.name}»…` : `Остановка модуля «${c.name}»…`);
+    try {
+        const r = await apiPost(url, {});
+        if (paused) { ioPaused.delete(connId); if (!r.ok) throw new Error('модуль выключен в конфигурации'); ioStatusLine(`Модуль «${c.name}» запущен`); }
+        else { ioPaused.add(connId); ioStatusLine(`Модуль «${c.name}» остановлен (опрос)`); }
+    } catch (e) { ioStatusLine(`Ошибка: ${e.message}`, true); return; }
+    // Тикер статуса подтянет драйверы через секунду; здесь — мгновенная
+    // перерисовка дерева, чтобы кнопка/индикатор не ждали таймера.
+    ioRenderTree();
+    setTimeout(ioRefreshAll, 400);
+}
+
 function ioRestartConn() {
     if (!ioSelConn) return ioStatusLine('Сначала выберите модуль', true);
     const c = ioConns.find(x => x.id === ioSelConn);
@@ -175,6 +211,12 @@ function ioSelectGroup(g) {
 
 // ------------------------------------------------------------------ таблица
 const IO_COLS = ['ID', 'Name', 'Группа', 'Address', 'Type', 'Scale', 'Offset', 'Unit', 'Value', 'Time'];
+// Маппинг названия колонки → поле тега (null = не в теге, а в liveRows)
+const COL_FIELD = {
+    'ID': 'id', 'Name': 'name', 'Группа': 'group_name', 'Address': 'address_str',
+    'Type': 'data_type', 'Scale': 'scale', 'Offset': 'offset_val', 'Unit': 'unit',
+    'Value': null, 'Time': null,
+};
 let ioSortCol = null, ioSortDir = 1;
 let ioSelRows = new Set();    // выделенные строки (клик/Ctrl/Shift, как QTableView)
 let ioLastRow = null;         // якорь для shift-диапазона
@@ -219,7 +261,22 @@ function ioVisibleTags() {
     if (q) tags = tags.filter(t => [t.name, t.address_str, t.group_name || '', t.data_type, t.unit || '']
         .join(' ').toLowerCase().includes(q));
     if (ioSortCol != null) {
-        tags.sort((a, b) => String(a[ioSortCol] ?? '').localeCompare(String(b[ioSortCol] ?? ''), undefined, { numeric: true }) * ioSortDir);
+        const fld = COL_FIELD[ioSortCol];
+        tags.sort((a, b) => {
+            let av, bv;
+            if (fld === null) {          // 'Value' / 'Time' — из liveRows
+                const la = liveRows.get(a.id), lb = liveRows.get(b.id);
+                if (ioSortCol === 'Value') { av = la ? la.value : null; bv = lb ? lb.value : null; }
+                else { av = la ? la.timestamp : null; bv = lb ? lb.timestamp : null; }
+            } else {
+                av = a[fld]; bv = b[fld];
+            }
+            // Числовые значения сравниваем как числа, остальные — localeCompare
+            const na = Number(av), nb = Number(bv);
+            if (av != null && bv != null && !isNaN(na) && !isNaN(nb) && typeof av !== 'string')
+                return (na - nb) * ioSortDir;
+            return String(av ?? '').localeCompare(String(bv ?? ''), undefined, { numeric: true }) * ioSortDir;
+        });
     }
     return tags;
 }
@@ -365,6 +422,7 @@ setInterval(async () => {
     try { st = await apiGet('/api/status'); } catch (e) { return; }
     ioStatus = {};
     (st.drivers || []).forEach(d => { ioStatus[d.conn_id] = d; });
+    ioPaused = new Set(st.manually_stopped || []);
     const root = document.getElementById('io-tree');
     if (!root) return;
     for (const node of root.querySelectorAll('.io-conn[data-conn]')) {
@@ -376,6 +434,17 @@ setInterval(async () => {
             const txt = ioPollSummary(id);
             if (poll.textContent !== txt) poll.textContent = txt;
         }
+        // Кнопка ⏸/▶ тоже может устареть (например, модуль перезапустили
+        // кнопкой «⟳»): правим на месте, без перерисовки всего дерева.
+        const btn = node.querySelector('.io-toggle');
+        if (btn) {
+            const paused = ioPaused.has(id);
+            const icon = paused ? '▶' : '⏸';
+            if (btn.textContent !== icon) {
+                btn.textContent = icon;
+                btn.title = paused ? 'Запустить опрос модуля' : 'Остановить опрос модуля';
+            }
+        }
     }
 }, 1000);
 
@@ -386,19 +455,25 @@ function ioTrackRecentChanged() {
 }
 
 // ------------------------------------------------------------------ модуль
-function ioConnForm(conn) {
+function ioConnForm(conn, autoTsap) {
     const c = conn || {};
     const cfg = c.config || {};
     const dt = c.driver_type || 'snap7';
+    const isAutoTsap = autoTsap ?? true;
+    const tsapDefault = isSnap7(dt) ? (cfg.connection_type ?? (dt === 'snap7_s200' ? 3 : 1)) : '';
+    const hintStyle = dt === 'snap7_s200' ? '' : 'display:none';
     return `<h3>${conn ? 'Редактирование подключения' : 'Новое подключение'}</h3>
         <div class="modal-form-row"><label>Имя модуля:</label><input id="c-name" type="text" value="${escAttr(c.name || 'New module')}"></div>
-        <div class="modal-form-row"><label>Тип драйвера:</label><select id="c-driver" onchange="ioConnDriverChanged()">${
+        <div class="modal-form-row"><label>Тип драйвера:</label><select id="c-driver" data-new="${isAutoTsap ? 1 : 0}" onchange="ioConnDriverChanged(this.dataset.new==='1')">${
             driverTypes.map(t => `<option value="${t.key}"${t.key === dt ? ' selected' : ''}>${escHtml(t.label)}</option>`).join('')
         }</select></div>
         <div class="modal-form-row"><label>IP-адрес контроллера:</label><input id="c-ip" type="text" value="${escAttr(cfg.ip || '192.168.0.1')}"></div>
         <div class="modal-form-row"><label>TCP Порт:</label><input id="c-port" type="number" value="${cfg.port ?? 102}"></div>
         <div class="modal-form-row" id="c-row-rack"><label>Стойка (Rack):</label><input id="c-rack" type="number" min="0" max="15" value="${cfg.rack ?? 0}"></div>
         <div class="modal-form-row" id="c-row-slot"><label>Слот ЦПУ (Slot):</label><input id="c-slot" type="number" min="0" max="15" value="${cfg.slot ?? 1}"></div>
+        <div class="modal-form-row" id="c-row-tsap"><label>Connection type (TSAP):</label><select id="c-tsap">${
+            [1,2,3,4,5,6,7].map(n => `<option value="${n}"${n === tsapDefault ? ' selected' : ''}>${n} — ${tsapLabel(n)}</option>`).join('')
+        }</select><div id="c-tsap-hint" style="font-size:12px;color:var(--warn);margin-top:4px;${hintStyle}">Для LOGO! 8 (6ED1052-...-0BA2) ставьте <b>3 — Basic</b>. В LOGO!Soft Comfort: Tools → Ethernet Connections → Server Connection, Local TSAP = 0x0300.</div></div>
         <div class="modal-form-row" id="c-row-slave"><label>Slave ID:</label><input id="c-slave" type="number" min="1" max="255" value="${cfg.slave_id ?? 1}"></div>
         <div class="modal-form-row"><label>Период опроса (мс):</label><input id="c-poll" type="number" min="1" max="60000" step="5" value="${c.poll_interval_ms ?? 100}"></div>
         <div class="modal-form-row"><label>Включено:</label><input id="c-enabled" type="checkbox"${conn ? (c.enabled ? ' checked' : '') : ' checked'} style="flex:0"></div>
@@ -408,27 +483,54 @@ function ioConnForm(conn) {
         </div>`;
 }
 
+// Подписи типов TSAP: 1=PG, 2=HMI, 3=Basic, 4=NST, 5=OP, 6=Other, 7=Third-party
+function tsapLabel(n) {
+    const labels = {
+        1: 'PG (S7-300/400/1200/1500)',
+        2: 'HMI (операторский панель)',
+        3: 'Basic (S7-200 SMART / LOGO! 8)',
+        4: 'NST (Network Slave)',
+        5: 'OP (операторская станция)',
+        6: 'Other',
+        7: 'Third-party',
+    };
+    return labels[n] || '';
+}
+
 function isSnap7(key) { return key === 'snap7' || key === 'snap7_s200'; }
-function ioConnDriverChanged() {
+function ioConnDriverChanged(isNew) {
     const dt = document.getElementById('c-driver').value;
     const isS7 = isSnap7(dt);
     document.getElementById('c-row-rack').style.display = isS7 ? '' : 'none';
     document.getElementById('c-row-slot').style.display = isS7 ? '' : 'none';
+    document.getElementById('c-row-tsap').style.display = isS7 ? '' : 'none';
     document.getElementById('c-row-slave').style.display = dt === 'modbus_client' ? '' : 'none';
     document.getElementById('c-port').value = isS7 ? 102 : 502;
+    // Автоподстановка TSAP только для новых подключений
+    if (isNew && isS7) {
+        const tsap = document.getElementById('c-tsap');
+        tsap.value = dt === 'snap7_s200' ? 3 : 1;
+    }
+    // Показать/скрыть подсказку для LOGO/S200
+    const hint = document.getElementById('c-tsap-hint');
+    if (hint) hint.style.display = dt === 'snap7_s200' ? '' : 'none';
 }
 
-function ioAddConn() { openModal(ioConnForm(null), () => ioConnDriverChanged()); }
+function ioAddConn() { openModal(ioConnForm(null, true), () => ioConnDriverChanged(true)); }
 function ioEditConn() {
     const c = ioConns.find(x => x.id === ioSelConn);
     if (!c) return ioStatusLine('Сначала выберите модуль', true);
-    openModal(ioConnForm(c), () => ioConnDriverChanged());
+    openModal(ioConnForm(c, false), () => ioConnDriverChanged(false));
 }
 
 async function ioConnSave(id) {
     const dt = document.getElementById('c-driver').value;
     const config = { ip: document.getElementById('c-ip').value.trim(), port: Number(document.getElementById('c-port').value) };
-    if (isSnap7(dt)) { config.rack = Number(document.getElementById('c-rack').value); config.slot = Number(document.getElementById('c-slot').value); }
+    if (isSnap7(dt)) {
+        config.rack = Number(document.getElementById('c-rack').value);
+        config.slot = Number(document.getElementById('c-slot').value);
+        config.connection_type = Number(document.getElementById('c-tsap').value);
+    }
     else if (dt === 'modbus_client') { config.slave_id = Number(document.getElementById('c-slave').value); }
     const body = {
         name: document.getElementById('c-name').value.trim() || 'Connection',
@@ -564,7 +666,7 @@ function ioTagForm(tag, conn) {
         <div class="modal-form-row"><label>Масштаб (Scale):</label><input id="t-scale" type="number" step="0.0001" value="${t.scale ?? 1.0}"></div>
         <div class="modal-form-row"><label>Смещение (Offset):</label><input id="t-offset" type="number" step="0.01" value="${t.offset_val ?? 0.0}"></div>
         <div class="modal-form-row"><label>Ед. изм.:</label><input id="t-unit" type="text" value="${escAttr(t.unit || '')}"></div>
-        <div class="modal-form-row"><label>Период записи (мс):</label><input id="t-log" type="number" min="0" step="50" value="${t.log_interval_ms ?? 0}"></div>
+        <div class="modal-form-row"><label title="Максимальный период записи в архив. Любое изменение значения пишется сразу (в пределах цикла журнала); это поле лишь задаёт верхнюю границу «молчания»: если сигнал не меняется, точка ставится принудительно не реже чем раз в N мс. 0 — писать только изменения (COV): стоячий сигнал в архиве не появится вовсе. На период опроса модуля не влияет — он читает ПЛК по своей частоте всегда.">Max период записи (мс):</label><input id="t-log" type="number" min="0" step="50" value="${t.log_interval_ms ?? 0}"></div>
         <div class="modal-form-row"><label>Мёртвая зона:</label><input id="t-dead" type="number" step="0.001" value="${t.deadband ?? 0.0}"></div>
         <div class="modal-btns"><button class="btn-del" onclick="closeModal()">Отмена</button>
         <button class="btn-action" onclick="ioTagSave(${tag ? tag.id : 0}, ${conn.id})">Сохранить</button></div>`;

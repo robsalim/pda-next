@@ -37,8 +37,34 @@ function makeCursors() { return { x1: null, x2: null }; }
 let bitsCursors = makeCursors();
 let chartsPaused = false;
 let bitsPaused = false;
+// Пока пользователь держит кнопку мыши на графике (rubber-band zoom uPlot'а,
+// перетаскивание курсоров X1/X2, пан за ось), live-тик обязан молчать: иначе
+// setData перетирает массивы посреди выделения, и рамка/курсор «прыгают».
+// Счётчик — на вкладке может быть зажато несколько окон одновременно.
+let mouseHeldCharts = 0;
+let mouseHeldBits = 0;
+
+function holdLive(chartType) {
+    if (chartType === 'charts') mouseHeldCharts++;
+    else mouseHeldBits++;
+    // Отпустить мышь могут за пределами окна — снимаем по window-mouseup.
+    window.addEventListener('mouseup', () => {
+        if (chartType === 'charts') mouseHeldCharts = Math.max(0, mouseHeldCharts - 1);
+        else mouseHeldBits = Math.max(0, mouseHeldBits - 1);
+    }, { once: true });
+}
 let userZoomedCharts = false;
 let userZoomedBits = false;
+// Полный интервал последней загрузки (epoch-секунды) для кнопки «x→ 100%»:
+// после зума t_start/t_end серверного ответа совпадают с видимым окном,
+// поэтому «до-зумовый» интервал держим отдельно.
+let bitsFullT0 = null, bitsFullT1 = null;
+// Покрытие реальными точками и подавление хука при программной пересборке Bits.
+let bitsCov = null;            // [t0, t1] — где лежат скачанные значения
+let bitsLoadedSpan = 0;        // ширина окна, на которую посчитана сетка ответа
+let bitsSuppressReload = false;
+let bitsZoom = null;           // { last, timer, seq } для троттлинга догрузки
+
 
 const COLORS = ['#667EEA', '#FF6384', '#4BC0C0', '#FF9F40', '#9966FF', '#FFCD56', '#00E676', '#E91E63'];
 
@@ -508,36 +534,107 @@ function refreshHeaderCursors() {
     }
 }
 
+// Зелёная «рука» для пана за ось времени. Системный курсор 'grab' в Windows
+// рисуется белым силуэтом — на светлой теме он невидим на белом же фоне оси.
+// SVG-курсор: обводка берётся из --text (тёмная на светлой теме и наоборот),
+// заливка — из --ok. Значения читаем при каждом вызове, поэтому курсор
+// сам меняет цвет вместе с темой без пересоздания графика.
+function okGreen() {
+    return getComputedStyle(document.body).getPropertyValue('--ok').trim() || '#00E676';
+}
+function inkColor() {
+    return getComputedStyle(document.body).getPropertyValue('--text').trim() || '#222';
+}
+function axisPanCursor(down) {
+    const g = okGreen(), k = inkColor();
+    // 24×24, hotspot (12,6): ладонь смотрит на курсор.
+    const svg = down
+        ? `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">` +
+          `<path d="M6.5 12V9.2a1.5 1.5 0 0 1 3 0v1.6M12 10.4V8.2a1.5 1.5 0 0 1 3 0v2.2M17.5 10.6V9.4a1.5 1.5 0 0 1 3 0v4.1c0 3.3-2.7 6-6 6h-1.2c-2 0-3.4-.8-4.6-2.4l-2.35-3.15a1.4 1.4 0 0 1 2.15-1.8l.85.9Z" ` +
+          `fill="${g}" stroke="${k}" stroke-width="1.3" stroke-linejoin="round"/></svg>`
+        : `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">` +
+          `<path d="M7 12V6.6a1.5 1.5 0 0 1 3 0V11m0-5.9a1.5 1.5 0 0 1 3 0V11m0-4.4a1.5 1.5 0 0 1 3 0V11m0-2.9a1.5 1.5 0 0 1 3 0v6.4c0 3.6-2.6 6.6-6.2 6.6-3 0-4.8-1.6-6.2-4L5 13.6c-.8-1.4 1.2-2.6 2.2-1.4l.8 1Z" ` +
+          `fill="${g}" stroke="${k}" stroke-width="1.3" stroke-linejoin="round"/></svg>`;
+    return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 12 6, ${down ? 'grabbing' : 'grab'}`;
+}
+
 function wheelZoomPlugin(chartType, cursors) {
     return {
         hooks: {
             ready: u => {
                 let plot = u.root.querySelector(".u-over");
-                // Debounce: колесико генерирует десятки событий в секунду.
-                // Собираем координаты и применяем setScale один раз с задержкой 150мс.
-                let wheelTimer = null;
-                let wheelDelta = 0;
+                // Зум по колесу применяется МГНОВЕННО на каждое событие, как в
+                // pyqtgraph. Раньше здесь был debounce 150 мс и один шаг
+                // масштаба на пачку событий — вращение ощущался «вязким».
+                // Множитель считается от величины дельты, а не только от знака,
+                // поэтому колесо с мелким шагом крутит так же плавно.
                 plot.addEventListener("wheel", e => {
                     e.preventDefault();
                     if (chartType === 'charts') userZoomedCharts = true;
                     else userZoomedBits = true;
-                    wheelDelta += e.deltaY;
-                    if (wheelTimer) clearTimeout(wheelTimer);
-                    wheelTimer = setTimeout(() => {
-                        wheelTimer = null;
-                        if (Math.abs(wheelDelta) < 1) { wheelDelta = 0; return; }
-                        let factor = 0.85;
-                        let left = u.posToVal(e.clientX - plot.getBoundingClientRect().left, "x");
-                        let xMin = u.scales.x.min, xMax = u.scales.x.max;
-                        let delta = xMax - xMin;
-                        let nextDelta = wheelDelta < 0 ? delta * factor : delta / factor;
-                        if (nextDelta < 0.1) nextDelta = 0.1;
-                        let ratio = (left - xMin) / delta;
-                        u.setScale("x", { min: left - ratio * nextDelta, max: left + (1 - ratio) * nextDelta });
-                        wheelDelta = 0;
-                    }, 150);
-                });
+                    let d = e.deltaY;
+                    if (e.deltaMode === 1) d *= 32;        // строки прокрутки
+                    else if (e.deltaMode === 2) d *= 400;  // страницы
+                    // Срезаем «удары» тачпада/инерционного скролла, иначе шкала
+                    // перекидывается через весь интервал за один шаг.
+                    d = Math.max(-240, Math.min(240, d));
+                    const k = Math.pow(1.0022, d);
+                    const left = e.clientX - plot.getBoundingClientRect().left;
+                    const anchor = u.posToVal(left, "x");
+                    const xMin = u.scales.x.min, xMax = u.scales.x.max;
+                    const delta = xMax - xMin;
+                    const next = Math.max(0.1, delta * k);
+                    const ratio = (anchor - xMin) / delta;
+                    u.setScale("x", { min: anchor - ratio * next, max: anchor + (1 - ratio) * next });
+                }, { passive: false });
                 plot.addEventListener("dblclick", () => resetZoom(u));
+
+                // Rubber-band zoom uPlot'а (выделение рамкой на plot-области):
+                // на всё время удержания ЛКМ live-тик ставим на паузу.
+                // capture-слушатель курсоров ниже вызывает stopPropagation()
+                // только для своих случаев, так что сюда приходит чистый
+                // «графический» mousedown.
+                plot.addEventListener("mousedown", e => {
+                    if (e.button === 0 && !dragCursor) holdLive(chartType);
+                });
+
+
+                // Перетаскивание за ось времени (как в pyqtgraph: график тянут
+                // мышью за саму ось). Ось — отдельный DOM-элемент uPlot, поэтому
+                // обработчики свои; подгрузку данных делает хук setScale.
+                const axisEl = u.axes[0] && u.axes[0]._el;
+                if (axisEl) {
+                    axisEl.style.cursor = axisPanCursor(false);
+                    axisEl.title = 'Потяните за ось времени, чтобы сдвинуть окно';
+                    axisEl.addEventListener('mousedown', e => {
+                        if (e.button !== 0) return;
+                        e.preventDefault();
+                        // bbox в device-пикселях, координаты мыши — CSS-пиксели.
+                        // pxRatio — свойство экземпляра uPlot (не namespace):
+                        // на экране 125%/150% без деления пан ехал бы быстрее курсора.
+                        const bbW = u.bbox.width / (u.pxRatio || 1);
+                        const span = u.scales.x.max - u.scales.x.min;
+                        const startX = e.clientX, min0 = u.scales.x.min, max0 = u.scales.x.max;
+                        if (chartType === 'charts') userZoomedCharts = true;
+                        else userZoomedBits = true;
+                        axisEl.style.cursor = axisPanCursor(true);
+                        document.body.style.userSelect = 'none';
+                        holdLive(chartType);
+                        const onMove = (ev) => {
+                            const dt = -((ev.clientX - startX) / bbW) * span;
+                            u.setScale('x', { min: min0 + dt, max: max0 + dt });
+                        };
+                        const onUp = () => {
+                            window.removeEventListener('mousemove', onMove);
+                            window.removeEventListener('mouseup', onUp);
+                            axisEl.style.cursor = axisPanCursor(false);
+                            document.body.style.userSelect = '';
+                        };
+                        window.addEventListener('mousemove', onMove);
+                        window.addEventListener('mouseup', onUp);
+                    });
+                }
+
 
                 // Перетаскивание курсоров X1/X2 (аналог movable InfiniteLine из chart_widget.py).
                 // Capture-слушатель на u.root срабатывает ДО обработчика uPlot на .u-over:
@@ -554,7 +651,12 @@ function wheelZoomPlugin(chartType, cursors) {
                 };
                 u.root.addEventListener("mousedown", e => {
                     const rect = plot.getBoundingClientRect();
-                    if (!rect.contains(e.clientX, e.clientY)) return;
+                    // DOMRect.contains по стандарту принимает координаты, но Blink
+                    // (Edge/Chrome) его не реализует — typeof rect.contains ===
+                    // "undefined", и каждый mousedown падал с TypeError. Ручная
+                    // проверка границ работает во всех браузерах.
+                    if (e.clientX < rect.left || e.clientX > rect.right ||
+                        e.clientY < rect.top || e.clientY > rect.bottom) return;
                     // Перетаскивание возможно только за свою линию: ЛКМ — X1, ПКМ — X2
                     const near = nearCursor(e.clientX - rect.left);
                     dragCursor = ((e.button === 0 && near === 'x1') || (e.button === 2 && near === 'x2')) ? near : null;
@@ -563,6 +665,7 @@ function wheelZoomPlugin(chartType, cursors) {
                     e.stopPropagation();
                     suppressClick = true;
                     document.body.style.userSelect = 'none';
+                    holdLive(chartType);
                 }, true);
                 window.addEventListener("mousemove", e => {
                     if (!dragCursor) return;
@@ -642,6 +745,77 @@ function resetZoom(u) {
     if (u === bitsChart) userZoomedBits = false;
     u.setData(u.data, true);
 }
+
+/// Полный интервал последней загрузки окна: после зума sig.t_start/t_end
+/// перезаписываются видимым окном (reloadWindowRange), поэтому «полную картину»
+/// держим отдельно. Без него кнопка «A X» показывала бы уже суженный интервал.
+function fullRangeOf(win) {
+    if (win.fullT0 != null && win.fullT1 != null && win.fullT1 > win.fullT0)
+        return [win.fullT0, win.fullT1];
+    const times = win.signals[0] && win.signals[0].times;
+    if (times && times.length) return [times[0], times[times.length - 1]];
+    return null;
+}
+
+/// Автомасштаб по X — вписать весь загруженный интервал (аналог кнопки «A» в
+/// pyqtgraph). В отличие от «🔍 100%» не пересоздаёт график и не ждёт ответа
+/// сервера: шкала возвращается сразу, а данные на полный интервал догружает
+/// хук setScale.
+function autoScaleX() {
+    const win = getActiveWindow();
+    if (!win || !win.chart) return;
+    const r = fullRangeOf(win);
+    if (!r) return;
+    // Флаг для хука setScale (он асинхронный): иначе он вернёт zoomed=true после
+    // того, как мы его сбросили, и кнопка «x→ 100%» выглядела бы неработающей.
+    win.autoScaleExit = true;
+    win.chart.setScale('x', { min: r[0], max: r[1] });
+    win.zoomed = false;
+    if (win.id === activeWindowId) userZoomedCharts = false;
+}
+
+/// Автомасштаб по Y — вписать кривые в ТЕКУЩЕЕ окно по X (в pyqtgraph это
+/// enableAutoRange(axis='y')). Нужно после того, как по времени приблизили
+/// узкий участок и кривая упёрлась в край графика.
+function autoScaleY() {
+    const win = getActiveWindow();
+    if (win && win.chart) fitYToVisible(win.chart);
+}
+
+/// Автомасштаб по времени для графика бит. Интервал загрузки помним отдельно:
+/// после зума payload.t_start/t_end перезаписываются видимым окном.
+function autoScaleXBits() {
+    if (!bitsChart) return;
+    if (bitsFullT0 == null || bitsFullT1 == null) return;
+    bitsChart.setScale('x', { min: bitsFullT0, max: bitsFullT1 });
+    userZoomedBits = false;
+}
+
+
+
+function fitYToVisible(u) {
+    if (!u || !u.data || u.data.length < 2 || !u.data[0] || !u.data[0].length) return;
+    const t0 = u.scales.x.min, t1 = u.scales.x.max;
+    let lo = Infinity, hi = -Infinity;
+    // Границы видимого окна в индексы массива (uPlot ищет по оси X сам).
+    const a = Math.max(0, u.valToIdx(t0) - 1);
+    const b = Math.min(u.data[0].length - 1, u.valToIdx(t1) + 1);
+    for (let i = 1; i < u.data.length; i++) {
+        const vals = u.data[i];
+        if (!vals) continue;
+        for (let j = a; j <= b; j++) {
+            const v = vals[j];
+            if (v == null) continue;
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+    }
+    if (lo === Infinity) return;             // в окне нет ни одной точки
+    if (!(hi > lo)) { lo -= 1; hi += 1; }    // горизонтальная прямая
+    const pad = (hi - lo) * 0.05;
+    u.setScale('y', { min: lo - pad, max: hi + pad });
+}
+
 
 function formatTime(sec) {
     if (!sec) return "—";
@@ -802,30 +976,99 @@ function getSeriesUrl(tags) {
 /// Подгружает данные для нового видимого диапазона после зума/пана.
 /// tMin/tMax — epoch-секунды (float), как их хранит uPlot при scale.time=true.
 /// Сервер принимает их напрямую через t0/t1, минуя текстовые span/ISO-форматы.
+/// Запрос всегда с запасом (маржа = один видимый интервал с каждой стороны):
+/// следующие шаги колеса уже покрыты данными, поэтому край графика при зуме
+/// «в минус» не пустует до окончания цикла загрузки.
 /// Возвращает true, если данные обновлены.
 async function reloadWindowRange(win, tMin, tMax) {
     if (!win.signals.length || !(tMax > tMin)) return false;
+    const margin = Math.max(tMax - tMin, 60);
+    const q0 = tMin - margin, q1 = tMax + margin;
     const tagStr = win.signals.map(s => s.tag.id).join(',');
-    const url = `/api/series?tags=${encodeURIComponent(tagStr)}&t0=${tMin.toFixed(3)}&t1=${tMax.toFixed(3)}`;
-    try {
-        const resp = await apiGet(url);
-        if (!resp.series || !resp.series.length) return false;
-        const byTag = new Map();
-        for (const s of resp.series) byTag.set(s.tag_id, s);
-        for (const sig of win.signals) {
-            const s = byTag.get(sig.tag.id);
-            if (s && s.times && s.times.length > 0) {
-                Object.assign(sig, { times: s.times, values: s.values, t_start: tMin, t_end: tMax });
-            }
-        }
-        return true;
-    } catch (e) {
-        return false;
+    const url = `/api/series?tags=${encodeURIComponent(tagStr)}&t0=${q0.toFixed(3)}&t1=${q1.toFixed(3)}`;
+    let resp;
+    try { resp = await apiGet(url); }
+    catch (e) { return false; }
+    if (!resp.series || !resp.series.length) return false;
+    const byTag = new Map();
+    for (const s of resp.series) byTag.set(s.tag_id, s);
+    for (const sig of win.signals) {
+        const s = byTag.get(sig.tag.id);
+        if (!s) continue;
+        // Покрытием считаем ЗАПРОШЕННОЕ окно, даже если точек в нём нет:
+        // на краю базы это защищает от повторных запросов на каждый тик колеса.
+        sig.t_start = q0; sig.t_end = q1;
+        if (s.times && s.times.length > 0) Object.assign(sig, { times: s.times, values: s.values });
+    }
+    // Полностью пустой ответ: покрытие запомнили (край базы больше не спамует
+    // запросами), но сетку и loadedSpan НЕ трогаем — они отвечают за старые
+    // данные, перерисовки нет.
+    if (!resp.series.some(s => s.times && s.times.length > 0)) return false;
+    // Помечаем, под какое ВИДИМОЕ окно посчитана сетка ответа (маржа шире, но
+    // её бакет крупнее). Reload на зуме in сравнивает с этим: перезапрос,
+    // только когда окно сузилось вдвое — то есть разрешение реально вырастет.
+    win.loadedSpan = tMax - tMin;
+    return true;
+}
+
+/// Интервал, который реально покрыт данными сигнала (для решения
+/// «нужна ли догрузка»: видимое окно внутри покрытия — запрос не идёт).
+function coveredRange(win) {
+    const sig = win.signals[0];
+    if (!sig || sig.t_start == null || sig.t_end == null) return null;
+    return [sig.t_start, sig.t_end];
+}
+
+/// При зуме in видимое окно всегда ЛЕЖИТ внутри загруженного, поэтому проверка
+/// «внутри покрытия» не выпускала запрос — и разрешение оставалось сеткой
+/// исходного (самого широкого) окна: короткие импульсы исчезали и в архиве,
+/// и в live. Догружаем, когда окно сузилось хотя бы в RELOAD_ZOOMIN раз:
+/// сервер пересчитает bucket_ms под новый span и отдаст сетку мельче.
+const RELOAD_ZOOMIN = 2;
+
+function needReload(w, vm, vx) {
+    const cov = coveredRange(w);
+    if (!cov || vm < cov[0] || vx > cov[1]) return true;      // край за данными
+    const loaded = w.loadedSpan;
+    return !!loaded && (vx - vm) * RELOAD_ZOOMIN < loaded;     // зум in finer
+}
+
+/// Троттлинг догрузки при зуме: ЧИСТый debounce («ждём паузу 200 мс») не
+/// стрелял запросами во время непрерывного вращения колеса — края долго
+/// оставались пустыми, а при быстром скролле не появлялись вовсе. Теперь
+/// первый запрос серии уходит СРАЗУ, дальнейшие — не чаще одного на
+/// ZOOM_RELOAD_MIN_MS, и trailing-таймер догружает финальный интервал
+/// после последнего события.
+const ZOOM_RELOAD_MIN_MS = 150;
+
+function scheduleZoomReload(w) {
+    const st = w.zoomReload || (w.zoomReload = { last: 0, timer: 0, seq: 0 });
+    const wait = ZOOM_RELOAD_MIN_MS - (Date.now() - st.last);
+    if (wait <= 0) {
+        st.last = Date.now();
+        fireChartReload(w, st);
+    } else {
+        clearTimeout(st.timer);
+        st.timer = setTimeout(() => {
+            st.last = Date.now();
+            fireChartReload(w, st);
+        }, wait);
     }
 }
 
-/// Debounce-таймер для ленивой подгрузки при зуме.
-const zoomReloadTimer = new Map(); // winId -> setTimeout
+function fireChartReload(w, st) {
+    const u = w.chart;
+    if (!u || !w.signals.length) return;
+    const vm = u.scales.x.min, vx = u.scales.x.max;
+    if (!(vx > vm)) return;
+    const seq = ++st.seq;
+    reloadWindowRange(w, vm, vx).then(updated => {
+        // Устаревший ответ (пока ждали, ушёл новый запрос) не применяем —
+        // иначе он перетирает более свежие данные.
+        if (!updated || st.seq !== seq || w.chart !== u) return;
+        applySeriesData(w, u);
+    });
+}
 
 function getActiveWindow() {
     return chartWindows.find(w => w.id === activeWindowId) || chartWindows[0];
@@ -909,6 +1152,8 @@ async function addSignal(tagId) {
         const data = await apiGet(getChartsUrl(tagId));
         if (!data.times || data.times.length === 0) return;
         win.signals.push({ tag, times: data.times, values: data.values, t_start: data.t_start, t_end: data.t_end });
+        win.fullT0 = data.t_start; win.fullT1 = data.t_end;
+
         rebuildChartWindow(win);
         // Обзор архива строится по сигналам активного окна — перерисовываем.
         if (document.getElementById('charts-mode').value === 'Archive') loadArchOverview();
@@ -972,16 +1217,61 @@ function renderLegend(win, legend) {
     legend.style.display = win.signals.length ? 'flex' : 'none';
 }
 
+/// Live-тик при пользовательском зуме: окно НЕ сбрасывается, но данные в нём
+/// должны продолжать прирастать. Раньше зумированное окно просто пропускалось
+/// (continue) — и после прокрутки колесом график замирал: новые точки в БД
+/// появлялись, а на экране не рисовались.
+/// Здесь: догружаем видимый интервал и, если его правый край «живой» (рядом с
+/// текущим моментом), сдвигаем окно вправо, сохраняя ширину, — график следует
+/// за последними значениями, как до зума.
+const LIVE_FOLLOW_MAX_S = 5;
+
+function liveWindowFollows(vx, nowSec) {
+    // Допуск не зависит от ширины окна: live-тик ходит раз в 1 с, плюс запас на
+    // задержку ответа. Оттянутое хотя бы на LIVE_FOLLOW_MAX_S в прошлое окно
+    // считается смотровым и остаётся на месте.
+    return nowSec - vx <= LIVE_FOLLOW_MAX_S;
+}
+
+async function refreshZoomedLiveWindow(win) {
+    const u = win.chart;
+    if (!u || !win.signals.length) return;
+    const vm = u.scales.x.min, vx = u.scales.x.max;
+    if (!(vx > vm)) return;
+    const width = vx - vm;
+    const nowSec = Date.now() / 1000;
+    const follow = liveWindowFollows(vx, nowSec);
+    // Окно смотрит в прошлое и целиком лежит в загруженном покрытии: новых
+    // точек туда уже не попадёт — запрос не нужен, иначе live-тик спамит сервер.
+    if (!follow && !needReload(win, vm, vx)) return;
+
+    const updated = await reloadWindowRange(win, vm, vx);
+    if (win.chart !== u) return;
+    if (!updated) return;
+
+    // setData(..., false) — обновляем массивы, масштаб остаётся пользовательский
+    applySeriesData(win, u);
+
+    // «Живое» окно едет за текущим моментом: сдвиг на ту же ширину.
+    // После reloadWindowRange новое окно гарантированно внутри покрытия,
+    // поэтому хук setScale встречным запросом не отвечает.
+    if (follow) u.setScale('x', { min: nowSec - width, max: nowSec });
+}
+
 async function reloadCharts(forceFit = false) {
     const isArchive = document.getElementById('charts-mode').value === 'Archive';
     const emptySignals = [];
     for (const win of chartWindows) {
         if (forceFit) win.zoomed = false;
-        // Live-тик не должен «затоптать» пользовательский зум: интервал в окне
-        // фиксирован, его данные уже записаны в БД. Пересчёт выборки при смене
-        // масштаба делает хук setScale; полный live-вид — по двойному клику
-        // (reloadCharts(true)). Здесь просто пропускаем приближённое окно.
-        if (!forceFit && win.zoomed) continue;
+        // Live-тик не должен «затоптать» пользовательский зум (масштаб остаётся),
+        // но и не обязан замораживать окно: в Live зумированное окно догружается
+        // и едет за текущим моментом (refreshZoomedLiveWindow). В Archive окно
+        // статично — там действительно пропускаем.
+        if (!forceFit && win.zoomed) {
+            if (isArchive) continue;  // архив статичен — не обновляем
+            await refreshZoomedLiveWindow(win);
+            continue;
+        }
         // Batch-запрос на окно: сервер решает о прореживании ОДИН РАЗ и
         // возвращает выровненные серии. Иначе uPlot построит все сигналы по
         // оси X первого тега, и значения второго уедут при разном числе точек.
@@ -999,6 +1289,13 @@ async function reloadCharts(forceFit = false) {
                 for (const s of resp.series) byTag.set(s.tag_id, s);
                 const tStart = resp.t_start;
                 const tEnd = resp.t_end;
+                // Помним полный интервал загрузки: он нужен кнопке «A X», т.к.
+                // ниже sig.t_start/t_end зум перезаписывает видимым окном.
+                win.fullT0 = tStart;
+                win.fullT1 = tEnd;
+                // Шаг сетки ответа соответствует ширине запрошенного окна.
+                win.loadedSpan = tEnd - tStart;
+
                 for (const sig of win.signals) {
                     const s = byTag.get(sig.tag.id);
                     if (s && s.times && s.times.length > 0) {
@@ -1070,16 +1367,17 @@ function rebuildChartWindow(win, forceFit = false) {
                 if (scaleKey !== 'x') return;
                 const w = chartWindows.find(x => x.chart === u);
                 if (!w || w.suppressReload) return;
-                w.zoomed = true;
-                const prev = zoomReloadTimer.get(w.id);
-                if (prev) clearTimeout(prev);
-                zoomReloadTimer.set(w.id, setTimeout(async () => {
-                    zoomReloadTimer.delete(w.id);
-                    // Данные могли уйти: окно удалено или пересоздано за debounce.
-                    if (w.chart !== u || w.suppressReload || !w.signals.length) return;
-                    const vm = u.scales.x.min, vx = u.scales.x.max;
-                    if (await reloadWindowRange(w, vm, vx)) applySeriesData(w, u);
-                }, 200));
+                // w.autoScaleExit ставит кнопка «x→ 100%»: хук setScale в uPlot
+                // асинхронный и иначе перезаписал бы сброс флага после выхода из зума.
+                if (w.autoScaleExit) { w.autoScaleExit = false; w.zoomed = false; }
+                else w.zoomed = true;
+                // Догрузка нужна только когда видимое окно ВЫХОДИТ за загруженное
+                // покрытие (с запасом 2× на шаг зума). Если край уже есть в данных,
+                // запрос не уходит — иначе колесо «дёргает» сервер на каждый тик.
+                const vm = u.scales.x.min, vx = u.scales.x.max;
+                if (!(vx > vm) || !w.signals.length) return;
+                if (!needReload(w, vm, vx)) return;
+                scheduleZoomReload(w);
             }]
         }
     };
@@ -1139,9 +1437,48 @@ const BIT_COLORS = [
     '#FFEB3B', '#9C27B0', '#795548', '#607D8B'
 ];
 
+/// Аналог refreshZoomedLiveWindow для вкладки Bits. Раньше reloadBits при
+/// пользовательском зуме просто return — и битовая диаграмма замирала.
+async function refreshZoomedLiveBits() {
+    const u = bitsChart;
+    if (!u || !bitsSelectedId) return;
+    const vm = u.scales.x.min, vx = u.scales.x.max;
+    if (!(vx > vm)) return;
+    const width = vx - vm;
+    const nowSec = Date.now() / 1000;
+    const margin = Math.max(width, 60);
+    const follow = liveWindowFollows(vx, nowSec);
+    // Окно в прошлом и внутри покрытия — новые биты туда не попадут.
+    if (!follow && bitsCov && vm >= bitsCov[0] && vx <= bitsCov[1] &&
+        !(bitsLoadedSpan && (vx - vm) * RELOAD_ZOOMIN < bitsLoadedSpan)) return;
+
+    let payload;
+    try {
+        payload = await apiGet(`/api/archive/${bitsSelectedId}?t0=${(vm - margin).toFixed(3)}&t1=${(vx + margin).toFixed(3)}`);
+    } catch (e) { return; }
+    if (bitsChart !== u) return;
+    bitsCov = [vm - margin, vx + margin];
+    bitsLoadedSpan = width;
+    if (!payload.times || !payload.times.length) return;
+
+    const tag = allTags.find(x => x.id === bitsSelectedId);
+    const nBits = (tag && (tag.data_type || '').toUpperCase() === 'BYTE') ? 8 : 16;
+
+    bitsSuppressReload = true;
+    u.setData(bitsSeriesArrays(payload, nBits), false);
+    Promise.resolve().then(() => { if (bitsChart === u) bitsSuppressReload = false; });
+
+    if (follow) u.setScale('x', { min: nowSec - width, max: nowSec });
+}
+
 async function reloadBits(forceFit = false) {
     if (!bitsSelectedId) return;
     if (forceFit) userZoomedBits = false;
+    if (!forceFit && userZoomedBits) {
+        // Live-режим: догружаем видимое окно, масштаб не сбрасывается
+        await refreshZoomedLiveBits();
+        return;
+    }
     let payload;
     try { payload = await apiGet(getBitsUrl(bitsSelectedId)); }
     catch (e) { return; }
@@ -1153,22 +1490,19 @@ async function reloadBits(forceFit = false) {
     const tag = allTags.find(x => x.id === bitsSelectedId);
     const nBits = (tag && (tag.data_type || '').toUpperCase() === 'BYTE') ? 8 : 16;
 
-    const data = [payload.times];
+    const data = bitsSeriesArrays(payload, nBits);
     const series = [{ label: "Time" }];
-    // Bit 0 — верхняя дорожка: y = nBits-1-b. Lo-Hi меняет байты слова.
-    const prep = payload.values.map(v => {
-        let w = Math.floor(v) & 0xFFFF;
-        if (bitsByteSwap && nBits === 16) w = ((w >> 8) | (w << 8)) & 0xFFFF;
-        return w;
-    });
-    for (let b = 0; b < nBits; b++) {
-        const pos = nBits - 1 - b;
+    for (let b = 0; b < nBits; b++)
         series.push({ label: `Bit ${b}`, stroke: BIT_COLORS[b], width: 1.5, paths: uPlot.paths.stepped({ align: 1 }) });
-        data.push(prep.map(w => pos + (((w >> b) & 1) * 0.75)));
-    }
 
     let tMin = payload.t_start || payload.times[0];
     let tMax = payload.t_end || payload.times[payload.times.length - 1];
+    bitsFullT0 = tMin; bitsFullT1 = tMax;   // для кнопки «x→ 100%»
+    // Покрытие реальными точками — для решения «нужна ли догрузка» при зуме.
+    bitsCov = [payload.times[0], payload.times[payload.times.length - 1]];
+    // Ширина окна запроса: по ней сервер считал шаг сетки (для reload на зуме in).
+    bitsLoadedSpan = tMax - tMin;
+
     const fit = !userZoomedBits || forceFit;
     if (fit) initCursorsFromRange(bitsCursors, tMin, tMax, forceFit);
     const tc = themeColors();
@@ -1183,11 +1517,80 @@ async function reloadBits(forceFit = false) {
             { stroke: tc.axis, grid: { stroke: tc.grid } },
             { stroke: tc.axis, grid: { stroke: tc.grid }, values: () => [], size: 90 }
         ],
-        hooks: { draw: [(self) => drawBitsTickLabels(self, nBits)] },
+        hooks: {
+            draw: [(self) => drawBitsTickLabels(self, nBits)],
+            // Догрузка краёв при зуме/пане, как на Charts. Хук асинхронный,
+            // поэтому границы читаем из u.scales.x внутри отложенного вызова.
+            setScale: [(u, k) => { if (k === 'x') onBitsScaleChange(u); }],
+        },
         series, cursor: { drag: { x: true, y: false } }
     };
-    bitsChart = new uPlot(opts, data, box);
+    bitsSuppressReload = true;
+    const u = new uPlot(opts, data, box);
+    bitsChart = u;
+    // Игним setScale от инициализации uPlot (microtask) — это не пользовательский зум.
+    Promise.resolve().then(() => { if (bitsChart === u) bitsSuppressReload = false; });
     if (activeTab === 'bits') updateCursorPanel(bitsCursors);
+}
+
+/// Собирает uPlot-массивы для вкладки Bits: ось времени + 8/16 дорожек бит.
+function bitsSeriesArrays(payload, nBits) {
+    const data = [payload.times];
+    // Bit 0 — верхняя дорожка: y = nBits-1-b. Lo-Hi меняет байты слова.
+    // null (бакет вне реальных записей — «в будущем» за последней точкой) не
+    // распаковываем в биты: дорожка должна обрываться, а не тянуться нулём.
+    const prep = payload.values.map(v => {
+        if (v == null) return null;
+        let w = Math.floor(v) & 0xFFFF;
+        if (bitsByteSwap && nBits === 16) w = ((w >> 8) | (w << 8)) & 0xFFFF;
+        return w;
+    });
+    for (let b = 0; b < nBits; b++) {
+        const pos = nBits - 1 - b;
+        data.push(prep.map(w => (w == null ? null : pos + (((w >> b) & 1) * 0.75))));
+    }
+    return data;
+}
+
+/// Догрузка краёв при зуме/пане вкладки Bits. Аналогично Charts: запрос с
+/// запасом, троттлинг, устаревший ответ не применяем. Окно грузим через
+/// /api/archive?t0/t1 — история доступна и в live-режиме за тот же интервал.
+function onBitsScaleChange(u) {
+    if (bitsSuppressReload || !bitsChart || u !== bitsChart) return;
+    const vm = u.scales.x.min, vx = u.scales.x.max;
+    if (!(vx > vm) || !bitsSelectedId) return;
+    // За краем покрытия — догружаем; внутри, но с сузлением в RELOAD_ZOOMIN раз
+    // — перезапрашиваем finer (короткие импульсы на зуме in, как на Charts).
+    if (bitsCov && vm >= bitsCov[0] && vx <= bitsCov[1] &&
+        !(bitsLoadedSpan && (vx - vm) * RELOAD_ZOOMIN < bitsLoadedSpan)) return;
+    const st = bitsZoom || (bitsZoom = { last: 0, timer: 0, seq: 0 });
+    const wait = ZOOM_RELOAD_MIN_MS - (Date.now() - st.last);
+    if (wait <= 0) { st.last = Date.now(); fireBitsReload(u, st); }
+    else { clearTimeout(st.timer); st.timer = setTimeout(() => { st.last = Date.now(); fireBitsReload(u, st); }, wait); }
+}
+
+function fireBitsReload(u, st) {
+    const vm = u.scales.x.min, vx = u.scales.x.max;
+    const margin = Math.max(vx - vm, 60);
+    const q0 = vm - margin, q1 = vx + margin;
+    const tag = allTags.find(x => x.id === bitsSelectedId);
+    const nBits = (tag && (tag.data_type || '').toUpperCase() === 'BYTE') ? 8 : 16;
+    const seq = ++st.seq;
+    const url = `/api/archive/${bitsSelectedId}?t0=${q0.toFixed(3)}&t1=${q1.toFixed(3)}`;
+    apiGet(url).then(payload => {
+        // Устаревший ответ или пересобранный график — не применяем.
+        if (st.seq !== seq || bitsChart !== u) return;
+        // Покрытием считаем ЗАПРОШЕННОЕ окно, даже если точек нет: на краю
+        // базы это защищает от повторных запросов на каждый тик колеса.
+        bitsCov = [q0, q1];
+        // Ширина ВИДИМОГО окна, под которую реально нужна сетка: с ней
+        // сравниваем последующее сужение (см. RELOAD_ZOOMIN на Charts).
+        bitsLoadedSpan = vx - vm;
+        if (!payload.times || !payload.times.length) return;
+        bitsSuppressReload = true;
+        u.setData(bitsSeriesArrays(payload, nBits), false);
+        Promise.resolve().then(() => { if (bitsChart === u) bitsSuppressReload = false; });
+    }).catch(() => {});
 }
 
 // ---------------------------------------------------------------- экспорт PNG/PDF
@@ -1563,10 +1966,12 @@ setInterval(async () => {
     const isChartsActive = document.getElementById('page-charts').classList.contains('active');
     const isBitsActive = document.getElementById('page-bits').classList.contains('active');
     const hasSignals = chartWindows.some(w => w.signals.length > 0);
-    if (isChartsActive && hasSignals && !chartsPaused && document.getElementById('charts-mode').value === 'Live') {
+    if (isChartsActive && hasSignals && !chartsPaused && mouseHeldCharts === 0 &&
+        document.getElementById('charts-mode').value === 'Live') {
         reloadCharts(false);
     }
-    if (isBitsActive && !bitsPaused && document.getElementById('bits-mode').value === 'Live') {
+    if (isBitsActive && !bitsPaused && mouseHeldBits === 0 &&
+        document.getElementById('bits-mode').value === 'Live') {
         reloadBits(false);
     }
 }, 1000);

@@ -364,6 +364,112 @@ async fn end_to_end_modbus_cycle() {
     let _ = h.tmp.path();
 }
 
+/// running_count в /api/status меняется асинхронно: задача драйвера поднимает
+/// флаг после bind. Тест ждёт целевое количество, а не читает сразу.
+impl Harness {
+    async fn wait_running(&self, want: i64) -> Value {
+        let mut st = json!(null);
+        for _ in 0..50 {
+            st = self.get_json("/api/status").await;
+            if st["running"].as_i64() == Some(want) {
+                return st;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        panic!("running_count не стал {want}: {st:?}");
+    }
+}
+
+/// Точечный стоп/старт одного модуля через REST: остановленный не опрашивает,
+/// но запускается обратно; /api/status показывает его в manually_stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_start_single_connection() {
+    let h = Harness::start().await;
+    let port = free_port().await;
+    let srv = h.post_json(
+        "/api/connections",
+        json!({
+            "name": "STOP TEST", "driver_type": "modbus_server", "enabled": true,
+            "poll_interval_ms": 200, "config": {"host": "127.0.0.1", "port": port}
+        }),
+    ).await;
+    let sid = srv["id"].as_i64().unwrap();
+    h.post_json("/api/tags", json!({
+        "id": 0, "connection_id": sid, "name": "st_float", "address_str": "HR160", "data_type": "FLOAT",
+        "scale": 1.0, "offset_val": 0.0, "unit": "", "group_name": "Тест",
+        "log_interval_ms": 1000, "deadband": 0.0
+    })).await;
+
+    // Драйвер поднялся (add_connection вызывает restart_all)
+    let st = h.wait_running(1).await;
+    assert!(st["manually_stopped"].as_array().unwrap().is_empty());
+
+    // Стоп — running=0, пауза в списке
+    let r = h.post_json(&format!("/api/connections/{sid}/stop"), json!({})).await;
+    assert_eq!(r["ok"], json!(true));
+    let st = h.wait_running(0).await;
+    assert!(st["manually_stopped"].as_array().unwrap().contains(&json!(sid)),
+        "модуль числится остановленным вручную: {st:?}");
+
+    // Старт обратно
+    let r = h.post_json(&format!("/api/connections/{sid}/start"), json!({})).await;
+    assert_eq!(r["ok"], json!(true));
+    let st = h.wait_running(1).await;
+    assert!(st["manually_stopped"].as_array().unwrap().is_empty(),
+        "после start паузы нет: {st:?}");
+
+    h.stop().await;
+    let _ = h.tmp.path();
+}
+
+/// Ручная пауза переживает «рестарт процесса»: второй AppCore поверх той же
+/// БД и того же pda_paused.json (рядом с db_config.json) не поднимает
+/// остановленный модуль при start(), а start_connection снимает паузу.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_pause_survives_process_restart() {
+    let h = Harness::start().await;
+    let port = free_port().await;
+    let srv = h.post_json(
+        "/api/connections",
+        json!({
+            "name": "PAUSE RESTART", "driver_type": "modbus_server", "enabled": true,
+            "poll_interval_ms": 200, "config": {"host": "127.0.0.1", "port": port}
+        }),
+    ).await;
+    let sid = srv["id"].as_i64().unwrap();
+    h.wait_running(1).await;
+    let _ = h.post_json(&format!("/api/connections/{sid}/stop"), json!({})).await;
+    h.wait_running(0).await;
+
+    // Имитация перезапуска процесса: новый AppCore поверх тех же файлов.
+    let db_path = h.tmp.path().join("smoke.db").to_string_lossy().into_owned();
+    h.stop().await;
+    let cfg = DbConfig { sqlite_path: db_path, ..Default::default() };
+    let db2 = std::sync::Arc::new(DatabaseService::open(cfg).await);
+    assert!(db2.is_available, "та же БД открыта заново");
+    let core2 = AppCore::with_config_path(db2, h.tmp.path().join("db_config.json"));
+    core2.start(false).await;
+
+    {
+        let mgr = core2.manager.read().await;
+        assert!(mgr.is_manually_stopped(sid), "пауза загружена при старте ядра");
+        assert_eq!(mgr.running_count(), 0, "start_all не поднимает ручную паузу");
+    }
+
+    // Снятие паузы работает и после рестарта.
+    assert!(core2.manager.write().await.start_connection(sid).await);
+    for _ in 0..50 {
+        if core2.manager.read().await.running_count() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert_eq!(core2.manager.read().await.running_count(), 1, "модуль снова опрашивается");
+    core2.manager.write().await.stop_all().await;
+    h.stop().await;
+    let _ = h.tmp.path();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn helpers_and_validation_endpoints() {
     let h = Harness::start().await;

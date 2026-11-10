@@ -9,7 +9,7 @@
 //! а её наблюдаемое состояние живёт в `DriverState` (её и останавливаем снятием
 //! флага `running`, как `stop()` в оригинале).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 
@@ -44,11 +44,28 @@ fn poll_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// On-disk формат файла ручных пауз (pda_paused.json рядом с db_config.json).
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct PauseFile {
+    #[serde(default)]
+    paused: Vec<i64>,
+}
+
 pub struct DriverManager {
     store: Arc<dyn DbConfigStore>,
     pub registry: Arc<TagRegistry>,
     pub historian: Historian,
     drivers: HashMap<i64, RunningDriver>,
+    /// Модули, остановленные пользователем вручную (из дерева I/O). Нужны,
+    /// чтобы start_drivers/start_all (выход из «только просмотр», старт приложения)
+    /// не поднимали то, что оператор намеренно держит выключенным. Флаг
+    /// connection.enabled при этом НЕ меняется — это runtime-пауза, а не
+    /// правка конфигурации.
+    manually_stopped: HashSet<i64>,
+    /// Файл для persist пауз (JSON {"paused": [ids]}). Пауза переживает рестарт
+    /// процесса и перезагрузку ПК: при старте сервера список перечитывается.
+    /// None (тесты ядра) — ничего не пишем и не читаем.
+    pause_file: Option<std::path::PathBuf>,
 }
 
 impl DriverManager {
@@ -67,6 +84,45 @@ impl DriverManager {
             registry,
             historian,
             drivers: HashMap::new(),
+            manually_stopped: HashSet::new(),
+            pause_file: None,
+        }
+    }
+
+    /// Файл, в котором переживают рестарт процесса ручные паузы модулей.
+    /// Путь задаётся до первого start_*: существующий список сразу загружается,
+    /// и start_all не поднимет то, что оператор остановил в прошлой сессии.
+    pub fn set_pause_file(&mut self, path: std::path::PathBuf) {
+        match std::fs::read_to_string(&path) {
+            Ok(txt) => match serde_json::from_str::<PauseFile>(&txt) {
+                Ok(p) => self.manually_stopped = p.paused.into_iter().collect(),
+                Err(exc) => tracing::warn!(
+                    "[Drivers] {}: не разобран файл пауз ({exc}), начинаем с чистого",
+                    path.display()
+                ),
+            },
+            Err(_) => {} // нет файла — это нормально (первый запуск)
+        }
+        self.pause_file = Some(path);
+    }
+
+    /// Сохранить текущий список пауз. Идемпотентно: любая смена manually_stopped
+    /// пишет файл целиком (список короткий). Ошибку логируем — она не должна
+    /// ломать стоп/старт, только перезапуск без учёта паузы.
+    fn save_paused(&self) {
+        let Some(path) = &self.pause_file else { return };
+        let mut ids: Vec<i64> = self.manually_stopped.iter().copied().collect();
+        ids.sort_unstable();
+        let txt = serde_json::to_string(&PauseFile { paused: ids }).unwrap_or_default();
+        if let Err(exc) = std::fs::write(path, txt) {
+            tracing::warn!("[Drivers] Не удалось сохранить файл пауз {}: {exc}", path.display());
+        }
+    }
+
+    /// Удаление модуля: вычёркиваем его из сохранённых пауз (id больше нет).
+    pub fn forget_connection(&mut self, conn_id: i64) {
+        if self.manually_stopped.remove(&conn_id) {
+            self.save_paused();
         }
     }
 
@@ -101,11 +157,71 @@ impl DriverManager {
 
         self.reload_tags().await;
         for c in conns {
-            if !c.enabled || self.drivers.contains_key(&c.id) {
+            // manually_stopped — пауза, снятая оператором из дерева I/O:
+            // такой модуль не поднимаем, даже пока enabled=true.
+            if !c.enabled || self.manually_stopped.contains(&c.id) || self.drivers.contains_key(&c.id) {
                 continue;
             }
             self.spawn_driver(&c);
         }
+    }
+
+    /// Остановить один модуль опроса, не трогая остальные и журнал.
+    /// Возвращает true, если драйвер был запущен (или числился вручную
+    /// остановленным — повторный stop идемпотентен).
+    pub async fn stop_connection(&mut self, conn_id: i64) -> bool {
+        self.manually_stopped.insert(conn_id);
+        self.save_paused();
+        if let Some(d) = self.drivers.remove(&conn_id) {
+            d.state.stop();
+            // abort дропает future задачи: слушатель Modbus-сервера закрывается
+            // сразу, порт освобождается. Handle — из выделенного poll_runtime(),
+            // аварить его отсюда (другой рантайм) нельзя, поэтому не ждём.
+            d.handle.abort();
+            true
+        } else {
+            // Уже не запущен — пауза всё равно зафиксирована, статус для UI
+            // останется «Stopped (paused by operator)».
+            true
+        }
+    }
+
+    /// Снять ручную паузу и запустить модуль из текущей конфигурации.
+    /// Возвращает true, если модуль включён и драйвер поднят.
+    pub async fn start_connection(&mut self, conn_id: i64) -> bool {
+        if self.manually_stopped.remove(&conn_id) {
+            self.save_paused();
+        }
+        if self.drivers.contains_key(&conn_id) {
+            return true; // уже работает
+        }
+        let conns = match self.store.get_all_connections().await {
+            Ok(c) => c,
+            Err(exc) => {
+                tracing::warn!("[Drivers] Не удалось загрузить подключения: {exc}");
+                return false;
+            }
+        };
+        let Some(c) = conns.iter().find(|c| c.id == conn_id) else {
+            tracing::warn!("[Drivers] Подключение id={conn_id} не найдено");
+            return false;
+        };
+        if !c.enabled {
+            tracing::warn!("[Drivers] Подключение '{}' выключено в конфигурации", c.name);
+            return false;
+        }
+        self.reload_tags().await;
+        self.spawn_driver(c);
+        true
+    }
+
+    /// Модули, остановленные вручную (для статуса: чем показывать паузу в UI).
+    pub fn manually_stopped_ids(&self) -> Vec<i64> {
+        self.manually_stopped.iter().copied().collect()
+    }
+
+    pub fn is_manually_stopped(&self, conn_id: i64) -> bool {
+        self.manually_stopped.contains(&conn_id)
     }
 
     /// Запуск без опроса: реестр из БД + журнал. Это режим «только просмотр» —
@@ -175,7 +291,11 @@ impl DriverManager {
     }
 
     /// Точечный перезапуск одного подключения (изменение конфигурации).
+    /// Конфиг менялся — оператор ожидает работы, снимаем ручную паузу.
     pub async fn restart_connection(&mut self, conn_id: i64) {
+        if self.manually_stopped.remove(&conn_id) {
+            self.save_paused();
+        }
         if let Some(d) = self.drivers.remove(&conn_id) {
             d.state.stop();
             d.handle.abort();
@@ -256,20 +376,34 @@ mod tests {
 
     /// Соединение слушаем на свободном высокопортовом адресе: 502 требует
     /// прав администратора, а тест не должен от них зависеть.
-    fn stub_conn() -> Connection {
+    /// Порт параметризован: tokio-тесты идут в параллель, и два мода на одном
+    /// порту дают "Address in use" — bind второго просто не поднимается.
+    fn stub_conn_on(port: u16) -> Connection {
         let mut cfg = ConnConfig::new();
         cfg.insert("host".into(), serde_json::json!("127.0.0.1"));
-        cfg.insert("port".into(), serde_json::json!(15020));
+        cfg.insert("port".into(), serde_json::json!(port));
         Connection::new(7, "cut", "modbus_server", true, 1000, cfg)
     }
 
+    fn stub_conn() -> Connection {
+        stub_conn_on(15020)
+    }
+
     /// Заглушка конфигурации: одно подключение + один тег.
-    struct StoreStub;
+    struct StoreStub {
+        port: u16,
+    }
+
+    impl StoreStub {
+        fn new(port: u16) -> Self {
+            Self { port }
+        }
+    }
 
     #[async_trait]
     impl DbConfigStore for StoreStub {
         async fn get_all_connections(&self) -> DbResult<Vec<Connection>> {
-            Ok(vec![stub_conn()])
+            Ok(vec![stub_conn_on(self.port)])
         }
         async fn add_connection(&self, _c: &Connection) -> DbResult<i64> {
             Ok(7)
@@ -375,7 +509,7 @@ mod tests {
             retention_days: 0.0,
         };
         let mut mgr = DriverManager::new(
-            Arc::new(StoreStub),
+            Arc::new(StoreStub::new(15020)),
             Arc::new(WriterStub {
                 written: written.clone(),
             }),
@@ -410,11 +544,114 @@ mod tests {
         assert!(stats.get("written").is_some(), "статистика журнала есть");
     }
 
+    /// Ручная пауза модуля: stop_connection снимает драйвер, start_drivers
+    /// (пересборка всех) его НЕ поднимает, start_connection — поднимает снова.
+    #[tokio::test]
+    async fn manual_stop_start_connection() {
+        let mut mgr = DriverManager::new(
+            Arc::new(StoreStub::new(15021)),
+            Arc::new(WriterStub {
+                written: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            Some(JournalConfig::default()),
+        );
+
+        // Поднимаем один модуль (id=7 из StoreStub) и ждём Running.
+        assert!(mgr.start_connection(7).await);
+        for _ in 0..50 {
+            if mgr.running_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(mgr.running_count(), 1, "модуль запущен start_connection");
+
+        // Останавливаем вручную — драйвер уходит, статус Stopped.
+        assert!(mgr.stop_connection(7).await);
+        assert_eq!(mgr.running_count(), 0, "после stop_connection ничего не опрашивается");
+        assert_eq!(mgr.driver_status(7), "Stopped");
+
+        // start_drivers (общий пересбор) НЕ должен поднимать вручную остановленный.
+        mgr.start_drivers().await;
+        assert_eq!(mgr.running_count(), 0, "manually_stopped переживает start_drivers");
+        assert!(mgr.is_manually_stopped(7));
+
+        // Снятие паузы — снова работает.
+        assert!(mgr.start_connection(7).await);
+        assert!(!mgr.is_manually_stopped(7));
+        for _ in 0..50 {
+            if mgr.running_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(mgr.running_count(), 1, "start_connection после паузы поднимает модуль");
+
+        mgr.stop_all().await;
+    }
+
+    /// Ручная пауза переживает рестарт процесса: список пишется в pause-файл,
+    /// новый DriverManager с тем же файлом не поднимает остановленный модуль,
+    /// а start_connection чистит и память, и файл.
+    #[tokio::test]
+    async fn manual_pause_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("pda_pause_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let pause_path = dir.join("pda_paused.json");
+        let _ = std::fs::remove_file(&pause_path);
+
+        let mk = || {
+            let mut m = DriverManager::new(
+                Arc::new(StoreStub::new(15023)),
+                Arc::new(WriterStub {
+                    written: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+                Some(JournalConfig::default()),
+            );
+            m.set_pause_file(pause_path.clone());
+            m
+        };
+
+        // Сессия 1: старт → ручная пауза → файл создан, в нём id=7.
+        let mut m1 = mk();
+        assert!(m1.start_connection(7).await);
+        for _ in 0..50 {
+            if m1.running_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(m1.stop_connection(7).await);
+        m1.stop_all().await; // "смерть процесса": драйверы сняты
+        drop(m1);
+        let txt = std::fs::read_to_string(&pause_path).expect("pause-файл записан");
+        assert!(txt.contains("7"), "в файле id остановленного модуля: {txt}");
+
+        // Сессия 2: новый менеджер с тем же файлом — модуль остаётся в паузе.
+        let mut m2 = mk();
+        assert!(m2.is_manually_stopped(7), "пауза загружена из файла");
+        m2.start_all().await;
+        assert_eq!(m2.running_count(), 0, "start_all не поднимает paused-модуль");
+
+        // Снятие паузы чистит и набор, и файл.
+        assert!(m2.start_connection(7).await);
+        let txt = std::fs::read_to_string(&pause_path).unwrap();
+        assert!(!txt.contains("7"), "после start в файле пусто: {txt}");
+        m2.stop_all().await;
+
+        // forget_connection убирает следы удалённого модуля из файла.
+        assert!(m2.stop_connection(7).await);
+        m2.forget_connection(7);
+        let txt = std::fs::read_to_string(&pause_path).unwrap();
+        assert!(!txt.contains("7"), "удалённый модуль вычеркнут: {txt}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn unknown_driver_skipped() {
         let cfg = JournalConfig::default();
         let mut mgr = DriverManager::new(
-            Arc::new(StoreStub),
+            Arc::new(StoreStub::new(15022)),
             Arc::new(WriterStub {
                 written: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }),

@@ -20,7 +20,7 @@ pub const QUALITY_BAD: i32 = 1;
 
 /// Максимум незаписанных переходов на тег. deque(maxlen) вытесняет старейшие,
 /// защищая память и очередь писателя от перегрузки при экстремальном дребезге.
-pub const MAX_PENDING_SAMPLES: usize = 8;
+pub const MAX_PENDING_SAMPLES: usize = 20;
 
 /// Один отсчёт: (метка времени, значение, качество).
 pub type Sample = (DateTime<Local>, f64, i32);
@@ -154,13 +154,7 @@ impl TagPoint {
         // Журнал выбирается реже опроса: запоминаем изменения значения,
         // чтобы короткий импульс (100->101->100 между сканами) не потерялся.
         // Мёртвую зону отсекает track_sample (накопленный дрейф пишется).
-        // При log_interval_ms = 0 (COV) регистрируем каждое пришедшее
-        // значение, включая повторяющееся.
-        let track = if st.log_interval_ms == 0 {
-            true
-        } else {
-            st.value.map_or(true, |prev| value != prev)
-        };
+        let track = st.value.map_or(true, |prev| value != prev);
         if track {
             track_sample(&mut st, ts, value, quality);
         }

@@ -155,10 +155,13 @@ fn query_raw_sqlite(
     Ok(out)
 }
 
-/// Предел точек на один график. Экран ~1–2 тыс. пикселей по X, поэтому больше
-/// рисовать бессмысленно: при десятках миллионов строк в БД такая выборка и
-/// такая передача — единственная причина «виснет при открытии графика».
-pub const MAX_POINTS: usize = 2000;
+/// Предел точек на один график. Раньше стояло 2000 «под ширину экрана», но
+/// при бакете в ~5 секунд короткие импульсы (2-3 отсчёта) размазывались AVG
+/// в ноль, и пользователь не видел ни переключений в архиве, ни в live.
+/// 5000 точек остаются лёгкими для uPlot (он умеет decimated-отрисовку),
+/// а разрешение растёт в 2.5 раза; при зуме in фронт перезапрашивает окно и
+/// получает ещё мельче — вплоть до raw-точек.
+pub const MAX_POINTS: usize = 5000;
 
 /// Granularity of the pre-aggregated summary table (1 minute).
 /// For windows larger than this, queries go to data_points_summary instead of
@@ -214,10 +217,11 @@ impl DatabaseService {
                     return get_series_raw_pg(&c, tag_ids, &start, &end).await;
                 }
                 // Если шаг прореживания крупнее минутного бакета (окно от
-                // ~33 часов), берём готовые средние из data_points_summary —
-                // таблица в ~1000x меньше и отвечает быстрее. Окна с шагом
-                // бакета мельче минуты summary не обслуживает: в ней просто
-                // нет таких бакетов, и densify вернул бы пустоту.
+                // ~3.5 суток при MAX_POINTS=5000), берём готовые средние из
+                // data_points_summary — таблица в ~1000x меньше и отвечает
+                // быстрее. Окна с шагом бакета мельче минуты summary не
+                // обслуживает: в ней просто нет таких бакетов, и densify
+                // вернул бы пустоту.
                 if bucket >= SUMMARY_BUCKET_MS {
                     let summary = query_summary_pg(&c, tag_ids, &start, &end).await?;
                     let start_ms = start.timestamp_millis();
@@ -369,12 +373,19 @@ fn ts_from_millis(ms: i64) -> NaiveDateTime {
 }
 
 /// Прореженный ответ БД (граница бакета в мс -> среднее) приводит к плотной
-/// сетке бакетов с постоянным шагом.
+/// сетке бакетов с постоянным шагом на всё запрошенное окно.
 ///
-/// uPlot строит все серии по единой оси X: если у одного тега бакет оказался
-/// пустым, его значения сдвигаются относительно соседнего сигнала. Пустой
-/// бакет наследует предыдущее значение (LOCF) — для ступенчатого промышленного
-/// сигнала это корректно. Ведущие пустые бакеты отбрасываются.
+/// uPlot строит все серии по единой оси X, поэтому шаг и границы сетки
+/// одинаковы для всех тегов окна. Между занятыми бакетами пустой бакет
+/// наследует предыдущее значение (LOCF) — для ступенчатого промышленного
+/// сигнала это корректно.
+///
+/// А вот бакеты ВНЕ диапазона реальных записей (до первого занятого и после
+/// последнего) заполняются NaN: serde_json отдаёт их как null, uPlot разрывает
+/// линию. LOCF здесь дорисовывал бы ровную прямую «в будущее» (правый край
+/// догрузочного окна при зуме out) или в простой оборудования. Пустой rows
+/// (вообще нет записей в окне) — пустой ответ: фронт по нему показывает
+/// «нет данных за период».
 fn densify_buckets(
     rows: Vec<(f64, f64)>,
     start_ms: i64,
@@ -384,6 +395,11 @@ fn densify_buckets(
     if bucket_ms <= 0 {
         return Vec::new();
     }
+    // rows отсортированы по бакету (ORDER BY в SQL) — границы реальных данных.
+    let (Some(&(first_busy, _)), Some(&(last_busy, _))) = (rows.first(), rows.last()) else {
+        return Vec::new();
+    };
+    let (first_busy, last_busy) = (first_busy as i64, last_busy as i64);
     let first = start_ms.div_euclid(bucket_ms) * bucket_ms;
     let mut it = rows.into_iter().peekable();
     let mut out = Vec::new();
@@ -399,12 +415,14 @@ fn densify_buckets(
                 break;
             }
         }
-        if let Some(v) = last {
-            out.push(DataPoint {
-                timestamp: ts_from_millis(b),
-                value: v,
-            });
-        }
+        let in_data = b >= first_busy && b <= last_busy;
+        out.push(DataPoint {
+            timestamp: ts_from_millis(b),
+            value: match last {
+                Some(v) if in_data => v,
+                _ => f64::NAN,
+            },
+        });
         b += bucket_ms;
     }
     out
@@ -571,9 +589,14 @@ fn get_series_bucketed_sqlite(
     // LIMIT — защита от переполнения, если фильтр по времени не сработает.
     let placeholders: String = tag_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let limit = (MAX_POINTS * tag_ids.len().max(1) + 100) as i64;
+    // Модификатор 'utc' обязателен: timestamp хранится как НАИВНАЯ ЛОКАЛЬНАЯ
+    // строка (dt_str), а julianday без модификатора трактует её как UTC.
+    // Без 'utc' сетка бакетов уезжает на величину часового пояса (+5 ч на этой
+    // машине — на 18 000 000 мс), и densify_buckets не находит ни одной точки:
+    // прореженные окна (/api/series, зум-подгрузка) приходят пустыми.
     let sql = format!(
         "SELECT tag_id, \
-         CAST(CAST((julianday(timestamp) - 2440587.5) * 86400000 AS INTEGER) / {b} AS INTEGER) * {b}, \
+         CAST(CAST((julianday(timestamp, 'utc') - 2440587.5) * 86400000 AS INTEGER) / {b} AS INTEGER) * {b}, \
          AVG(value) \
          FROM data_points \
          WHERE tag_id IN ({ph}) AND timestamp >= ? AND timestamp <= ? \
@@ -706,7 +729,7 @@ fn busy_buckets_sqlite(
 ) -> DbResult<Vec<i64>> {
     let placeholders: String = tag_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT DISTINCT CAST(CAST((julianday(timestamp) - 2440587.5) * 86400000 AS INTEGER) / {b} AS INTEGER) * {b} AS b \
+        "SELECT DISTINCT CAST(CAST((julianday(timestamp, 'utc') - 2440587.5) * 86400000 AS INTEGER) / {b} AS INTEGER) * {b} AS b \
          FROM data_points \
          WHERE tag_id IN ({ph}) AND timestamp >= ? AND timestamp <= ? \
          ORDER BY 1 \
@@ -2203,7 +2226,7 @@ impl DbConfigStore for DatabaseService {
                 // LIMIT — защита от переполнения, если фильтр по времени не сработает.
                 let limit = MAX_POINTS + 100;
                 let sql = format!(
-                    "SELECT (CAST((julianday(timestamp) - 2440587.5) * 86400000 AS INTEGER) / ?4) * ?4, \
+                    "SELECT (CAST((julianday(timestamp, 'utc') - 2440587.5) * 86400000 AS INTEGER) / ?4) * ?4, \
                      AVG(value) FROM data_points \
                      WHERE tag_id = ?1 AND timestamp >= ?2 AND timestamp <= ?3 \
                      GROUP BY 1 ORDER BY 1 \

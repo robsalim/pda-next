@@ -54,7 +54,15 @@ impl AppCore {
         db_config_path: PathBuf,
         exports_dir: PathBuf,
     ) -> Arc<Self> {
-        let manager = DriverManager::new(db.clone(), db.clone(), None);
+        let mut manager = DriverManager::new(db.clone(), db.clone(), None);
+        // Ручные паузы модулей переживают рестарт процесса: sidecar-файл
+        // pda_paused.json в том же каталоге, где db_config.json. Загружается
+        // сразу — start() ниже не поднимет то, что остановил оператор.
+        let pause_file = db_config_path
+            .parent()
+            .map(|d| d.join("pda_paused.json"))
+            .unwrap_or_else(|| PathBuf::from("pda_paused.json"));
+        manager.set_pause_file(pause_file);
         let registry = manager.registry.clone();
         let (live_tx, _) = broadcast::channel(64);
         Arc::new(Self {
