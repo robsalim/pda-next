@@ -138,8 +138,22 @@ button[disabled] { opacity: .5; cursor: default; }
 .bits-right { flex: 1; display: flex; flex-direction: column; padding: 8px; gap: 8px; min-width: 0; }
 .tree-list { flex: 1; overflow-y: auto; margin: 0; padding: 0; list-style: none; font-size: 13px; }
 .tree-list ul { list-style: none; margin: 0; padding-left: 14px; }
+/* Сворачиваемые узлы дерева сигналов: caret-треугольник + клик по ветке. */
+.tree-branch { font-weight: bold; color: var(--text-dim); }
+.tree-fold { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 4px;
+    border-radius: 3px; padding: 2px 4px; }
+.tree-fold:hover { background: var(--hover); color: var(--text-strong); }
+.tree-caret { display: inline-block; width: 0; height: 0; flex: 0 0 auto;
+    border-left: 5px solid currentColor; border-top: 4px solid transparent; border-bottom: 4px solid transparent; }
+.tree-fold.folded .tree-caret { transform: rotate(-90deg); }
+.tree-count { color: var(--text-faint); font-weight: normal; font-size: 11px; }
+.title-btns { float: right; display: inline-flex; gap: 4px; }
+.title-btn { background: var(--bg); color: var(--text-dim); border: 1px solid var(--border-mut);
+    border-radius: 3px; font-size: 10px; line-height: 1; padding: 3px 6px; cursor: pointer; }
+.title-btn:hover { background: var(--hover); color: var(--text-strong); }
 .tree-node { padding: 5px 10px; cursor: pointer; user-select: none; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-radius: 3px; }
 .tree-branch { font-weight: bold; color: var(--text-dim); }
+.tree-leaf { padding: 2px 4px; border-radius: 3px; }
 .tree-leaf:hover { background: var(--hover); color: var(--text-strong); }
 .tree-leaf.selected { background: var(--accent); color: #FFF; }
 .tree-empty { padding: 12px; color: var(--text-faint); font-size: 12px; }

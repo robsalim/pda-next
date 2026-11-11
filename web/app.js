@@ -884,7 +884,50 @@ function escHtml(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function buildTreeHtml(tags, leafRenderer) {
+// Сворачиваемое дерево: узел-ветка (.tree-fold) прячет свой <ul class="tree-kids">.
+// Состояние (какие узлы свёрнуты) хранится в localStorage по id корневого
+// списка, поэтому переживает перезагрузку страницы и перерисовку дерева на
+// каждом fetchTags(). Ключи стабильны: "C:<модуль>" и "G:<модуль>/<группа>".
+const treeFoldCache = {};
+
+function treeAttr(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function treeFoldSet(treeId) {
+    if (!treeFoldCache[treeId]) {
+        let arr = [];
+        try { arr = JSON.parse(localStorage.getItem('pda_tree_fold_' + treeId) || '[]'); } catch (e) { arr = []; }
+        treeFoldCache[treeId] = new Set(Array.isArray(arr) ? arr : []);
+    }
+    return treeFoldCache[treeId];
+}
+
+function treeSaveFold(root) {
+    if (!root || !root.id) return;
+    const keys = [...root.querySelectorAll('.tree-fold.folded')].map(el => el.dataset.fold);
+    treeFoldCache[root.id] = new Set(keys);
+    try { localStorage.setItem('pda_tree_fold_' + root.id, JSON.stringify(keys)); } catch (e) { /* приватный режим - только текущая сессия */ }
+}
+
+function treeToggleFold(header) {
+    const li = header.parentElement;
+    const kids = li && li.querySelector(':scope > ul.tree-kids');
+    const collapsed = header.classList.toggle('folded');
+    if (kids) kids.style.display = collapsed ? 'none' : '';
+    treeSaveFold(header.closest('.tree-list'));
+}
+
+///collapse=true — свернуть все узлы дерева, false — развернуть.
+function treeFoldAll(treeId, collapse) {
+    const root = document.getElementById(treeId);
+    if (!root) return;
+    for (const el of root.querySelectorAll('.tree-fold')) el.classList.toggle('folded', collapse);
+    for (const ul of root.querySelectorAll('ul.tree-kids')) ul.style.display = collapse ? 'none' : '';
+    treeSaveFold(root);
+}
+
+function buildTreeHtml(tags, leafRenderer, treeId, branchDrag) {
     const byConn = {};
     tags.forEach(t => {
         const c = t.connection || 'Без подключения';
@@ -892,13 +935,26 @@ function buildTreeHtml(tags, leafRenderer) {
         (byConn[c] = byConn[c] || {});
         (byConn[c][g] = byConn[c][g] || []).push(t);
     });
+    const folded = treeId ? treeFoldSet(treeId) : new Set();
+    // Ветки draggable только там, где их принимают (дерево Charts).
+    const bd = branchDrag ? ' draggable="true" ondragstart="treeBranchDragStart(event)"' : '';
     let html = '';
     Object.keys(byConn).sort().forEach(c => {
-        html += `<li><div class="tree-branch">🔌 ${escHtml(c)}</div><ul>`;
+        const cKey = `C:${c}`;
+        const cFold = folded.has(cKey) ? ' folded' : '';
+        const cIds = branchDrag ? ` data-ids="${Object.values(byConn[c]).flatMap(list => list.map(t => t.id)).join(',')}"` : '';
+        html += `<li class="tree-fold-node"><div class="tree-branch tree-fold${cFold}"${cIds}${bd} data-fold="${treeAttr(cKey)}"
+            onclick="treeToggleFold(this)"${branchDrag ? ' title="Перетащите на график, чтобы добавить все сигналы модуля"' : ''}><span class="tree-caret"></span>🔌 ${escHtml(c)}</div>
+            <ul class="tree-kids"${cFold ? ' style="display:none"' : ''}>`;
         Object.keys(byConn[c]).sort().forEach(g => {
-            html += `<li><div class="tree-branch">📁 ${escHtml(g)} (${byConn[c][g].length})</div><ul>`;
-            html += byConn[c][g].map(leafRenderer).join('');
-            html += `</ul></li>`;
+            const list = byConn[c][g];
+            const gKey = `G:${c}/${g}`;
+            const gFold = folded.has(gKey) ? ' folded' : '';
+            const gIds = branchDrag ? ` data-ids="${list.map(t => t.id).join(',')}"` : '';
+            html += `<li class="tree-fold-node"><div class="tree-branch tree-fold${gFold}"${gIds}${bd} data-fold="${treeAttr(gKey)}"
+                onclick="treeToggleFold(this)"${branchDrag ? ' title="Перетащите на график, чтобы добавить все сигналы группы"' : ''}><span class="tree-caret"></span>📁 ${escHtml(g)}
+                <span class="tree-count">(${list.length})</span></div>
+                <ul class="tree-kids"${gFold ? ' style="display:none"' : ''}>${list.map(leafRenderer).join('')}</ul></li>`;
         });
         html += `</ul></li>`;
     });
@@ -909,9 +965,54 @@ function renderSidebar() {
     const list = document.getElementById('sidebar-tags');
     if (!allTags.length) { list.innerHTML = `<li class="tree-empty">Нет сигналов в базе</li>`; return; }
     list.innerHTML = buildTreeHtml(allTags, t => `
-        <li><div class="tree-leaf" draggable="true" ondragstart="dragSignal(event, ${t.id})" onclick="addSignal(${t.id})">
+        <li><div class="tree-leaf" data-tid="${t.id}" draggable="true"
+            ondragstart="treeLeafDragStart(event, ${t.id})" onclick="treeLeafClick(event, ${t.id})">
             ${escHtml(t.name)} <span style="color:var(--text-faint); font-size:11px;">${escHtml(t.unit || '')}</span>
-        </div></li>`);
+        </div></li>`, 'sidebar-tags', true);
+    // Порядок листьев в DOM = порядок диапазонов Shift.
+    treeOrderIds = [...list.querySelectorAll('.tree-leaf[data-tid]')].map(el => Number(el.dataset.tid));
+    treeApplySel();
+}
+
+// ----------------------------------------------------------------- выделение дерева
+// Сигналы добавляются на график ТОЛЬКО перетаскиванием. Одиночный клик —
+// выделение одного узла, Ctrl — добавить/убрать, Shift — диапазон. Перетащить
+// можно как выделенные листья (тянем любой из них), так и всю ветку (группу
+// или модуль): она несёт все свои сигналы, даже свёрнутые.
+let treeSelIds = new Set();
+let treeAnchorId = null;
+let treeOrderIds = [];
+
+function treeApplySel() {
+    for (const el of document.querySelectorAll('#sidebar-tags .tree-leaf[data-tid]')) {
+        el.classList.toggle('selected', treeSelIds.has(Number(el.dataset.tid)));
+    }
+}
+
+function treeLeafClick(ev, tagId) {
+    if (ev.shiftKey && treeAnchorId != null) {
+        const a = treeOrderIds.indexOf(treeAnchorId), b = treeOrderIds.indexOf(tagId);
+        if (a >= 0 && b >= 0) for (let i = Math.min(a, b); i <= Math.max(a, b); i++) treeSelIds.add(treeOrderIds[i]);
+    } else if (ev.ctrlKey || ev.metaKey) {
+        if (treeSelIds.has(tagId)) treeSelIds.delete(tagId); else { treeSelIds.add(tagId); treeAnchorId = tagId; }
+    } else if (!treeSelIds.has(tagId)) {
+        // Клик по уже выделенному не сбрасывает группу — иначе нельзя её перетащить.
+        treeSelIds = new Set([tagId]);
+        treeAnchorId = tagId;
+    }
+    treeApplySel();
+}
+
+function treeLeafDragStart(ev, tagId) {
+    const ids = treeSelIds.has(tagId) ? [...treeSelIds] : [tagId];
+    ev.dataTransfer.effectAllowed = 'copy';
+    ev.dataTransfer.setData('text/plain', ids.join(','));
+}
+
+function treeBranchDragStart(ev) {
+    const el = ev.currentTarget;
+    ev.dataTransfer.effectAllowed = 'copy';
+    ev.dataTransfer.setData('text/plain', el.dataset.ids || '');
 }
 
 const BIT_TYPES = new Set(['BYTE', 'INT16', 'UINT16']);
@@ -925,7 +1026,7 @@ function renderBitsTree() {
         const sel = t.id === bitsSelectedId ? ' selected' : '';
         return `<li><div id="bits-node-${t.id}" class="tree-leaf${sel}" onclick="selectBitsTag(${t.id})">` +
                `${escHtml(t.name)} [${escHtml(t.data_type)}]</div></li>`;
-    });
+    }, 'bits-tree');
     if (!bitsSelectedId || !document.getElementById(`bits-node-${bitsSelectedId}`)) {
         selectBitsTag(tags[0].id);
     }
@@ -1074,11 +1175,6 @@ function getActiveWindow() {
     return chartWindows.find(w => w.id === activeWindowId) || chartWindows[0];
 }
 
-function dragSignal(event, tagId) {
-    event.dataTransfer.effectAllowed = 'copy';
-    event.dataTransfer.setData('text/plain', String(tagId));
-}
-
 function addChartWindow() {
     const id = Date.now() + Math.random();
     const box = document.createElement('div');
@@ -1090,7 +1186,13 @@ function addChartWindow() {
     box.addEventListener('click', () => selectChartWindow(id));
     box.addEventListener('dragover', event => { event.preventDefault(); box.classList.add('drop-target'); });
     box.addEventListener('dragleave', () => box.classList.remove('drop-target'));
-    box.addEventListener('drop', event => { event.preventDefault(); box.classList.remove('drop-target'); selectChartWindow(id); const tagId = Number(event.dataTransfer.getData('text/plain')); if (tagId) addSignal(tagId); });
+    box.addEventListener('drop', event => {
+        event.preventDefault(); box.classList.remove('drop-target'); selectChartWindow(id);
+        // Данные drag: CSV id (несколько сигналов, вся группа/модуль).
+        const ids = (event.dataTransfer.getData('text/plain') || '').split(',')
+            .map(s => Number(s)).filter(n => Number.isFinite(n) && n > 0);
+        if (ids.length) addSignals(ids);
+    });
     attachResizeHandle(box);
     const win = { id, signals: [], chart: null, zoomed: false, cursors: makeCursors() };
     // ResizeObserver (аналог live-ресайза Qt-виджета): uPlot перерисовывается
@@ -1143,22 +1245,85 @@ function removeChartWindow(id) {
     if (activeWindowId === id) selectChartWindow(chartWindows[Math.max(0, index - 1)].id);
 }
 
-async function addSignal(tagId) {
+/// Пакетное добавление сигналов на график активного окна: один batch-запрос
+/// на все новые теги (тот же /api/series, что и live-тик). Дубликаты пропускаем.
+/// Пустые серии НЕ пропускаем — добавляем их с пустым массивом (как в старой
+/// версии addSignal), чтобы пользователь видел, что сигнал принят, но данных
+/// в выбранном окне нет (в отличие от silent-continue).
+async function addSignals(tagIds) {
     const win = getActiveWindow();
-    if (!win || win.signals.some(s => s.tag.id === tagId)) return;
-    const tag = allTags.find(t => t.id === tagId);
-    if (!tag) return;
+    if (!win) return;
+    const fresh = [];
+    for (const id of tagIds) {
+        const tag = allTags.find(t => t.id === id);
+        if (!tag) continue;
+        if (win.signals.some(s => s.tag.id === id)) continue;
+        if (!fresh.some(t => t.id === id)) fresh.push(tag);
+    }
+    if (!fresh.length) return;
     try {
-        const data = await apiGet(getChartsUrl(tagId));
-        if (!data.times || data.times.length === 0) return;
-        win.signals.push({ tag, times: data.times, values: data.values, t_start: data.t_start, t_end: data.t_end });
-        win.fullT0 = data.t_start; win.fullT1 = data.t_end;
-
-        rebuildChartWindow(win);
-        // Обзор архива строится по сигналам активного окна — перерисовываем.
+        const resp = await apiGet(getSeriesUrl(fresh.map(tag => ({ tag }))));
+        const byTag = new Map();
+        for (const s of (resp.series || [])) byTag.set(s.tag_id, s);
+        let added = 0, empty = 0;
+        for (const tag of fresh) {
+            const s = byTag.get(tag.id);
+            const times = (s && s.times && s.times.length > 0) ? s.times : [];
+            const values = (s && s.values && s.values.length > 0) ? s.values : [];
+            win.signals.push({ tag, times, values, t_start: resp.t_start, t_end: resp.t_end });
+            if (times.length) added++; else empty++;
+        }
+        if (!added && !empty) return;
+        if (win.fullT0 == null || resp.t_start < win.fullT0) win.fullT0 = resp.t_start;
+        if (win.fullT1 == null || resp.t_end > win.fullT1) win.fullT1 = resp.t_end;
+        win.zoomed = false;   // новый состав — вписываем весь интервал
+        rebuildChartWindow(win, true);
         if (document.getElementById('charts-mode').value === 'Archive') loadArchOverview();
-    } catch (e) { console.warn('charts load', e); }
+        // Видимая обратная связь: сколько добавлено и сколько без данных.
+        const msg = `Добавлено: ${added}` + (empty ? ` (нет данных: ${empty})` : '');
+        chartsStatusLine(msg, added === 0);
+    } catch (e) { console.warn('charts load', e); chartsStatusLine('Ошибка добавления: ' + e.message, true); }
 }
+
+// ------------------------------------------------------------------ статус drop
+let chartsStatusTimer = null;
+
+/// Строка состояния в тулбаре окон Charts. Без неё «перетащил, а на графике
+/// ничего» неотличимо от поломки: при пустом окне архива/Live сигнал
+/// добавляется, но линия пустая — об этом и пишет сообщение.
+function chartsStatusLine(msg, isErr) {
+    const el = document.getElementById('charts-status');
+    if (!el) return;
+    el.textContent = msg;
+    el.classList.toggle('err', !!isErr);
+    clearTimeout(chartsStatusTimer);
+    chartsStatusTimer = setTimeout(() => { el.textContent = ''; }, 8000);
+}
+
+/// CSV id из dataTransfer: "5" или "1,2,3" (лист, группа, модуль).
+function parseDragIds(txt) {
+    return String(txt || '').split(',').map(s => Number(s.trim()))
+        .filter(n => Number.isFinite(n) && n > 0);
+}
+
+/// Drop на всю область графиков: промах мимо рамки окна (тулбар, мини-обзор
+/// архива, промежутки между окнами) не должен выглядеть как «не тащится» —
+/// сигналы уходят в активное окно. Обработчик конкретного окна делает
+/// stopPropagation, поэтому двойного добавления нет.
+function bindChartAreaDrop() {
+    const area = document.querySelector('.chart-area');
+    if (!area) return;
+    area.addEventListener('dragover', e => { e.preventDefault(); area.classList.add('drop-target'); });
+    area.addEventListener('dragleave', e => { if (!area.contains(e.relatedTarget)) area.classList.remove('drop-target'); });
+    area.addEventListener('drop', e => {
+        e.preventDefault();
+        area.classList.remove('drop-target');
+        const ids = parseDragIds(e.dataTransfer.getData('text/plain'));
+        if (ids.length) addSignals(ids);
+    });
+}
+
+function addSignal(tagId) { addSignals([tagId]); }
 
 function removeSignal(tagId) {
     const win = getActiveWindow();
@@ -1211,10 +1376,21 @@ function bindLegendValues(win, chart) {
 function renderLegend(win, legend) {
     legend.innerHTML = win.signals.map((s, idx) => {
         const color = COLORS[idx % COLORS.length];
-        return `<div class="legend-row"><span class="legend-line" style="background-color:${color};"></span><span class="legend-name" style="color:${color};">${escHtml(s.tag.name)}</span><span class="legend-val" data-idx="${idx}" style="color:${color};"></span><button class="legend-del" onclick="removeSignal(${s.tag.id}); event.stopPropagation();">×</button></div>`;
+        return `<div class="legend-row" onmouseenter="legendHover(${win.id},${idx},true)" onmouseleave="legendHover(${win.id},${idx},false)"><span class="legend-line" style="background-color:${color};"></span><span class="legend-name" style="color:${color};">${escHtml(s.tag.name)}</span><span class="legend-val" data-idx="${idx}" style="color:${color};"></span><button class="legend-del" onclick="removeSignal(${s.tag.id}); event.stopPropagation();">×</button></div>`;
     }).join('');
     win.legendVals = Array.from(legend.querySelectorAll('.legend-val'));
     legend.style.display = win.signals.length ? 'flex' : 'none';
+}
+
+/// Наведение на строку легенды — линия сигнала на графике в 2 раза толще.
+function legendHover(winId, idx, enter) {
+    const win = chartWindows.find(w => w.id === winId);
+    if (!win || !win.chart) return;
+    // uPlot: series[0] = time axis, сигналы начиная с 1.
+    const si = idx + 1;
+    if (!win.chart.series[si]) return;
+    win.chart.series[si].width = enter ? 4 : 2;
+    win.chart.redraw(false);
 }
 
 /// Live-тик при пользовательском зуме: окно НЕ сбрасывается, но данные в нём
