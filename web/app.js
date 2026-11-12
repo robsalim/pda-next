@@ -649,6 +649,26 @@ function wheelZoomPlugin(chartType, cursors) {
                     }
                     return null;
                 };
+                // Именованные функции для корректного удаления слушателей при mouseup
+                // (иначе при каждом rebuildChartWindow накапливаются замыкания на uPlot
+                // и DOM-элементы → утечка памяти до 5 ГБ за пару часов).
+                const onCursorMove = (ev) => {
+                    if (!dragCursor) return;
+                    const left = ev.clientX - plot.getBoundingClientRect().left;
+                    cursors[dragCursor] = u.posToVal(left, "x");
+                    refreshHeaderCursors();
+                    u.redraw();
+                };
+                const onCursorUp = () => {
+                    if (!dragCursor) return;
+                    dragCursor = null;
+                    document.body.style.userSelect = '';
+                    window.removeEventListener("mousemove", onCursorMove);
+                    window.removeEventListener("mouseup", onCursorUp);
+                    // click после mouseup может не прийти (отпустили вне plot) —
+                    // снимаем флаг, чтобы он не «съел» следующий обычный клик
+                    setTimeout(() => { suppressClick = false; }, 0);
+                };
                 u.root.addEventListener("mousedown", e => {
                     const rect = plot.getBoundingClientRect();
                     // DOMRect.contains по стандарту принимает координаты, но Blink
@@ -666,22 +686,9 @@ function wheelZoomPlugin(chartType, cursors) {
                     suppressClick = true;
                     document.body.style.userSelect = 'none';
                     holdLive(chartType);
+                    window.addEventListener("mousemove", onCursorMove);
+                    window.addEventListener("mouseup", onCursorUp);
                 }, true);
-                window.addEventListener("mousemove", e => {
-                    if (!dragCursor) return;
-                    const left = e.clientX - plot.getBoundingClientRect().left;
-                    cursors[dragCursor] = u.posToVal(left, "x");
-                    refreshHeaderCursors();
-                    u.redraw();
-                });
-                window.addEventListener("mouseup", () => {
-                    if (!dragCursor) return;
-                    dragCursor = null;
-                    document.body.style.userSelect = '';
-                    // click после mouseup может не прийти (отпустили вне plot) —
-                    // снимаем флаг, чтобы он не «съел» следующий обычный клик
-                    setTimeout(() => { suppressClick = false; }, 0);
-                });
 
                 // ЛКМ -> X1, ПКМ -> X2 (на каждом графике свои)
                 plot.addEventListener("click", e => {
