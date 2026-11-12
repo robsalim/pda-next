@@ -522,9 +522,37 @@ async fn helpers_and_validation_endpoints() {
     assert_eq!(db["config"]["engine"], json!("sqlite"));
 
     // /api/retention
+    // Предписываем db_config.json так, как это сделал бы первый запуск в проде
+    // (путь к той же временной базе) — дальше /api/retention должен пропатчить файл.
+    std::fs::write(
+        h.tmp.path().join("db_config.json"),
+        serde_json::to_string_pretty(&json!({
+            "engine": "sqlite",
+            "sqlite_path": h.tmp.path().join("smoke.db").to_string_lossy(),
+            "retention_days": 0.0,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let r = h.post_json("/api/retention", json!({ "days": 7.5 })).await;
     assert_eq!(r["ok"], json!(true));
     assert_eq!(r["days"].as_f64(), Some(7.5));
+
+    // retention персистится в db_config.json и восстанавливается при from_config
+    // (имитация рестарта процесса).
+    let file = h.tmp.path().join("db_config.json");
+    let saved: Value = serde_json::from_str(
+        &std::fs::read_to_string(&file).expect("db_config.json записан"),
+    )
+    .expect("db_config.json — валидный JSON");
+    assert_eq!(saved["retention_days"], json!(7.5));
+    let restored = AppCore::from_config(DbConfig::from_json(&saved), file.clone()).await;
+    assert_eq!(
+        restored.manager.read().await.journal_stats()["retention_days"],
+        json!(7.5),
+        "глубина хранения должна пережить рестарт"
+    );
+    restored.manager.write().await.stop_all().await;
 
     // /api/db/test на мёртвый postgres: ok=false + понятная ошибка (не 500)
     let dead = free_port().await;

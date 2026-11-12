@@ -447,9 +447,31 @@ pub async fn set_retention(
     State(core): State<Arc<AppCore>>,
     Json(b): Json<RetentionBody>,
 ) -> Json<Value> {
-    let mgr = core.manager.read().await;
-    mgr.set_retention_days(b.days);
-    Json(json!({ "ok": true, "days": b.days }))
+    let days = b.days.max(0.0);
+    {
+        let mgr = core.manager.read().await;
+        mgr.set_retention_days(days);
+    }
+    persist_retention(&core, days);
+    Json(json!({ "ok": true, "days": days }))
+}
+
+/// Обновить ключ retention_days в db_config.json (read-patch-write): глубина
+/// хранения переживает рестарт процесса. Нет файла — создаём с одним ключом,
+/// остальное при старте возьмётся из дефолтов DbConfig.
+fn persist_retention(core: &AppCore, days: f64) {
+    let path = &core.db_config_path;
+    let mut v = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|txt| serde_json::from_str::<Value>(&txt).ok())
+        .unwrap_or_else(|| json!({}));
+    if !v.is_object() {
+        v = json!({});
+    }
+    v["retention_days"] = json!(days);
+    if let Err(e) = std::fs::write(path, serde_json::to_string_pretty(&v).unwrap()) {
+        tracing::warn!("Не удалось сохранить retention в {}: {e}", path.display());
+    }
 }
 
 // ---------------------------------------------------------------- режим опроса
@@ -862,9 +884,20 @@ pub async fn db_switch(
     let body_cfg = b.to_json();
     let cfg = b.into_cfg();
     core.switch_database(cfg).await.map_err(ApiError)?;
+    // retention_days — настройка не из формы БД; сохраняем текущую, чтобы
+    // переключение базы не сбрасывало глубину хранения.
+    let retention = core
+        .manager
+        .read()
+        .await
+        .journal_stats()["retention_days"]
+        .as_f64()
+        .unwrap_or(0.0);
+    let mut file_cfg = body_cfg;
+    file_cfg["retention_days"] = json!(retention);
     if let Err(e) = std::fs::write(
         &core.db_config_path,
-        serde_json::to_string_pretty(&body_cfg).unwrap(),
+        serde_json::to_string_pretty(&file_cfg).unwrap(),
     ) {
         tracing::warn!(
             "Не удалось сохранить {}: {e}",

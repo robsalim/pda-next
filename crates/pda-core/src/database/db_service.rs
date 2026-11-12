@@ -35,6 +35,9 @@ pub struct DbConfig {
     pub dbname: String,
     pub user: String,
     pub password: String,
+    /// Глубина хранения истории, сутки (0 = не чистить). Персистится в
+    /// db_config.json, чтобы выживать между рестартами процесса.
+    pub retention_days: f64,
 }
 
 impl Default for DbConfig {
@@ -48,6 +51,7 @@ impl Default for DbConfig {
             dbname: "pda_data".into(),
             user: "postgres".into(),
             password: "25052015".into(),
+            retention_days: 0.0,
         }
     }
 }
@@ -79,6 +83,9 @@ impl DbConfig {
         }
         if let Some(s) = v.get("password").and_then(|x| x.as_str()) {
             cfg.password = s.to_string();
+        }
+        if let Some(d) = v.get("retention_days").and_then(|x| x.as_f64()) {
+            cfg.retention_days = d.max(0.0);
         }
         cfg
     }

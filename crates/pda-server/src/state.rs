@@ -80,8 +80,14 @@ impl AppCore {
     pub async fn from_config(cfg: DbConfig, db_config_path: PathBuf) -> Arc<Self> {
         // Поднимаем приоритет процесса (Windows: ABOVE_NORMAL) — опрос не конкурирует с HTTP/WS.
         pda_core::drivers::priority::set_process_priority();
+        let retention = cfg.retention_days;
         let db = Arc::new(DatabaseService::open(cfg).await);
-        Self::with_config_path(db, db_config_path)
+        let core = Self::with_config_path(db, db_config_path);
+        // Глубина хранения переживает рестарт: берётся из db_config.json.
+        if retention > 0.0 {
+            core.manager.read().await.set_retention_days(retention);
+        }
+        core
     }
 
     pub async fn db_snapshot(&self) -> Arc<DatabaseService> {
