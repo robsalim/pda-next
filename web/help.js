@@ -202,7 +202,7 @@ __ADDRESS_REFERENCE__
   <li>Для Live-подключений убедитесь, что модуль не находится на паузе.</li>
 </ol>
 </details>
-<p><b>Проект на GitHub:</b> <a href="https://github.com/robsalim/py_pda_v2" target="_blank" rel="noopener noreferrer">robsalim/py_pda_v2</a></p>
+<p><b>Проект на GitHub:</b> <a href="https://github.com/robsalim/pda-next" target="_blank" rel="noopener noreferrer">robsalim/pda-next</a></p>
 `;
 
 function helpAddressReference() {
