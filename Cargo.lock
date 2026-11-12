@@ -2464,7 +2464,7 @@ dependencies = [
 
 [[package]]
 name = "pda-core"
-version = "1.1.5"
+version = "1.1.6"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -2484,7 +2484,7 @@ dependencies = [
 
 [[package]]
 name = "pda-desktop"
-version = "1.1.5"
+version = "1.1.6"
 dependencies = [
  "axum",
  "pda-core",
@@ -2498,7 +2498,7 @@ dependencies = [
 
 [[package]]
 name = "pda-server"
-version = "1.1.5"
+version = "1.1.6"
 dependencies = [
  "axum",
  "chrono",

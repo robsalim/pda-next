@@ -160,7 +160,9 @@ button[disabled] { opacity: .5; cursor: default; }
 
 /* ===== I/O ===== */
 #page-io { flex-direction: row; }
-.io-left { width: 320px; min-width: 320px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 8px; gap: 6px; overflow-y: auto; }
+.io-left { width: 320px; min-width: 200px; max-width: 60vw; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 8px; gap: 6px; overflow-y: auto; }
+.io-splitter { flex: 0 0 5px; cursor: col-resize; background: var(--border); transition: background .15s; }
+.io-splitter:hover, .io-splitter.active { background: var(--accent); }
 .io-left-head { display: flex; align-items: center; justify-content: space-between; }
 .io-tree { flex: 1; min-height: 140px; overflow-y: auto; background: var(--bg); border: 1px solid var(--border-mut); border-radius: 4px; padding: 4px; font-size: 12px; }
 .io-conn { padding: 6px 8px; border-radius: 3px; cursor: pointer; display: flex; align-items: center; gap: 6px; }

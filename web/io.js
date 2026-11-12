@@ -1014,3 +1014,44 @@ function parseCsv(text, delim) {
     if (field || row.length) { row.push(field); out.push(row); }
     return out;
 }
+
+// ===== Перетаскиваемая граница панели I/O (splitter) =====
+(function initIoSplitter() {
+    const splitter = document.getElementById('io-splitter');
+    const left = document.querySelector('.io-left');
+    if (!splitter || !left) return;
+
+    const KEY = 'pda_io_left_width';
+    const saved = parseInt(localStorage.getItem(KEY), 10);
+    if (saved >= 200 && saved <= window.innerWidth * 0.6) left.style.width = saved + 'px';
+
+    let dragging = false, startX = 0, startW = 0;
+
+    splitter.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        dragging = true;
+        startX = e.clientX;
+        startW = left.offsetWidth;
+        splitter.classList.add('active');
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - startX;
+        const w = Math.max(200, Math.min(startW + dx, window.innerWidth * 0.6));
+        left.style.width = w + 'px';
+        splitter.dataset.width = w;
+    });
+
+    document.addEventListener('mouseup', () => {
+        if (!dragging) return;
+        dragging = false;
+        splitter.classList.remove('active');
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+        const w = parseInt(splitter.dataset.width, 10);
+        if (w >= 200) localStorage.setItem(KEY, w);
+    });
+})();
