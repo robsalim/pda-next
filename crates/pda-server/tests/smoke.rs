@@ -470,6 +470,102 @@ async fn manual_pause_survives_process_restart() {
     let _ = h.tmp.path();
 }
 
+/// «⏸ Опрос» (view_only) должен останавливать и журнал: heartbeat-теги
+/// (log_interval_ms) иначе продолжают писать каждую секунду в стоящий опрос —
+/// счётчик «записано» растёт, база наполняется дублями при пустом графике.
+#[tokio::test(flavor = "multi_thread")]
+async fn view_only_stops_journal_writes() {
+    let h = Harness::start().await;
+    let port = free_port().await;
+    h.post_json(
+        "/api/connections",
+        json!({
+            "name": "VO SRV", "driver_type": "modbus_server", "enabled": true,
+            "poll_interval_ms": 200, "config": {"host": "127.0.0.1", "port": port}
+        }),
+    )
+    .await;
+    h.wait_running(1).await;
+    h.post_json(
+        "/api/tags",
+        json!({
+            "id": 0, "connection_id": 1, "name": "vo_float", "address_str": "HR160",
+            "data_type": "FLOAT", "scale": 1.0, "offset_val": 0.0, "unit": "",
+            "group_name": "Тест", "log_interval_ms": 1000, "deadband": 0.0
+        }),
+    )
+    .await;
+
+    let mut client = tokio_modbus::client::tcp::connect_slave(([127, 0, 0, 1], port).into(), Slave(1))
+        .await
+        .unwrap();
+    let bytes = 42.5f32.to_bits().to_be_bytes();
+    client
+        .write_multiple_registers(
+            160,
+            &[
+                u16::from_be_bytes([bytes[0], bytes[1]]),
+                u16::from_be_bytes([bytes[2], bytes[3]]),
+            ],
+        )
+        .await
+        .unwrap();
+    drop(client);
+
+    // При включённом опросе журнал пишет (первая точка + heartbeat раз в секунду).
+    let written = |s: &Value| s["journal"]["written"].as_i64().unwrap_or(0);
+    let w0 = written(&h.get_json("/api/status").await);
+    let mut w1 = w0;
+    for _ in 0..60 {
+        w1 = written(&h.get_json("/api/status").await);
+        if w1 > w0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(w1 > w0, "при опросе журнал пишет: written={w1}");
+
+    // «⏸ Опрос»: драйверы И журнал останавливаются — записи больше нет.
+    let p = h.post_json("/api/polling", json!({ "enabled": false })).await;
+    assert_eq!(p["view_only"], json!(true));
+    tokio::time::sleep(Duration::from_millis(300)).await; // добить финальный flush
+    let a = written(&h.get_json("/api/status").await);
+    tokio::time::sleep(Duration::from_millis(1400)).await // больше heartbeat-периода
+    ;
+    let b = written(&h.get_json("/api/status").await);
+    assert_eq!(a, b, "в режиме только просмотр журнал не пишет (было {a}, стало {b})");
+
+    // Возврат к опросу — журнал снова работает.
+    h.post_json("/api/polling", json!({ "enabled": true })).await;
+    h.wait_running(1).await;
+    let mut client = tokio_modbus::client::tcp::connect_slave(([127, 0, 0, 1], port).into(), Slave(1))
+        .await
+        .unwrap();
+    let bytes2 = 43.5f32.to_bits().to_be_bytes();
+    client
+        .write_multiple_registers(
+            160,
+            &[
+                u16::from_be_bytes([bytes2[0], bytes2[1]]),
+                u16::from_be_bytes([bytes2[2], bytes2[3]]),
+            ],
+        )
+        .await
+        .unwrap();
+    drop(client);
+    let mut ok = false;
+    for _ in 0..60 {
+        if written(&h.get_json("/api/status").await) > b {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ok, "после включения опроса журнал возобновил запись");
+    h.stop().await;
+    let _ = h.tmp.path();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn helpers_and_validation_endpoints() {
     let h = Harness::start().await;
@@ -606,6 +702,7 @@ async fn frontend_assets_served() {
     let h = Harness::start().await;
     for (path, marker) in [
         ("/", "btn-tab-charts"),       // index.html — вкладки
+        ("/m.html", "Сигнал не выбран"), // мобильная мини-версия (один график)
         ("/app.css", "--plot-bg"),     // CSS с токенами темы
         ("/app.js", "new uPlot"),      // Charts/Bits
         ("/io.js", "ioRefreshAll"),    // вкладка I/O

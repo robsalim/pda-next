@@ -15,7 +15,14 @@ pub fn db_config_default() -> HashMap<String, serde_json::Value> {
 }
 
 pub const DEFAULT_MODBUS_SERVER_PORT: u16 = 502;
-pub const WEB_HOST: &str = "127.0.0.1";
+/// Адрес HTTP-сервера по умолчанию. `0.0.0.0` — «все интерфейсы»: работает
+/// одинаково на Windows и Linux, доступен и по `http://127.0.0.1:PORT`, и по
+/// `http://localhost:PORT` (браузер сам перебирает адреса localhost), и по
+/// адресу машины в локальной сети — с телефона открывать `m.html` можно прямо
+/// по `http://<ip>:PORT`. Раньше здесь стоял `127.0.0.1`, из-за чего на Linux
+/// сервер был слышен только на самой машине. Переопределение: `--host ADDR`
+/// или `PDA_HOST` (например, `--host 127.0.0.1` — оставить только loopback).
+pub const WEB_HOST: &str = "0.0.0.0";
 pub const WEB_PORT: u16 = 8082;
 pub const APP_NAME: &str = "PDA Next";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <!-- maximum-scale/user-scalable=no — телефон ведёт себя как приложение:
+         пинч не зумит страницу, жест остаётся только для графика. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#12161c">
+    <title>PDA Mobile</title>
+    <link rel="stylesheet" href="vendor/uplot.min.css">
+    <script src="vendor/uplot.iife.min.js"></script>
+    <style>
+        /* Тёмная тема — дефолт (как на десктопе), светлая по кнопке или
+           prefers-color-scheme. Токены — те же, что в app.css. */
+        :root {
+            --bg: #12161c; --panel: #1a212b; --border: #2b3644;
+            --text: #d6dee8; --text-faint: #7c8a9c; --text-strong: #ffffff;
+            --accent: #3fa9f5; --grid: #243040;
+        }
+        body.light {
+            --bg: #f4f6f9; --panel: #ffffff; --border: #d4dbe4;
+            --text: #24313f; --text-faint: #7d8a99; --text-strong: #0d1520;
+            --accent: #1a79c9; --grid: #e0e6ee;
+        }
+        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        html, body { height: 100%; }
+        body {
+            margin: 0; background: var(--bg); color: var(--text);
+            font: 15px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+            display: flex; flex-direction: column;
+            height: 100dvh; overscroll-behavior: none;
+        }
+        button {
+            font: inherit; color: var(--text); background: var(--panel);
+            border: 1px solid var(--border); border-radius: 8px;
+            min-height: 40px; padding: 6px 10px; touch-action: manipulation;
+        }
+        button:active { filter: brightness(1.25); }
+
+        header {
+            display: flex; align-items: center; gap: 8px;
+            padding: calc(6px + env(safe-area-inset-top)) 10px 6px;
+            background: var(--panel); border-bottom: 1px solid var(--border);
+        }
+        #drawer-btn { font-size: 20px; line-height: 1; }
+        .title { font-weight: 700; color: var(--text-strong); }
+        .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--text-faint); flex: none; }
+        .dot.ok { background: #3fbf6f; } .dot.err { background: #e05252; }
+        .spacer { flex: 1; }
+
+        /* Строка выбранного сигнала: имя, текущее значение, крестик сброса. */
+        #sig-row {
+            display: flex; align-items: center; gap: 8px; padding: 4px 12px;
+            font-size: 14px; color: var(--text-faint); min-height: 30px;
+            border-bottom: 1px solid var(--border);
+        }
+        #sig-name { color: var(--text-strong); font-weight: 600;
+                    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        #sig-value { font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 700; }
+        #sig-clear { display: none; min-height: 28px; padding: 2px 8px; }
+
+        main { flex: 1; min-height: 0; position: relative; }
+        #chart { position: absolute; inset: 4px 2px 2px 2px; }
+        #empty-hint {
+            position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+            color: var(--text-faint); text-align: center; padding: 24px;
+        }
+
+        .bottom {
+            display: flex; gap: 6px; padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+            background: var(--panel); border-top: 1px solid var(--border);
+        }
+        .spans { display: flex; gap: 4px; flex: 1; overflow-x: auto; scrollbar-width: none; }
+        .spans::-webkit-scrollbar { display: none; }
+        .spans button { padding: 6px 10px; min-width: 44px; flex: none; font-size: 14px; }
+        .spans button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+        /* Drawer: дерево сигналов поверх экрана, свайп/тап по затемнению закрывает. */
+        #backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.45); opacity: 0;
+                    pointer-events: none; transition: opacity .18s; z-index: 10; }
+        #backdrop.open { opacity: 1; pointer-events: auto; }
+        #drawer {
+            position: fixed; top: 0; bottom: 0; left: 0; width: 82vw; max-width: 340px;
+            background: var(--bg); border-right: 1px solid var(--border); z-index: 11;
+            transform: translateX(-102%); transition: transform .18s ease-out;
+            display: flex; flex-direction: column; padding-top: env(safe-area-inset-top);
+        }
+        #drawer.open { transform: none; }
+        #drawer-head { display: flex; gap: 8px; padding: 10px; border-bottom: 1px solid var(--border); }
+        #search {
+            flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--panel);
+            border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+        }
+        #tag-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+        .g-conn { padding: 10px 12px 2px; font-size: 12px; text-transform: uppercase;
+                  letter-spacing: .4px; color: var(--text-faint); }
+        .g-group { padding: 6px 12px 0; font-size: 13px; color: var(--accent); font-weight: 600; }
+        .t-row {
+            display: flex; flex-direction: column; gap: 2px; width: 100%; text-align: left;
+            border: none; border-bottom: 1px solid var(--border); border-radius: 0;
+            background: none; min-height: 46px; padding: 8px 12px;
+        }
+        .t-row.sel { background: var(--panel); box-shadow: inset 3px 0 0 var(--accent); }
+        .t-name { color: var(--text-strong); font-weight: 600; }
+        .t-meta { font-size: 12px; color: var(--text-faint); }
+
+        /* uPlot под нашу тему */
+        .u-wrap { background: transparent; }
+        .u-axis text { fill: var(--text-faint); font-size: 11px; }
+        .u-legend { display: none; }
+    </style>
+</head>
+<body>
+    <header>
+        <button id="drawer-btn" aria-label="Сигналы">☰</button>
+        <span class="title">PDA</span>
+        <span class="dot" id="dot" title="Связь с сервером"></span>
+        <span class="spacer"></span>
+        <button id="desk-btn" title="Десктоп-версия">🖥️</button>
+        <button id="theme-btn">🌙</button>
+    </header>
+
+    <div id="sig-row">
+        <span id="sig-name">Сигнал не выбран</span>
+        <span id="sig-value"></span>
+        <span class="spacer"></span>
+        <span id="sig-time" style="font-size:12px"></span>
+        <button id="sig-clear" title="Убрать сигнал">✕</button>
+    </div>
+
+    <main>
+        <div id="chart"></div>
+        <div id="empty-hint">Нажмите ☰ и выберите сигнал</div>
+    </main>
+
+    <div class="bottom">
+        <div class="spans" id="spans">
+            <button data-span="5 мин">5м</button>
+            <button data-span="15 мин">15м</button>
+            <button data-span="1 час">1ч</button>
+            <button data-span="4 часа">4ч</button>
+            <button data-span="12 часов">12ч</button>
+            <button data-span="24 часа">24ч</button>
+        </div>
+        <button id="pause-btn" title="Пауза/обновление">⏸</button>
+        <button id="fit-btn" title="Обновить окно">⟳</button>
+    </div>
+
+    <div id="backdrop"></div>
+    <nav id="drawer">
+        <div id="drawer-head">
+            <input id="search" type="search" placeholder="Поиск сигнала…" autocomplete="off">
+        </div>
+        <div id="tag-list"></div>
+    </nav>
+
+    <script>
+    'use strict';
+    // Обход автоперехода с desktop-версии: m.html?desktop=1 — обратно на index,
+    // выбор запоминается (тот же ключ pda_mode, что читает index.html).
+    try {
+        if (new URLSearchParams(location.search).get('desktop')) {
+            localStorage.setItem('pda_mode', 'desktop');
+            location.replace('index.html');
+        }
+    } catch (e) { /* старый браузер */ }
+    // ------------------------------------------------ состояние (в localStorage)
+    const store = {
+        get tagId() { const v = localStorage.getItem('m.tag'); return v ? +v : null; },
+        set tagId(v) { v == null ? localStorage.removeItem('m.tag') : localStorage.setItem('m.tag', String(v)); },
+        get span() { return localStorage.getItem('m.span') || '15 мин'; },
+        set span(v) { localStorage.setItem('m.span', v); },
+    };
+    let allTags = [];
+    let paused = false;
+    let ch = null;          // uPlot
+    let lastVal = null;     // для подписи текущего значения
+
+    const $ = (id) => document.getElementById(id);
+
+    // ------------------------------------------------ тема
+    function applyTheme(light) {
+        document.body.classList.toggle('light', light);
+        $('theme-btn').textContent = light ? '☀️' : '🌙';
+        document.querySelector('meta[name=theme-color]').content = light ? '#f4f6f9' : '#12161c';
+        localStorage.setItem('pda_web_theme', light ? 'light' : 'dark'); // общий ключ с desktop
+        makeChart(); // uPlot читает цвета при создании — пересоздаём
+        if (store.tagId) refresh();
+    }
+    applyTheme(localStorage.getItem('pda_web_theme') === 'light'
+        || (!localStorage.getItem('pda_web_theme')
+            && matchMedia('(prefers-color-scheme: light)').matches));
+    $('theme-btn').onclick = () => applyTheme(!document.body.classList.contains('light'));
+    // Кнопка «на десктоп»: тот же обходной путь, что m.html?desktop=1 (см.
+    // начало скрипта) — pda_mode=desktop запоминается, index.html больше
+    // не редиректит обратно.
+    $('desk-btn').onclick = () => location.replace('m.html?desktop=1');
+
+    // ------------------------------------------------ график
+    function cssVar(n) { return getComputedStyle(document.body).getPropertyValue(n).trim(); }
+    function makeChart() {
+        if (ch) { ch.destroy(); ch = null; }
+        const el = $('chart');
+        el.innerHTML = '';
+        ch = new uPlot({
+            width: el.clientWidth, height: el.clientHeight,
+            padding: [6, 6, 4, 4],
+            axes: [
+                { stroke: cssVar('--text-faint'), grid: { stroke: cssVar('--grid'), width: 1 },
+                  size: 46, values: (_s, t) => t.map(v => v ? new Date(v * 1000)
+                      .toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }) : '') },
+                { stroke: cssVar('--text-faint'), grid: { stroke: cssVar('--grid'), width: 1 }, size: 44 },
+            ],
+            // ВАЖНО: цвет и ширина — на ВТОРОЙ серии. series[0] — это ось
+            // времени, линия из неё никогда не рисуется, а серия без stroke в
+            // uPlot 1.6 даётся null: путь строится, но рисовать его нечем, и
+            // график выглядит пустым при живых данных.
+            series: [{ label: '' }, { stroke: cssVar('--accent'), width: 2 }],
+            cursor: { points: { show: false }, drag: { x: false, y: false } },
+            select: { show: false },
+            scales: { x: { time: true }, y: { auto: true } },
+            hooks: { init: [] },
+        }, [[], []], el);
+    }
+    makeChart();
+    addEventListener('resize', () => ch && ch.setSize({ width: $('chart').clientWidth,
+                                                        height: $('chart').clientHeight }));
+    addEventListener('orientationchange', () => setTimeout(() => {
+        ch.setSize({ width: $('chart').clientWidth, height: $('chart').clientHeight });
+        refresh();
+    }, 250));
+
+    // ------------------------------------------------ данные
+    let noData = false; // у выбранного сигнала нет точек в текущем окне
+    async function refresh() {
+        if (store.tagId == null) { ch.setData([[], []]); paint(); return; }
+        try {
+            const r = await fetch(`/api/series?tags=${store.tagId}&span=${encodeURIComponent(store.span)}`);
+            const j = await r.json();
+            const s = (j.series || [])[0];
+            const n = s ? s.times.length : 0;
+            noData = n === 0;
+            $('dot').className = 'dot ok';
+            ch.setData([s ? s.times : [], s ? s.values : []]);
+            lastVal = n ? s.values[n - 1] : null;
+            paint();
+        } catch (e) {
+            $('dot').className = 'dot err';
+        }
+    }
+
+    function fmtVal(v) {
+        if (v == null) return '';
+        const a = Math.abs(v);
+        return (a >= 1000 ? v.toFixed(0) : a >= 10 ? v.toFixed(1) : a >= 1 ? v.toFixed(2) : v.toFixed(3));
+    }
+
+    function paint() {
+        const t = store.tagId != null ? allTags.find(x => x.id === store.tagId) : null;
+        $('sig-clear').style.display = t ? '' : 'none';
+        $('sig-name').textContent = t ? `${t.name}${t.unit ? ' [' + t.unit + ']' : ''}` : 'Сигнал не выбран';
+        $('sig-value').textContent = t && lastVal != null ? fmtVal(lastVal) : '';
+        $('sig-time').textContent = t && lastVal != null
+            ? new Date().toLocaleTimeString('ru-RU') : '';
+
+        // Подсказка по центру: либо сигнал не выбран, либо в окне нет точек.
+        const hint = $('empty-hint');
+        if (!t) {
+            hint.style.display = 'flex';
+            hint.textContent = 'Нажмите ☰ и выберите сигнал';
+        } else if (noData) {
+            hint.style.display = 'flex';
+            hint.textContent = 'Нет данных за «' + store.span + '» — выберите окно больше';
+        } else {
+            hint.style.display = 'none';
+        }
+    }
+
+    // Кнопка паузы останавливает опрос, ⟳ снимает паузу и обновляет сразу.
+    setInterval(() => { if (!paused) refresh(); }, 1000); // тот же темп, что на десктопе
+    $('pause-btn').onclick = () => {
+        paused = !paused;
+        $('pause-btn').textContent = paused ? '▶' : '⏸';
+    };
+    $('fit-btn').onclick = () => { paused = false; $('pause-btn').textContent = '⏸'; refresh(); };
+
+    // Окна span — кнопки снизу, выбор помнят.
+    for (const b of $('spans').children) {
+        b.onclick = () => { store.span = b.dataset.span; markSpan(); refresh(); };
+    }
+    function markSpan() {
+        for (const b of $('spans').children) b.classList.toggle('on', b.dataset.span === store.span);
+    }
+    markSpan();
+
+    // ------------------------------------------------ drawer со списком сигналов
+    function openDrawer(o) {
+        $('drawer').classList.toggle('open', o);
+        $('backdrop').classList.toggle('open', o);
+    }
+    $('drawer-btn').onclick = () => { renderTags(); openDrawer(true); };
+    $('backdrop').onclick = () => openDrawer(false);
+    $('sig-clear').onclick = () => { store.tagId = null; refresh(); renderTags(); };
+
+    $('search').oninput = renderTags;
+
+    async function loadTags() {
+        try {
+            allTags = await (await fetch('/api/tags')).json();
+            renderTags();
+            paint();
+        } catch (e) { /* сервер лежит — dot покраснеет на первом же refresh */ }
+    }
+
+    // Список: модуль → группа → сигналы. Тап по сигналу — выбрать, по выбранному — снять.
+    function renderTags() {
+        const q = $('search').value.trim().toLowerCase();
+        const list = $('tag-list');
+        const match = (t) => !q || [t.name, t.address, t.group, t.connection]
+            .join(' ').toLowerCase().includes(q);
+        let html = '';
+        const byConn = new Map();
+        for (const t of allTags.filter(match)) {
+            const c = byConn.get(t.connection) || new Map();
+            byConn.set(t.connection, c);
+            const g = c.get(t.group) || [];
+            g.push(t); c.set(t.group, g);
+        }
+        for (const [conn, groups] of byConn) {
+            html += `<div class="g-conn">${esc(conn)}</div>`;
+            for (const [grp, tags] of groups) {
+                html += `<div class="g-group">${esc(grp)}</div>`;
+                for (const t of tags) {
+                    html += `<button class="t-row${t.id === store.tagId ? ' sel' : ''}" data-id="${t.id}">
+                        <span class="t-name">${esc(t.name)}</span>
+                        <span class="t-meta">${esc(t.address)}${t.unit ? ' · ' + esc(t.unit) : ''}</span></button>`;
+                }
+            }
+        }
+        list.innerHTML = html || '<div class="g-conn">Ничего не найдено</div>';
+        for (const row of list.querySelectorAll('.t-row')) {
+            row.onclick = () => {
+                const id = +row.dataset.id;
+                store.tagId = (store.tagId === id) ? null : id;
+                lastVal = null;
+                renderTags(); refresh(); openDrawer(false);
+            };
+        }
+    }
+    const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+    loadTags();
+    refresh();
+    </script>
+</body>
+</html>

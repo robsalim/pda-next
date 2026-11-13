@@ -3,6 +3,23 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script>
+    // Тач-устройство с узким экраном — на мобильную мини-версию (m.html).
+    // Обход для ручного выбора: index.html?desktop=1, m.html?desktop=1
+    // (в m.html для этого есть кнопка 🖥️); обратный принудительный переход:
+    // index.html?mobile=1. Выбор запоминается.
+    (function () {
+        try {
+            var q = new URLSearchParams(location.search);
+            if (q.get('desktop')) localStorage.setItem('pda_mode', 'desktop');
+            if (q.get('mobile')) localStorage.setItem('pda_mode', 'mobile');
+            if (localStorage.getItem('pda_mode') === 'desktop') return;
+            var mobile = localStorage.getItem('pda_mode') === 'mobile' ||
+                (matchMedia('(pointer: coarse)').matches && innerWidth < 760);
+            if (mobile) location.replace('m.html');
+        } catch (e) { /* старый браузер — просто десктоп */ }
+    })();
+    </script>
     <title>PDA</title>
     <!-- uPlot лежит рядом с фронтендом, а не на unpkg: desktop-оболочка
          (WebView2 / WKWebView) работает на объектах без доступа в сеть,

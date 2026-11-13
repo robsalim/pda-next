@@ -117,10 +117,15 @@ impl AppCore {
     pub async fn set_view_only(&self, on: bool) -> bool {
         self.view_only.store(on, Ordering::SeqCst);
         let mut mgr = self.manager.write().await;
+        // Вместе с драйверами поднимаем/останавливаем и журнал: при
+        // остановленном опросе реестр замирает, а heartbeat-теги
+        // (log_interval_ms > 0) продолжали бы писать каждую секунду одну и ту
+        // же точку — счётчик «записано» рос бы при пустом графике, а база
+        // наполнялась дублями.
         if on {
-            mgr.stop_drivers().await;
+            mgr.stop_all().await;
         } else {
-            mgr.start_drivers().await;
+            mgr.start_all().await;
         }
         on
     }

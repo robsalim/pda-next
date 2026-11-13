@@ -807,7 +807,12 @@ function fitYToVisible(u) {
     // Границы видимого окна в индексы массива (uPlot ищет по оси X сам).
     const a = Math.max(0, u.valToIdx(t0) - 1);
     const b = Math.min(u.data[0].length - 1, u.valToIdx(t1) + 1);
+    // Битовые дорожки рисуем в пикселях (см. bitLanePaths) — их 0/1 в
+    // автомасштаб Y не пускаем, иначе аналоговые кривые сплющиваются к середине.
+    const w = chartWindows.find(x => x.chart === u);
+    const bitSi = w && w.bitSi ? new Set(w.bitSi) : null;
     for (let i = 1; i < u.data.length; i++) {
+        if (bitSi && bitSi.has(i)) continue;
         const vals = u.data[i];
         if (!vals) continue;
         for (let j = a; j <= b; j++) {
@@ -1508,6 +1513,118 @@ async function reloadCharts(forceFit = false) {
     }
 }
 
+// ------------------------------------------------- битовые дорожки на Charts
+// Как в IBAPDA: сигнал типа BOOL рисуется не по шкале Y, а цифровой
+// дорожкой внизу окна. Дорожки идут стопкой без наложений: импульс 0→1
+// занимает 4% высоты, следующая дорожка сдвинута на 6% выше
+// (2% — визуальный зазор). Линия рисуется по обоим уровням, поэтому
+// «ноль» дорожки виден всегда; участок со значением 1 закрашивается сплошь
+// цветом сигнала. Порядок стопки совпадает с легендой: первый BOOL —
+// самая верхняя полоса. Остальные типы сигналов — как раньше
+// (stepped по шкале Y).
+const BIT_LANE_STEP = 0.06; // сдвиг каждой следующей дорожки вверх — 6%
+const BIT_LANE_H = 0.04;    // высота импульса 0→1 — 4% (зазор между полосами 2%)
+const BIT_LANE_BASE = 0.01; // «ноль» нижней дорожки — на 1% от нижнего края
+
+function isBitSignal(s) {
+    return ((s.tag && s.tag.data_type) || '').toUpperCase() === 'BOOL';
+}
+
+/// Кастомный paths для uPlot: классическая цифровая дорожка в пиксельных
+/// координатах (не зависит от шкалы Y). Линия рисуется сплошной ступенчатой
+/// трассой по обоим уровням — «0» и «1», поэтому полоса дорожки видна даже
+/// при нулевом сигнале; участки со значением 1 дополнительно заливаются
+/// сплошь цветом сигнала.
+function bitLanePaths(u, si, i0, i1, lane) {
+    const stroke = new Path2D();
+    const fill = new Path2D();
+    const bb = u.bbox;
+    const H = bb.height;
+    const y0 = bb.top + H - (BIT_LANE_BASE + lane * BIT_LANE_STEP) * H; // «ноль» дорожки
+    const y1 = y0 - BIT_LANE_H * H;                                     // «единица» дорожки
+    const xs = u.data[0], vs = u.data[si];
+    let started = false, curLvl = y0;
+    for (let i = i0; i <= i1 && i < vs.length; i++) {
+        const v = vs[i];
+        if (v == null || xs[i] == null) { started = false; continue; }
+        const x = u.valToPos(xs[i], 'x', true);
+        const lvl = Math.abs(v) > 0.5 ? y1 : y0;
+        if (!started) {
+            stroke.moveTo(x, lvl);
+            started = true;
+        } else {
+            // Ступенька: сначала по горизонтали до x на старом уровне,
+            // затем вертикаль на новый (stepped align=1).
+            stroke.lineTo(x, curLvl);
+            stroke.lineTo(x, lvl);
+        }
+        // Заливка «1» — прямоугольник до следующей точки (или до правого
+        // края окна, если это последний отсчёт).
+        if (lvl === y1) {
+            const j = i + 1;
+            const cont = j <= i1 && j < vs.length && vs[j] != null && xs[j] != null;
+            const x2 = cont ? u.valToPos(xs[j], 'x', true) : bb.left + bb.width;
+            if (x2 > x) {
+                fill.moveTo(x, y1); fill.lineTo(x2, y1);
+                fill.lineTo(x2, y0); fill.lineTo(x, y0);
+                fill.closePath();
+            }
+        }
+        curLvl = lvl;
+    }
+    // Держим значение до правого края окна (как stepped-сигналы).
+    if (started) stroke.lineTo(bb.left + bb.width, curLvl);
+    return { stroke, fill, clip: null, band: null, gaps: null, flags: 1 };
+}
+
+/// Собирает series для uPlot по сигнальному составу окна: битовые — в
+/// дорожки снизу (lane 0, 1, ...), остальные — обычные stepped-кривые.
+/// Возвращает индексы битовых серий (uPlot: 1..N), чтобы автомасштаб Y
+/// их игнорировал — иначе 0/1 дорожек «сплющивают» аналоговые сигналы.
+function buildChartSeries(win) {
+    const series = [{ label: "Time" }];
+    const bitSi = [];
+    // Полосы: lowest lane — самый нижний BOOL в списке, так что порядок
+    // дорожек на графике совпадает с легендой (первый BOOL — верхняя полоса).
+    const bitIdx = win.signals.reduce((acc, s, i) => (isBitSignal(s) ? acc.concat(i) : acc), []);
+    const bottomLane = Math.max(0, bitIdx.length - 1);
+    let k = -1;
+    win.signals.forEach((s, idx) => {
+        const color = COLORS[idx % COLORS.length];
+        if (isBitSignal(s)) {
+            k++;
+            const lane = bottomLane - k;
+            series.push({
+                label: s.tag.name, stroke: color, fill: color, width: 1.5,
+                points: { show: false },
+                paths: (u, si, i0, i1) => bitLanePaths(u, si, i0, i1, lane),
+            });
+            bitSi.push(idx + 1);
+        } else {
+            series.push({ label: s.tag.name, stroke: color, width: 2, paths: uPlot.paths.stepped({ align: 1 }) });
+        }
+    });
+    return { series, bitSi };
+}
+
+/// Начальный диапазон Y по аналоговым сигналам (битовые дорожки не участвуют).
+/// null — когда аналоговых нет или данных нет: пусть uPlot масштабирует сам.
+function chartYRange(win) {
+    let lo = Infinity, hi = -Infinity;
+    for (const s of win.signals) {
+        if (isBitSignal(s) || !s.values) continue;
+        for (const v of s.values) {
+            if (v == null) continue;
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+    }
+    if (lo === Infinity) return null;
+    if (!(hi > lo)) { lo -= 1; hi += 1; }
+    const pad = (hi - lo) * 0.05;
+    return { min: lo - pad, max: hi + pad };
+}
+
 function rebuildChartWindow(win, forceFit = false) {
     const root = document.querySelector(`.chart-window[data-window-id="${win.id}"]`);
     const box = root?.querySelector('.chart-box');
@@ -1520,19 +1637,25 @@ function rebuildChartWindow(win, forceFit = false) {
 
     const baseTimes = win.signals[0].times;
     const data = [baseTimes];
-    const series = [{ label: "Time" }];
-    win.signals.forEach((s, idx) => {
-        series.push({ label: s.tag.name, stroke: COLORS[idx % COLORS.length], width: 2, paths: uPlot.paths.stepped({ align: 1 }) });
-        data.push(s.values);
-    });
+    const { series, bitSi } = buildChartSeries(win);
+    win.bitSi = bitSi;   // для fitYToVisible: не пускать 0/1 дорожек в автомасштаб Y
+    win.signals.forEach((s) => data.push(s.values));
     const tMin = win.signals[0].t_start || baseTimes[0];
     const tMax = win.signals[0].t_end || baseTimes[baseTimes.length - 1];
     const fit = !win.zoomed || forceFit;
     if (fit) initCursorsFromRange(win.cursors, tMin, tMax, forceFit);
     const tc = themeColors();
+    // Y фиксируем по аналоговым сигналам только когда в окне есть битовые
+    // дорожки: их 0/1 иначе сплющивают автомасштаб. Без бит — всё как
+    // раньше (uPlot сам вписывает кривые); когда биты есть, но аналогов
+    // нет, остаётся авто-диапазон 0…1.
+    const yR = bitSi.length ? chartYRange(win) : null;
     const opts = {
         width: box.clientWidth || 1000, height: box.clientHeight || 400,
-        scales: { x: { time: true, min: fit ? tMin : undefined, max: fit ? tMax : undefined } },
+        scales: {
+            x: { time: true, min: fit ? tMin : undefined, max: fit ? tMax : undefined },
+            y: yR ? { min: yR.min, max: yR.max } : {},
+        },
         plugins: [wheelZoomPlugin('charts', win.cursors)],
         axes: [{ stroke: tc.axis, grid: { stroke: tc.grid } }, { stroke: tc.axis, grid: { stroke: tc.grid } }],
         series, cursor: { drag: { x: true, y: false } },
@@ -1819,19 +1942,20 @@ function chartPngBlob(win, lightMode = false) {
         // Сохраняем данные
         const baseTimes = win.signals[0].times;
         const data = [baseTimes];
-        const series = [{ label: "Time" }];
-        win.signals.forEach((s, idx) => {
-            series.push({ label: s.tag.name, stroke: COLORS[idx % COLORS.length], width: 2, paths: uPlot.paths.stepped({ align: 1 }) });
-            data.push(s.values);
-        });
+        const { series } = buildChartSeries(win);
+        win.signals.forEach((s) => data.push(s.values));
         const tMin = win.signals[0].t_start || baseTimes[0];
         const tMax = win.signals[0].t_end || baseTimes[baseTimes.length - 1];
         const origChart = win.chart;
 
         // Создаём временный график с белой темой
+        const yR = chartYRange(win);
         const opts = {
             width: box.clientWidth || 1000, height: box.clientHeight || 400,
-            scales: { x: { time: true, min: tMin, max: tMax } },
+            scales: {
+                x: { time: true, min: tMin, max: tMax },
+                y: yR ? { min: yR.min, max: yR.max } : {},
+            },
             plugins: [],
             axes: [
                 { stroke: LIGHT_THEME.axis, grid: { stroke: LIGHT_THEME.grid } },
