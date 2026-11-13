@@ -18,6 +18,9 @@ use super::tag_point::TagPoint;
 pub struct TagRegistry {
     points: RwLock<HashMap<i64, Arc<TagPoint>>>,
     by_conn: RwLock<HashMap<i64, HashSet<i64>>>,
+    /// Подключения, чьи точки не пишутся в историю (virtual: значения
+    /// вычисляются из выражений, прошлое пересчитывается из операндов).
+    journal_excluded_conns: RwLock<HashSet<i64>>,
     /// Теги, изменившиеся с момента последней выборки (для GUI)
     dirty: Mutex<DirtyState>,
 }
@@ -33,11 +36,17 @@ impl TagRegistry {
         Self {
             points: RwLock::new(HashMap::new()),
             by_conn: RwLock::new(HashMap::new()),
+            journal_excluded_conns: RwLock::new(HashSet::new()),
             dirty: Mutex::new(DirtyState {
                 ids: HashSet::new(),
                 at: 0.0,
             }),
         }
+    }
+
+    /// Заменить множество подключений, чьи точки не пишутся в историю.
+    pub fn set_journal_excluded_conns(&self, conns: impl IntoIterator<Item = i64>) {
+        *self.journal_excluded_conns.write() = conns.into_iter().collect();
     }
 
     // ------------------------------------------------------------------ build
@@ -194,8 +203,14 @@ impl TagRegistry {
     /// скана точек возвращаются все промежуточные значения из буфера.
     pub fn collect_due(&self, now: DateTime<Local>) -> Vec<DuePoint> {
         let points: Vec<Arc<TagPoint>> = self.points.read().values().cloned().collect();
+        let excluded = self.journal_excluded_conns.read();
         let mut out = Vec::new();
         for point in points {
+            if excluded.contains(&point.connection_id) {
+                // Виртуалы: прошлое пересчитывается из операндов, не пишем.
+                point.drop_samples();
+                continue;
+            }
             collect_point(&point, now, &mut out);
         }
         out
@@ -212,9 +227,14 @@ impl TagRegistry {
         tag_ids: impl IntoIterator<Item = i64>,
     ) -> Vec<DuePoint> {
         let points = self.points.read();
+        let excluded = self.journal_excluded_conns.read();
         let mut out = Vec::new();
         for tid in tag_ids {
             if let Some(point) = points.get(&tid) {
+                if excluded.contains(&point.connection_id) {
+                    point.drop_samples();
+                    continue;
+                }
                 collect_point(point, now, &mut out);
             }
         }

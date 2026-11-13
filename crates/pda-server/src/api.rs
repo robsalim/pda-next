@@ -98,6 +98,176 @@ fn points_payload(points: Vec<pda_core::models::DataPoint>) -> Vec<(f64, f64)> {
         .collect()
 }
 
+// ---------------------------------------------------------------- виртуалы
+//
+// Теги virtual-подключений не пишутся в журнал — их прошлое вычисляется из
+// историй операндов на каждый запрос (/points, /archive, /series). Здесь
+// сборка окна: замыкание зависимостей, чтение реальных серий и вызов
+// pda_core::core::virtual_calc::eval_history.
+
+/// Индексы конфигурации: виртуальные теги и принадлежность тегов подключениям.
+struct VirtualIndex {
+    /// tag_id -> исходный код выражения (виртуалы).
+    virt: std::collections::HashMap<i64, String>,
+    /// Все id тегов конфигурации (для проверки существования операнда).
+    known: std::collections::HashSet<i64>,
+}
+
+async fn build_virtual_index(db: &Arc<DatabaseService>) -> ApiResult<VirtualIndex> {
+    let conns = db.get_all_connections().await?;
+    let virt_conns: std::collections::HashSet<i64> = conns
+        .iter()
+        .filter(|c| pda_core::drivers::registry::is_virtual(&c.driver_type))
+        .map(|c| c.id)
+        .collect();
+    let tags = db.get_all_tags().await?;
+    let virt = tags
+        .iter()
+        .filter(|t| virt_conns.contains(&t.connection_id))
+        .map(|t| (t.id, t.address_str.clone()))
+        .collect();
+    let known = tags.iter().map(|t| t.id).collect();
+    Ok(VirtualIndex { virt, known })
+}
+
+impl VirtualIndex {
+    fn info(&self) -> impl Fn(i64) -> Option<(bool, String)> + '_ {
+        |id| {
+            if let Some(src) = self.virt.get(&id) {
+                Some((true, src.clone()))
+            } else if self.known.contains(&id) {
+                Some((false, String::new()))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Замыкание виртуальных зависимостей: все реальные операнды (транзитивно
+    /// через вложенные виртуалы), чью историю надо прочитать для запроса.
+    fn operand_ids(&self, wanted: &[i64]) -> Vec<i64> {
+        use pda_core::core::virtual_expr;
+        let mut pending: Vec<i64> = wanted
+            .iter()
+            .copied()
+            .filter(|id| self.virt.contains_key(id))
+            .collect();
+        let mut seen_virt: std::collections::HashSet<i64> = pending.iter().copied().collect();
+        let mut real: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        while let Some(id) = pending.pop() {
+            let src = match self.virt.get(&id) {
+                Some(s) => s,
+                None => {
+                    real.insert(id); // реальный операнд
+                    continue;
+                }
+            };
+            let deps = virtual_expr::deps_of(src).unwrap_or_default();
+            for d in deps {
+                if self.virt.contains_key(&d) {
+                    if seen_virt.insert(d) {
+                        pending.push(d);
+                    }
+                } else {
+                    real.insert(d);
+                }
+            }
+        }
+        real.into_iter().collect()
+    }
+    /// Максимальное окно AVG (мс) среди выражений wanted и их транзитивных
+    /// виртуальных зависимостей. Историю операндов читают с таким запасом
+    /// влево, чтобы среднее по окну считалось корректно на начале окна.
+    fn avg_lead_ms(&self, wanted: &[i64]) -> i64 {
+        use pda_core::core::virtual_expr;
+        let mut pending: Vec<i64> = wanted
+            .iter()
+            .copied()
+            .filter(|id| self.virt.contains_key(id))
+            .collect();
+        let mut seen: std::collections::HashSet<i64> = pending.iter().copied().collect();
+        let mut lead = 0.0f64;
+        while let Some(id) = pending.pop() {
+            let src = match self.virt.get(&id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let node = match virtual_expr::parse(src) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            lead = lead.max(virtual_expr::max_window_ms(&node));
+            let mut refs = std::collections::HashSet::new();
+            virtual_expr::dependencies(&node, &mut refs);
+            for d in refs {
+                if self.virt.contains_key(&d) && seen.insert(d) {
+                    pending.push(d);
+                }
+            }
+        }
+        lead.ceil() as i64
+    }
+}
+
+/// Истории виртуалов `wanted` за окно [start, end].
+/// Пустой результат, если ни один из wanted не виртуальный.
+async fn virtual_series(
+    db: &Arc<DatabaseService>,
+    idx: &VirtualIndex,
+    wanted: &[i64],
+    start: DateTime<Local>,
+    end: DateTime<Local>,
+) -> ApiResult<Vec<(i64, Vec<(f64, f64)>)>> {
+    let wanted_virt: Vec<i64> = wanted.iter().copied().filter(|id| idx.virt.contains_key(id)).collect();
+    if wanted_virt.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Реальные операнды читаем сырыми точками (группировку по бакетам
+    // делает eval_history на объединённой сетке).
+    //
+    // Левый край расширяем на максимальное окно AVG (из истории операнда),
+    // иначе среднее на начале окна считалось бы по неполному числу точек.
+    // Правый край — на 1 мс: журнал хранит время с микросекундами
+    // (...26.958666), а границы окон (anchor из timestamp_millis, t0/t1 фронта)
+    // усечены до мс (...26.958). SQLite сравнивает timestamps как строки, и
+    // точка ровно на границе оказалась бы за окном — на live-графике это
+    // незаметно (поток непрерывен), но последний шаг истории пропадал.
+    let lead_ms = idx.avg_lead_ms(&wanted_virt).max(0);
+    let start_read = start - chrono::Duration::milliseconds(lead_ms);
+    let end_read = end + chrono::Duration::milliseconds(1);
+    let mut real = std::collections::BTreeMap::new();
+    for id in idx.operand_ids(&wanted_virt) {
+        let rows = db.get_data_points_range(id, start_read, end_read).await?;
+        let pts: Vec<(i64, f64)> = rows
+            .into_iter()
+            .map(|p| {
+                let ms = p
+                    .timestamp
+                    .and_local_timezone(Local)
+                    .single()
+                    .map(|d| d.timestamp_millis())
+                    .unwrap_or(0);
+                (ms, p.value)
+            })
+            .collect();
+        real.insert(id, pts);
+    }
+    let out = pda_core::core::virtual_calc::eval_history(&wanted_virt, &idx.info(), &real);
+    let start_ms = start.timestamp_millis();
+    Ok(out
+        .into_iter()
+        .map(|(id, s)| {
+            (
+                id,
+                s.into_iter()
+                    .filter(|(t, _)| *t >= start_ms)
+                    .map(|(t, v)| (t as f64 / 1000.0, v))
+                    .collect(),
+            )
+        })
+        .collect())
+}
+
 //serde default-хелперы (замыкания в attr не допускаются)
 fn default_span() -> String {
     "1 час".to_string()
@@ -148,6 +318,8 @@ pub struct SpanQuery {
 }
 
 /// Точки за окно «span» относительно последней записи (Python /api/points).
+/// Виртуальные теги: окно берётся относительно последней записи операндов,
+/// значения вычисляются из их историй.
 pub async fn points(
     State(core): State<Arc<AppCore>>,
     UrlPath(tag_id): UrlPath<i64>,
@@ -155,6 +327,37 @@ pub async fn points(
 ) -> ApiResult<Json<Value>> {
     let db = core.db_snapshot().await;
     let delta_ms = parse_span_ms(&q.span);
+    let idx = build_virtual_index(&db).await?;
+    if idx.virt.contains_key(&tag_id) {
+        // Опора — самая свежая запись операндов (у виртуала своей истории нет).
+        let operands = idx.operand_ids(&[tag_id]);
+        let mut anchor_ms: Option<i64> = None;
+        for op in &operands {
+            if let Ok(ts) = db.get_last_data_time_for(*op).await {
+                if let Some(ms) = ts {
+                    anchor_ms = Some(anchor_ms.map_or(ms, |a: i64| a.max(ms)));
+                }
+            }
+        }
+        let end_dt = chrono::TimeZone::timestamp_millis_opt(&Local, anchor_ms.unwrap_or_else(|| Local::now().timestamp_millis()))
+            .single()
+            .unwrap_or_else(Local::now);
+        let start_dt = end_dt - chrono::Duration::milliseconds(delta_ms);
+        let series = virtual_series(&db, &idx, &[tag_id], start_dt, end_dt).await?;
+        let (times, values): (Vec<f64>, Vec<f64>) = series
+            .into_iter()
+            .next()
+            .map(|(_, s)| s)
+            .unwrap_or_default()
+            .into_iter()
+            .unzip();
+        return Ok(Json(json!({
+            "times": times,
+            "values": values,
+            "t_start": start_dt.timestamp() as f64,
+            "t_end": end_dt.timestamp() as f64,
+        })));
+    }
     let (points, t_start, t_end) = db.get_data_points_by_span(tag_id, delta_ms).await?;
     let (times, values): (Vec<f64>, Vec<f64>) = points_payload(points).into_iter().unzip();
     Ok(Json(
@@ -199,6 +402,23 @@ pub async fn archive(
             (start_dt, start_dt + chrono::Duration::milliseconds(dur_ms))
         }
     };
+    let idx = build_virtual_index(&db).await?;
+    if idx.virt.contains_key(&tag_id) {
+        let series = virtual_series(&db, &idx, &[tag_id], start_dt, end_dt).await?;
+        let (times, values): (Vec<f64>, Vec<f64>) = series
+            .into_iter()
+            .next()
+            .map(|(_, s)| s)
+            .unwrap_or_default()
+            .into_iter()
+            .unzip();
+        return Ok(Json(json!({
+            "times": times,
+            "values": values,
+            "t_start": start_dt.timestamp() as f64,
+            "t_end": end_dt.timestamp() as f64,
+        })));
+    }
     let points = db.get_data_points_range(tag_id, start_dt, end_dt).await?;
     let (times, values): (Vec<f64>, Vec<f64>) = points_payload(points).into_iter().unzip();
     Ok(Json(json!({
@@ -364,14 +584,70 @@ pub async fn series(
         },
     };
 
-    let window = db.get_series_window(&tag_ids, start_dt, end_dt).await?;
-    let series: Vec<Value> = window
-        .into_iter()
+    // Виртуальные теги считаем из историй их операндов; реальные операнды
+    // добавляем к окну чтения, чтобы не делать второй заход в БД.
+    let idx = build_virtual_index(&db).await?;
+    let virt_wanted: Vec<i64> = tag_ids.iter().copied().filter(|id| idx.virt.contains_key(id)).collect();
+    let real_wanted: Vec<i64> = tag_ids.iter().copied().filter(|id| !idx.virt.contains_key(id)).collect();
+    let mut read_ids = real_wanted.clone();
+    // Для виртуалов с AVG читаем операнды с запасом влево на размер окна.
+    let virt_start = if virt_wanted.is_empty() {
+        start_dt
+    } else {
+        let lead_ms = idx.avg_lead_ms(&virt_wanted).max(0);
+        start_dt - chrono::Duration::milliseconds(lead_ms)
+    };
+    if !virt_wanted.is_empty() {
+        for op in idx.operand_ids(&virt_wanted) {
+            if !read_ids.contains(&op) {
+                read_ids.push(op);
+            }
+        }
+    }
+
+    let window = if read_ids.is_empty() {
+        Vec::new()
+    } else {
+        db.get_series_window(&read_ids, virt_start, end_dt).await?
+    };
+    // Точки операндов до virt_start нужны только для AVG — наружу (в реальные
+    // серии) они не попадают, window фильтруется ниже по real_wanted.
+    let start_ms = start_dt.timestamp_millis();
+    let mut series: Vec<Value> = window
+        .iter()
+        .filter(|(id, _)| real_wanted.contains(id))
         .map(|(tag_id, points)| {
-            let (times, values): (Vec<f64>, Vec<f64>) = points_payload(points).into_iter().unzip();
+            let (times, values): (Vec<f64>, Vec<f64>) = points_payload(points.clone()).into_iter().unzip();
             json!({ "tag_id": tag_id, "times": times, "values": values })
         })
         .collect();
+
+    if !virt_wanted.is_empty() {
+        // Сырые точки операндов из окна чтения (уже прочитано выше).
+        let mut real_hist: std::collections::BTreeMap<i64, Vec<(i64, f64)>> = Default::default();
+        for (id, points) in &window {
+            if !real_wanted.contains(id) {
+                let pts = points_payload(points.clone())
+                    .into_iter()
+                    .map(|(sec, v)| ((sec * 1000.0).round() as i64, v))
+                    .collect();
+                real_hist.insert(*id, pts);
+            }
+        }
+        let virt_out = pda_core::core::virtual_calc::eval_history(
+            &virt_wanted,
+            &idx.info(),
+            &real_hist,
+        );
+        for (tag_id, s) in virt_out {
+            let (times, values): (Vec<f64>, Vec<f64>) = s
+                .into_iter()
+                .filter(|(t, _)| *t >= start_ms)
+                .map(|(t, v)| (t as f64 / 1000.0, v))
+                .unzip();
+            series.push(json!({ "tag_id": tag_id, "times": times, "values": values }));
+        }
+    }
 
     // t_last — момент самой свежей записи во всей базе. Фронт в режиме Archive
     // показывает его рядом с полем «Начало»: видно, до какой даты грузить.

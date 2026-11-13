@@ -14,8 +14,9 @@ pub mod priority;
 pub mod registry;
 pub mod s7_proto;
 pub mod snap7;
+pub mod virtual_calc;
 
 pub use driver_manager::DriverManager;
 pub use registry::{
-    address_info, get_driver_label, is_known, normalize_driver_type, validate_address,
+    address_info, get_driver_label, is_known, is_virtual, normalize_driver_type, validate_address,
 };

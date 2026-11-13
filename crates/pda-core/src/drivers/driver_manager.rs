@@ -16,11 +16,12 @@ use std::sync::{Arc, OnceLock};
 use crate::config::JournalConfig;
 use crate::core::historian::Historian;
 use crate::core::tag_registry::TagRegistry;
+use crate::core::virtual_calc::VirtualPlan;
 use crate::database::db_service::{DbConfigStore, DbWriter};
 use crate::models::Connection;
 
 use super::base::DriverState;
-use super::{modbus_client, modbus_server, priority, registry, snap7};
+use super::{modbus_client, modbus_server, priority, registry, snap7, virtual_calc};
 
 /// Запущенный драйвер: состояние + задача (аналог объекта BaseDriver).
 struct RunningDriver {
@@ -66,6 +67,10 @@ pub struct DriverManager {
     /// процесса и перезагрузку ПК: при старте сервера список перечитывается.
     /// None (тесты ядра) — ничего не пишем и не читаем.
     pause_file: Option<std::path::PathBuf>,
+    /// План вычислений виртуальных сигналов (перебирается в reload_tags).
+    /// Общая RwLock: задачи-вычислители читают его каждый цикл, менеджер
+    /// перезаписывает при любой правке конфигурации тегов/подключений.
+    virtual_plan: Arc<std::sync::RwLock<VirtualPlan>>,
 }
 
 impl DriverManager {
@@ -86,6 +91,7 @@ impl DriverManager {
             drivers: HashMap::new(),
             manually_stopped: HashSet::new(),
             pause_file: None,
+            virtual_plan: Arc::new(std::sync::RwLock::new(VirtualPlan::default())),
         }
     }
 
@@ -128,12 +134,39 @@ impl DriverManager {
 
     // ---------------------------------------------------------------- tags
     /// Обновляет реестр тегов из БД (старт, изменение конфигурации).
+    /// Заодно пересобирает план виртуальных вычислений: правка любого
+    /// выражения/id операнда мгновенно отражается на задаче-вычислителе.
     pub async fn reload_tags(&self) {
-        match self.store.get_all_tags().await {
-            Ok(tags) => self.registry.replace_all(&tags),
+        let tags = match self.store.get_all_tags().await {
+            Ok(t) => t,
             Err(exc) => {
                 tracing::warn!("[Drivers] Не удалось загрузить теги в реестр: {exc}");
+                return;
             }
+        };
+        self.registry.replace_all(&tags);
+
+        // Virtual-подключения: план + исключение их точек из журнала.
+        let conns = self.store.get_all_connections().await.unwrap_or_default();
+        let virt_ids: Vec<i64> = conns
+            .iter()
+            .filter(|c| registry::is_virtual(&c.driver_type))
+            .map(|c| c.id)
+            .collect();
+        self.registry
+            .set_journal_excluded_conns(virt_ids.iter().copied());
+        let virt_ids_set: std::collections::HashSet<i64> = virt_ids.iter().copied().collect();
+        let virt_tags: Vec<crate::models::Tag> = tags
+            .iter()
+            .filter(|t| virt_ids_set.contains(&t.connection_id))
+            .cloned()
+            .collect();
+        let plan = VirtualPlan::build(&virt_tags);
+        for (id, msg) in &plan.errors {
+            tracing::warn!("[Virtual] тег id={id}: {msg}");
+        }
+        if let Ok(mut g) = self.virtual_plan.write() {
+            *g = plan;
         }
     }
 
@@ -260,6 +293,7 @@ impl DriverManager {
         // Modbus-серверу нужен прямой доступ к очереди журнала: записанное
         // Master'ом значение должно попадать в БД при приходе посылки.
         let journal = self.historian.collector().clone();
+        let vplan = self.virtual_plan.clone();
         // Опрос — на выделенном рантайме с повышенным приоритетом потоков.
         let handle = poll_runtime().spawn(async move {
             match dt.as_str() {
@@ -270,6 +304,9 @@ impl DriverManager {
                 "modbus_server" => {
                     modbus_server::run_modbus_server(conn_cfg, registry, task_state, Some(journal))
                         .await
+                }
+                "virtual" => {
+                    virtual_calc::run_virtual(conn_cfg, registry, task_state, vplan).await
                 }
                 _ => {}
             }

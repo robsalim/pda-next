@@ -467,8 +467,8 @@ function ioConnForm(conn, autoTsap) {
         <div class="modal-form-row"><label>Тип драйвера:</label><select id="c-driver" data-new="${isAutoTsap ? 1 : 0}" onchange="ioConnDriverChanged(this.dataset.new==='1')">${
             driverTypes.map(t => `<option value="${t.key}"${t.key === dt ? ' selected' : ''}>${escHtml(t.label)}</option>`).join('')
         }</select></div>
-        <div class="modal-form-row"><label>IP-адрес контроллера:</label><input id="c-ip" type="text" value="${escAttr(cfg.ip || '192.168.0.1')}"></div>
-        <div class="modal-form-row"><label>TCP Порт:</label><input id="c-port" type="number" value="${cfg.port ?? 102}"></div>
+        <div class="modal-form-row" id="c-row-ip"><label>IP-адрес контроллера:</label><input id="c-ip" type="text" value="${escAttr(cfg.ip || '192.168.0.1')}"></div>
+        <div class="modal-form-row" id="c-row-port"><label>TCP Порт:</label><input id="c-port" type="number" value="${cfg.port ?? 102}"></div>
         <div class="modal-form-row" id="c-row-rack"><label>Стойка (Rack):</label><input id="c-rack" type="number" min="0" max="15" value="${cfg.rack ?? 0}"></div>
         <div class="modal-form-row" id="c-row-slot"><label>Слот ЦПУ (Slot):</label><input id="c-slot" type="number" min="0" max="15" value="${cfg.slot ?? 1}"></div>
         <div class="modal-form-row" id="c-row-tsap"><label>Connection type (TSAP):</label><select id="c-tsap">${
@@ -501,11 +501,18 @@ function isSnap7(key) { return key === 'snap7' || key === 'snap7_s200'; }
 function ioConnDriverChanged(isNew) {
     const dt = document.getElementById('c-driver').value;
     const isS7 = isSnap7(dt);
+    // Виртуальный модуль — выражения, сетевые параметры ему не нужны.
+    const isVirt = dt === 'virtual';
+    document.getElementById('c-row-ip').style.display = isVirt ? 'none' : '';
+    document.getElementById('c-row-port').style.display = isVirt ? 'none' : '';
     document.getElementById('c-row-rack').style.display = isS7 ? '' : 'none';
     document.getElementById('c-row-slot').style.display = isS7 ? '' : 'none';
     document.getElementById('c-row-tsap').style.display = isS7 ? '' : 'none';
     document.getElementById('c-row-slave').style.display = dt === 'modbus_client' ? '' : 'none';
-    document.getElementById('c-port').value = isS7 ? 102 : 502;
+    if (!isVirt) document.getElementById('c-port').value = isS7 ? 102 : 502;
+    // Для виртуалов период опроса = частота пересчёта выражений.
+    const pollLabel = document.querySelector('#c-poll').closest('.modal-form-row').querySelector('label');
+    pollLabel.textContent = isVirt ? 'Период пересчёта (мс):' : 'Период опроса (мс):';
     // Автоподстановка TSAP только для новых подключений
     if (isNew && isS7) {
         const tsap = document.getElementById('c-tsap');
@@ -632,6 +639,7 @@ function ioTagForm(tag, conn) {
     const addr = info.address || {};
     const areas = addr.areas || [];
     const isS7 = isSnap7(dtKey), isMb = (dtKey === 'modbus_client' || dtKey === 'modbus_server');
+    const isVirt = dtKey === 'virtual';
     let types = BASE_TYPES.concat(isS7 ? S7_EXTRA : []);
     if (isMb) types = MODBUS_TYPES;
     if (t.data_type && !types.includes(t.data_type)) types.unshift(t.data_type);
@@ -642,9 +650,21 @@ function ioTagForm(tag, conn) {
     let html = `<h3>${tag ? 'Редактирование переменной' : 'Создать переменную'}</h3>
         <div class="modal-form-row"><label>Имя (Name):</label><input id="t-name" type="text" value="${escAttr(t.name || 'New_Signal')}"></div>
         <div class="modal-form-row"><label>Группа:</label><select id="t-group">${groups.map(g => `<option${g === (t.group_name || 'Общие') ? ' selected' : ''}>${escHtml(g)}</option>`).join('')}</select></div>
-        <div class="modal-form-row"><label>Адрес:</label><input id="t-addr" type="text" value="${escAttr(t.address_str ?? '0')}" oninput="ioTagAddrChanged()" placeholder="${escAttr(addr.hint || '')}"></div>`;
+        <div class="modal-form-row"><label>${isVirt ? 'Выражение:' : 'Адрес:'}</label><input id="t-addr" type="text" value="${escAttr(isVirt ? (t.address_str ?? '') : (t.address_str ?? '0'))}" oninput="ioTagAddrChanged()" placeholder="${escAttr(addr.hint || '')}"></div>`;
 
-    if (isS7) {
+    if (isVirt) {
+        // Помощник выражения: список всех сигналов приложения, клик вставляет [id].
+        const ex = addr.examples || [];
+        html += `<div class="modal-addr-box"><div class="addr-title">🧮 Сигналы для выражения (клик вставляет [id])</div>
+            <div class="modal-form-row"><label>Поиск:</label><input id="v-search" type="text" placeholder="имя сигнала или модуля…" oninput="ioVirtRender()" style="width:100%"></div>
+            <div id="v-list" style="max-height:160px;overflow:auto;font-size:12px"></div>
+        </div>
+        <div class="modal-addr-box"><div class="addr-title">📋 Примеры выражений (клик подставляет)</div>
+            <div style="display:flex;flex-wrap:wrap;gap:6px;padding:2px 0">
+            ${ex.map(e => `<button class="btn-action" style="font-size:12px;padding:2px 8px" title="${escAttr(e[2] || '')}" onclick="ioVirtExample('${escAttr(e[0])}')">${escHtml(e[0])}</button>`).join('')}
+            </div>
+        </div>`;
+    } else if (isS7) {
         const p = parseS7(t.address_str ?? 'MW0', dtKey === 'snap7_s200') || { area: areas[0]?.[0] || 'M', db: 1, size: 'W', offset: 0, bit: 0 };
         html += `<div class="modal-addr-box"><div class="addr-title">🧩 Конструктор S7</div>
             <div class="modal-form-row"><label>Область:</label><select id="s-area" onchange="ioS7Changed()">${areas.map(a => `<option value="${a[0]}"${a[0] === p.area ? ' selected' : ''}>${escHtml(a[1])}</option>`).join('')}</select></div>
@@ -676,7 +696,7 @@ function ioTagForm(tag, conn) {
 function ioTagOpen(tag) {
     const conn = ioConns.find(c => c.id === ioSelConn);
     if (!conn) return ioStatusLine('Сначала выберите модуль', true);
-    openModal(ioTagForm(tag, conn), () => { ioTagAddrValidate(); ioS7Gating(); });
+    openModal(ioTagForm(tag, conn), () => { ioTagAddrValidate(); ioS7Gating(); ioVirtRender(); });
 }
 function ioAddTag() { ioTagOpen(null); }
 function ioEditTag(id) {
@@ -705,6 +725,44 @@ function ioS7Changed() {
 function ioMbChanged() {
     const p = { area: document.getElementById('m-area').value, offset: Number(document.getElementById('m-off').value) };
     document.getElementById('t-addr').value = buildModbus(p);
+    ioTagAddrValidate();
+}
+
+// -------------------------------------------------------- помощник выражений
+// ioVirtRender — список сигналов для вставки [id]; клик добавляет ссылку в поле.
+function ioVirtRender() {
+    const box = document.getElementById('v-list');
+    if (!box) return;
+    const q = ((document.getElementById('v-search') || {}).value || '').toLowerCase();
+    const editingId = (ioTags.find(x => x.id === ioSelTagId) || {}).id;
+    const rows = (typeof allTags !== 'undefined' ? allTags : [])
+        .filter(t => t.id !== editingId)
+        .filter(t => !q || ((t.name || '') + ' ' + (t.connection || '')).toLowerCase().includes(q))
+        .slice(0, 300);
+    box.innerHTML = rows.map(t =>
+        `<div style="padding:2px 6px;cursor:pointer" title="Вставить [${t.id}]" onclick="ioVirtInsert(${t.id})">` +
+        `<b>[${t.id}]</b> ${escHtml(t.name || '')} <span style="opacity:.55">${escHtml(t.connection || '')}</span></div>`
+    ).join('') || '<div style="padding:4px 6px;opacity:.6">нет совпадений</div>';
+}
+function ioVirtInsert(id) {
+    const el = document.getElementById('t-addr');
+    if (!el) return;
+    const s = el.selectionStart ?? el.value.length, e = el.selectionEnd ?? el.value.length;
+    const ref = `[${id}]`;
+    el.value = el.value.slice(0, s) + ref + el.value.slice(e);
+    el.focus();
+    el.selectionStart = el.selectionEnd = s + ref.length;
+    ioTagAddrValidate();
+}
+// Кнопка «Примеры выражений»: подставляет шаблон целиком, выделяя [id]
+// для быстрой замены через список сигналов выше.
+function ioVirtExample(expr) {
+    const el = document.getElementById('t-addr');
+    if (!el) return;
+    el.value = expr;
+    el.focus();
+    const m = /\[\d+\]/.exec(expr);
+    if (m) { el.selectionStart = m.index; el.selectionEnd = m.index + m[0].length; }
     ioTagAddrValidate();
 }
 function ioTagAddrChanged() {

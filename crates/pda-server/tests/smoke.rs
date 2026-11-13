@@ -14,7 +14,7 @@ use tokio_modbus::prelude::*;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use pda_core::core::tag_registry::QUALITY_GOOD;
-use pda_core::database::db_service::{DatabaseService, DbConfig};
+use pda_core::database::db_service::{DbConfigStore, DatabaseService, DbConfig};
 use pda_server::{api, AppCore};
 
 struct Harness {
@@ -1051,6 +1051,158 @@ async fn export_pdf_places_chart_at_real_size() {
     }
     assert!(found, "на странице есть вставка XObject (Do)");
 
+    h.stop().await;
+    let _ = h.tmp.path();
+}
+
+/// Сквозной тест виртуальных сигналов: virtual-модуль считает выражения из
+/// live-значений операндов, /api/points и /api/series вычисляют историю
+/// виртуала из журнала операндов, а сам виртуал в БД не пишется.
+#[tokio::test(flavor = "multi_thread")]
+async fn virtual_signal_live_and_history() {
+    let h = Harness::start().await;
+    let port = free_port().await;
+
+    // Источник — modbus_server с FLOAT-сигналом.
+    h.post_json(
+        "/api/connections",
+        json!({
+            "name": "VIRT SRC", "driver_type": "modbus_server", "enabled": true,
+            "poll_interval_ms": 200, "config": {"host": "127.0.0.1", "port": port}
+        }),
+    )
+    .await;
+    let t_real = h
+        .post_json(
+            "/api/tags",
+            json!({
+                "id": 0, "connection_id": 1, "name": "src_float", "address_str": "HR160",
+                "data_type": "FLOAT", "scale": 1.0, "offset_val": 0.0, "unit": "°C",
+                "group_name": "Виртуалы", "log_interval_ms": 200, "deadband": 0.0
+            }),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+
+    let mut client =
+        tokio_modbus::client::tcp::connect_slave(([127, 0, 0, 1], port).into(), Slave(1))
+            .await
+            .unwrap();
+    let bytes = 50.75f32.to_bits().to_be_bytes();
+    client
+        .write_multiple_registers(
+            160,
+            &[
+                u16::from_be_bytes([bytes[0], bytes[1]]),
+                u16::from_be_bytes([bytes[2], bytes[3]]),
+            ],
+        )
+        .await
+        .unwrap();
+    h.wait_live(10_000, |rows| {
+        rows.iter()
+            .any(|r| r["id"] == json!(t_real) && r["value"].as_f64() == Some(50.75))
+    })
+    .await;
+    drop(client);
+
+    // Виртуальный модуль: выражения [real]*2 и [real]>40.
+    let vconn = h
+        .post_json(
+            "/api/connections",
+            json!({
+                "name": "VIRT", "driver_type": "virtual", "enabled": true,
+                "poll_interval_ms": 100, "config": {}
+            }),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    let t_double = h
+        .post_json(
+            "/api/tags",
+            json!({
+                "id": 0, "connection_id": vconn, "name": "doubled",
+                "address_str": format!("[{t_real}] * 2"), "data_type": "FLOAT",
+                "scale": 1.0, "offset_val": 0.0, "unit": "", "group_name": "Виртуалы",
+                "log_interval_ms": 0, "deadband": 0.0
+            }),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    let t_cond = h
+        .post_json(
+            "/api/tags",
+            json!({
+                "id": 0, "connection_id": vconn, "name": "hot",
+                "address_str": format!("[{t_real}] > 40"), "data_type": "BOOL",
+                "scale": 1.0, "offset_val": 0.0, "unit": "", "group_name": "Виртуалы",
+                "log_interval_ms": 0, "deadband": 0.0
+            }),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+
+    // Вычислитель публикует результаты в live (масштаб 1.0 -> 101.5, условие 1.0)
+    h.wait_live(10_000, |rows| {
+        rows.iter().any(|r| {
+            r["id"] == json!(t_double)
+                && (r["value"].as_f64().unwrap_or(0.0) - 101.5).abs() < 1e-6
+                && r["quality"].as_i64() == Some(QUALITY_GOOD as i64)
+        }) && rows
+            .iter()
+            .any(|r| r["id"] == json!(t_cond) && r["value"].as_f64() == Some(1.0))
+    })
+    .await;
+
+    // История виртуала вычисляется из журнала операнда (сам операнд пишется).
+    h.wait_points(t_real, 20_000).await;
+    let resp = h.get_json(&format!("/api/points/{t_double}")).await;
+    let vals = resp["values"].as_array().unwrap().clone();
+    assert!(
+        !vals.is_empty(),
+        "/api/points виртуала должен отдавать вычисленную историю: {resp:?}"
+    );
+    assert!(
+        vals.iter()
+            .all(|v| (v.as_f64().unwrap_or(0.0) - 101.5).abs() < 1e-6),
+        "все точки выражения [real]*2 равны 101.5: {vals:?}"
+    );
+
+    // /api/series отдаёт и реальную, и вычисленную виртуальную серии.
+    let s = h
+        .get_json(&format!("/api/series?tags={t_real},{t_double}"))
+        .await;
+    let arr = s["series"].as_array().unwrap();
+    assert_eq!(arr.len(), 2, "две серии (реальная + виртуальная): {s:?}");
+
+    // Виртуал в data_points не пишется — журнал его пропускает.
+    let db = h.core.db_snapshot().await;
+    let now = chrono::Local::now();
+    let raw = db
+        .get_data_points_range(t_double, now - chrono::Duration::hours(1), now)
+        .await
+        .unwrap();
+    assert!(raw.is_empty(), "история виртуала не должна попадать в БД");
+
+    // Валидация выражений через общий эндпоинт адресов.
+    let ok = h
+        .post_json(
+            "/api/validate/address",
+            json!({ "driver_type": "virtual", "address": format!("[{t_real}] > 0 && [999] < 5"), "data_type": "BOOL" }),
+        )
+        .await;
+    assert_eq!(ok["ok"], json!(true), "корректное выражение принято");
+    let bad = h
+        .post_json(
+            "/api/validate/address",
+            json!({ "driver_type": "virtual", "address": "[1 +", "data_type": "FLOAT" }),
+        )
+        .await;
+    assert_eq!(bad["ok"], json!(false), "битое выражение отклонено");
 
     h.stop().await;
     let _ = h.tmp.path();

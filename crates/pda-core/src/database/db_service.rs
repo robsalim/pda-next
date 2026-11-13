@@ -286,6 +286,42 @@ impl DatabaseService {
         }
     }
 
+    /// Момент самой свежей записи одного тега (epoch, мс). Нужен окну
+    /// виртуальных тегов: у виртуала своей истории нет, опора — операнды.
+    pub async fn get_last_data_time_for(&self, tag_id: i64) -> DbResult<Option<i64>> {
+        if !self.is_available {
+            return Ok(None);
+        }
+        match self.be()? {
+            Backend::Sqlite(lock) => {
+                let conn = lock.lock().await;
+                let s: Option<String> = conn
+                    .query_row(
+                        "SELECT timestamp FROM data_points WHERE tag_id = ?1 ORDER BY timestamp DESC LIMIT 1;",
+                        params![tag_id],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .unwrap_or(None);
+                Ok(s.as_deref()
+                    .and_then(parse_sqlite_ts)
+                    .map(|d| d.timestamp_millis()))
+            }
+            Backend::Postgres(lock) => {
+                let c = lock.lock().await;
+                let v: Option<DateTime<Utc>> = c
+                    .query(
+                        "SELECT \"timestamp\" FROM data_points WHERE tag_id = $1 ORDER BY \"timestamp\" DESC LIMIT 1;",
+                        &[&(tag_id as i32)],
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .first()
+                    .and_then(|r| r.get(0));
+                Ok(v.map(|t| t.timestamp_millis()))
+            }
+        }
+    }
+
     /// Занятые бакеты окна: моменты (epoch, мс) начала бакета, внутри которого
     /// есть хотя бы одна запись по выбранным тегам.
     ///
