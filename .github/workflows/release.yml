@@ -31,8 +31,32 @@ jobs:
       - uses: actions/checkout@v7
       # Тот же тулчейин, что в разработке: windows-gnu. webview2-com-sys на GNU
       # линкуется через импорт-библиотеку, поэтому рядом с exe обязателен
-      # WebView2Loader.dll — его кладёт build.rs pda-desktop.
+      # WebView2Loader.dll.
       - run: rustup default stable-x86_64-pc-windows-gnu
+      # DLL кладём ДО сборки: build.rs pda-desktop пропускает копирование, если
+      # файл уже в target/<profile>/. Источник — NuGet Microsoft.Web.WebView2:
+      # на GitHub-раннерах реестр cargo не отдал DLL (прогоны v1.1.9–v1.2.1
+      # падали на Copy-Item), NuGet одинаков для локальной и CI-сборки.
+      # Если скачивание не удалось — предупреждаем и продолжаем: запасной путь
+      # у build.rs есть (поиск в cargo home), а без DLL сборка упадёт в build.rs
+      # с внятной паникой вместо молчаливого Copy-Item.
+      - name: Подготовить WebView2Loader.dll (NuGet)
+        shell: pwsh
+        run: |
+          $tmp = Join-Path $env:RUNNER_TEMP "webview2-nuget"
+          try {
+            New-Item -ItemType Directory -Force "$tmp\extract" | Out-Null
+            Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2" `
+              -OutFile "$tmp\webview2.zip" -UseBasicParsing
+            Expand-Archive "$tmp\webview2.zip" "$tmp\extract"
+            $dll = Join-Path "$tmp\extract" "build\native\x64\WebView2Loader.dll"
+            if (-not (Test-Path $dll)) { throw "в пакете нет $dll" }
+            New-Item -ItemType Directory -Force target\release | Out-Null
+            Copy-Item $dll target\release\WebView2Loader.dll -Force
+            "WebView2Loader.dll: $((Get-Item target\release\WebView2Loader.dll).Length) байт"
+          } catch {
+            Write-Warning "NuGet не отдал WebView2Loader.dll: $($_.Exception.Message) - полагаемся на build.rs"
+          }
       - run: cargo build --release -p pda-server -p pda-desktop
       - run: cargo test --release -p pda-core -p pda-server
       - name: Собрать поставку
