@@ -75,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     core.start(view_only).await;
     core.spawn_live_pump();
+    core.spawn_watchdog();
 
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
     let addr = listener.local_addr()?;

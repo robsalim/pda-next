@@ -500,6 +500,9 @@ pub async fn run_modbus_server(
         }
         let accepted =
             tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await;
+        // Сервер жив, пока крутит accept: подключение клиента здесь не нужно —
+        // супервизор считает «связь есть», когда цикл крутится.
+        state.mark_ok();
         let stream = match accepted {
             Ok(Ok((s, _peer))) => s,
             Ok(Err(e)) => {

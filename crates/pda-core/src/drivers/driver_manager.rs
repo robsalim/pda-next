@@ -27,6 +27,45 @@ use super::{modbus_client, modbus_server, priority, registry, snap7, virtual_cal
 struct RunningDriver {
     state: Arc<DriverState>,
     handle: tokio::task::JoinHandle<()>,
+    /// Конфигурация, из которой поднят драйвер — супервизор перезапускает
+    /// модуль по ней, без лишного похода в БД (правка конфига и так идёт
+    /// через restart_connection).
+    conn: Connection,
+    /// Когда задача поднята: сразу после спавна драйвер ещё не успевает
+    /// ни подключиться, ни отчитать — проверять его рано.
+    spawned_at: std::time::Instant,
+    /// Сколько раз модуль переподнял супервизор (сбрасывается, когда всё хорошо).
+    restarts: u32,
+    /// Раньше этого момента перезапуск не повторять (растущая пауза после
+    /// неудачных попыток). None — попыток нет.
+    next_try: Option<std::time::Instant>,
+}
+
+/// Настройки супервизора модулей опроса.
+#[derive(Debug, Clone)]
+pub struct WatchdogConfig {
+    /// Период проверок задачей-супервизором (AppCore::spawn_watchdog).
+    pub tick_ms: u64,
+    /// Сколько секунд даём модулю на старт до первой проверки.
+    pub start_grace_ms: u64,
+    /// Потерей связи считается отсутствие успешного обмена дольше этого срока.
+    /// Для модуля с редким опросом берется max(stall_ms, 10 * poll_interval_ms).
+    pub stall_ms: u64,
+    /// Пауза перед первым перезапуском и потолок нарастающей паузы.
+    pub retry_min_ms: u64,
+    pub retry_max_ms: u64,
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            tick_ms: 5000,
+            start_grace_ms: 10_000,
+            stall_ms: 30_000,
+            retry_min_ms: 5_000,
+            retry_max_ms: 60_000,
+        }
+    }
 }
 
 /// Выделенный рантайм опроса. Драйверы PLC/Modbus крутятся здесь, а не в общем
@@ -311,7 +350,17 @@ impl DriverManager {
                 _ => {}
             }
         });
-        self.drivers.insert(c.id, RunningDriver { state, handle });
+        self.drivers.insert(
+            c.id,
+            RunningDriver {
+                state,
+                handle,
+                conn: c.clone(),
+                spawned_at: std::time::Instant::now(),
+                restarts: 0,
+                next_try: None,
+            },
+        );
     }
 
     /// Останавливает драйверы, затем журнал: накопленные точки сольются в БД.
@@ -348,6 +397,112 @@ impl DriverManager {
         }
     }
 
+    // -------------------------------------------------------------- watchdog
+    /// Супервизор модулей опроса: поднимает заново те, что умерли или
+    /// потеряли связь с ПЛК.
+    ///
+    /// Модуль считается требующим перезапуска, если
+    ///   * его задача завершилась (`running == false` или finished handle) —
+    ///     например, Modbus-сервер не смог занять порт, либо IP в конфигурации
+    ///     неразрешимый;
+    ///   * или последний успешный цикл был дольше `stall_ms` (для редкого
+    ///     опроса — 10 периодов): драйвер крутится в «Connect Error», завис на
+    ///     чтении или ушёл в бесконечный пересокет.
+    ///
+    /// Перезапуск не делается чаще, чем раз в нарастающую паузу
+    /// (retry_min_ms, retry_min*2, … до retry_max_ms), счётчик обнуляется, как
+    /// только модуль снова стабильно обменивается с устройством.
+    /// Ручные паузы (manually_stopped) не трогаем: их оператор гасит сам.
+    ///
+    /// Синхронный и быстрый (в БД не ходит) — вызывается фоновой задачей
+    /// AppCore под write-локом менеджера. Возвращает описания перезапусков.
+    pub fn watchdog_tick(&mut self, cfg: &WatchdogConfig) -> Vec<String> {
+        let now = std::time::Instant::now();
+        let grace = std::time::Duration::from_millis(cfg.start_grace_ms);
+        let mut doomed: Vec<(i64, String)> = Vec::new();
+        for (id, d) in self.drivers.iter_mut() {
+            if now.duration_since(d.spawned_at) < grace {
+                continue; // только что поднят — ещё не успел подключиться
+            }
+            let stalled_for = d.state.stalled_for();
+            let limit = std::time::Duration::from_millis(cfg.stall_ms.max(
+                d.conn.poll_interval_ms.max(1) as u64 * 10,
+            ));
+            let dead = !d.state.running.load(Ordering::Relaxed) || d.handle.is_finished();
+            if !dead && stalled_for < limit {
+                // Связь есть — забыем про прошлые неудачи.
+                if d.restarts > 0 {
+                    d.restarts = 0;
+                    d.next_try = None;
+                }
+                continue;
+            }
+            if d.next_try.map(|when| now < when).unwrap_or(false) {
+                continue; // растущая пауза после неудачных попыток
+            }
+            let reason = if dead {
+                format!(
+                    "задача опроса завершилась ({}), обмен молчал {:.0} с",
+                    d.state.status(),
+                    stalled_for.as_secs_f64()
+                )
+            } else {
+                format!(
+                    "нет успешного обмена {:.0} с ({}), обмен остановлен",
+                    stalled_for.as_secs_f64(),
+                    d.state.status()
+                )
+            };
+            doomed.push((*id, reason));
+        }
+        let mut done = Vec::new();
+        for (id, reason) in doomed {
+            if let Some(msg) = self.restart_under_watch(id, &reason, cfg, now) {
+                done.push(msg);
+            }
+        }
+        done
+    }
+
+    /// Снять задачу модуля и поднять её из той же конфигурации, увеличив паузу
+    /// на следующую попытку. None — модуля уже нет в списке запущенных.
+    fn restart_under_watch(
+        &mut self,
+        conn_id: i64,
+        reason: &str,
+        cfg: &WatchdogConfig,
+        now: std::time::Instant,
+    ) -> Option<String> {
+        let old = self.drivers.remove(&conn_id)?;
+        let attempts = old.restarts + 1;
+        let conn = old.conn.clone();
+        old.state.stop();
+        // Как в stop_connection: handle из выделенного poll_runtime(), абортим
+        // без ожидания — сокет (и порт Modbus-сервера) дропается вместе с future.
+        old.handle.abort();
+        tracing::warn!(
+            "[Watchdog] Перезапуск модуля '{}' (id={}), попытка {attempts}: {reason}",
+            conn.name,
+            conn_id
+        );
+        self.spawn_driver(&conn);
+        let Some(d) = self.drivers.get_mut(&conn_id) else {
+            tracing::error!(
+                "[Watchdog] Модуль '{}' (id={}) не поднят повторно — драйвер не создан",
+                conn.name,
+                conn_id
+            );
+            return None;
+        };
+        let backoff = cfg
+            .retry_min_ms
+            .saturating_mul(2u64.saturating_pow(attempts.saturating_sub(1)))
+            .min(cfg.retry_max_ms);
+        d.restarts = attempts;
+        d.next_try = Some(now + std::time::Duration::from_millis(backoff));
+        Some(format!("{} ({}): {reason}", conn.name, conn_id))
+    }
+
     // ------------------------------------------------------------------ misc
     /// Смена сервиса БД (переподключение): журнал должен писать в новую базу.
     /// Драйверы публикуют значения в реестр, а не пишут в БД напрямую, поэтому
@@ -379,12 +534,30 @@ impl DriverManager {
             .unwrap_or_else(|| "Stopped".into())
     }
 
-    /// Состояния всех драйверов для панели/веба.
+    /// Состояния всех драйверов для панели/веба. Дополнительно к снимку самого
+    /// драйвера: `restarts` — сколько раз поднял супервизор, `restart_in` —
+    /// через сколько секунд возможна следующая попытка (пока связь есть, нет).
     pub fn drivers_json(&self) -> serde_json::Value {
+        let now = std::time::Instant::now();
         serde_json::json!(self
             .drivers
             .values()
-            .map(|d| d.state.to_json())
+            .map(|d| {
+                let mut j = d.state.to_json();
+                if let Some(o) = j.as_object_mut() {
+                    o.insert(
+                        "restarts".into(),
+                        serde_json::json!(d.restarts),
+                    );
+                    o.insert(
+                        "restart_in".into(),
+                        serde_json::json!(d
+                            .next_try
+                            .map(|t| t.saturating_duration_since(now).as_secs_f64())),
+                    );
+                }
+                j
+            })
             .collect::<Vec<_>>())
     }
 
@@ -698,5 +871,164 @@ mod tests {
         let c = Connection::new(8, "x", "nosuch", true, 1000, Default::default());
         mgr.spawn_driver(&c);
         assert!(mgr.drivers.is_empty());
+    }
+
+    // ------------------------------------------------------------- супервизор
+    fn mk_mgr(port: u16) -> DriverManager {
+        DriverManager::new(
+            Arc::new(StoreStub::new(port)),
+            Arc::new(WriterStub {
+                written: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            Some(JournalConfig::default()),
+        )
+    }
+
+    fn addr_cfg(host_key: &str, host: &str, port: u16) -> ConnConfig {
+        let mut cfg = ConnConfig::new();
+        cfg.insert(host_key.into(), serde_json::json!(host));
+        cfg.insert("port".into(), serde_json::json!(port));
+        cfg
+    }
+
+    /// Супервизор без пауз и с нулевой выдержкой на старт — чтобы тест не ждал
+    /// реальных 10 секунд старта.
+    fn fast_watchdog() -> WatchdogConfig {
+        WatchdogConfig {
+            tick_ms: 50,
+            start_grace_ms: 0,
+            stall_ms: 30_000,
+            retry_min_ms: 300,
+            retry_max_ms: 60_000,
+        }
+    }
+
+    /// Мёртвая задача: Modbus-сервер с неразрешимым адресом завершается сразу,
+    /// в UI при этом модуль числится запущенным. Супервизор обязан поднять его
+    /// заново (счётчик попыток — в /api/status).
+    #[tokio::test]
+    async fn watchdog_restarts_dead_driver() {
+        let mut mgr = mk_mgr(15031);
+        let c = Connection::new(
+            9,
+            "dead",
+            "modbus_server",
+            true,
+            1000,
+            addr_cfg("host", "not-an-ip", 15031),
+        );
+        mgr.spawn_driver(&c);
+        assert!(mgr.drivers.contains_key(&9), "модуль числится запущенным");
+
+        let done = mgr.watchdog_tick(&fast_watchdog());
+        assert_eq!(done.len(), 1, "мёртвый модуль перезапущен: {done:?}");
+        let d = mgr.drivers.get(&9).expect("модуль на месте после перезапуска");
+        assert_eq!(d.restarts, 1);
+        assert!(d.next_try.is_some(), "назначена пауза до следующей попытки");
+        // Отчёт для /api/status: по нему видно, что модуль поднимали.
+        assert_eq!(mgr.drivers_json()[0]["restarts"], serde_json::json!(1));
+        mgr.stop_all().await;
+    }
+
+    /// Перезапуски не должны идти подряд: пока пауза после попытки не истекла,
+    /// супервизор модуль не трогает, дальше пробует снова — реже и реже.
+    #[tokio::test]
+    async fn watchdog_backs_off_between_attempts() {
+        let mut mgr = mk_mgr(15032);
+        let c = Connection::new(
+            9,
+            "dead",
+            "modbus_server",
+            true,
+            1000,
+            addr_cfg("host", "not-an-ip", 15032),
+        );
+        mgr.spawn_driver(&c);
+        let cfg = fast_watchdog(); // retry_min_ms = 300
+
+        assert_eq!(mgr.watchdog_tick(&cfg).len(), 1, "первая попытка");
+        assert!(
+            mgr.watchdog_tick(&cfg).is_empty(),
+            "пока пауза не истекла — тишина"
+        );
+        assert_eq!(mgr.drivers.get(&9).unwrap().restarts, 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        assert_eq!(mgr.watchdog_tick(&cfg).len(), 1, "пауза истекла — новая попытка");
+        assert_eq!(mgr.drivers.get(&9).unwrap().restarts, 2);
+        // вторая попытка удваивает паузу (600 мс) — сразу её не повторяем
+        assert!(mgr.watchdog_tick(&cfg).is_empty(), "пауза растёт");
+        mgr.stop_all().await;
+    }
+
+    /// Модуль запущен, задача крутится, но связи нет (connect к несуществующему
+    /// серверу): через `stall_ms` это считается потерей связи, модуль поднимается
+    /// заново — именно то, что нужно после обрыва кабеля/перезагрузки ПЛК.
+    #[tokio::test]
+    async fn watchdog_restarts_driver_without_connection() {
+        let mut mgr = mk_mgr(15033);
+        // Порт заведомо закрыт: connect отказывает мгновенно, драйвер уходит в
+        // цикл «Connect Error», running при этом остаётся true.
+        let c = Connection::new(
+            11,
+            "offline",
+            "modbus_client",
+            true,
+            50,
+            addr_cfg("ip", "127.0.0.1", 15033),
+        );
+        mgr.spawn_driver(&c);
+        let cfg = WatchdogConfig {
+            stall_ms: 100,
+            ..fast_watchdog()
+        };
+        // Лимит для этого модуля max(stall_ms, 10 * poll) = 500 мс.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        assert!(
+            mgr.drivers_json()[0]["stalled_s"].as_f64().unwrap_or(0.0) >= 0.5,
+            "в отчёте /api/status видно, сколько модуль был без связи"
+        );
+        let done = mgr.watchdog_tick(&cfg);
+        assert_eq!(done.len(), 1, "нет связи — перезапуск: {done:?}");
+        assert_eq!(mgr.drivers.get(&11).unwrap().restarts, 1);
+        mgr.stop_all().await;
+    }
+
+    /// Здоровый модуль супервизор не трогает, а накопленные попытки обнуляет.
+    #[tokio::test]
+    async fn watchdog_leaves_healthy_driver_alone() {
+        let mut mgr = mk_mgr(15034);
+        assert!(mgr.start_connection(7).await); // modbus_server на 15034
+        for _ in 0..50 {
+            if mgr.running_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(mgr.running_count(), 1);
+        mgr.drivers.get_mut(&7).unwrap().restarts = 3; // «до этого» роняли
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            mgr.watchdog_tick(&fast_watchdog()).is_empty(),
+            "живой модуль перезапускать нельзя"
+        );
+        assert_eq!(
+            mgr.drivers.get(&7).unwrap().restarts,
+            0,
+            "связь есть — счётчик попыток забыт"
+        );
+        mgr.stop_all().await;
+    }
+
+    /// Ручная пауза оператора — не авария: остановленный модуль супервизор
+    /// не поднимает (его просто нет в списке запущенных).
+    #[tokio::test]
+    async fn watchdog_keeps_manual_pause() {
+        let mut mgr = mk_mgr(15035);
+        assert!(mgr.stop_connection(7).await);
+        assert!(mgr.watchdog_tick(&fast_watchdog()).is_empty());
+        assert_eq!(mgr.running_count(), 0);
+        mgr.stop_all().await;
     }
 }

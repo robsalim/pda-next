@@ -79,6 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 core.start(view_only).await;
                 core.spawn_live_pump();
+                core.spawn_watchdog();
 
                 // 127.0.0.1:0 -> ОС выдаёт свободный порт; фронтенд берёт host
                 // из location.host, WS строится от того же адреса.

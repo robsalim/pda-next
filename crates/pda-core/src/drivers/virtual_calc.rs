@@ -161,6 +161,9 @@ pub async fn run_virtual(
         let n = compute_once(&registry, &plan, Some(conn_cfg.id), &mut buffers);
         let cycle_s = started.elapsed().as_secs_f64();
         update_stats(&state, cycle_s, cycle_s, 0.0, 1, n);
+        // Вычислителю не нужна связь с ПЛК, но цикл обязан крутиться:
+        // зависшая задача — повод супервизору переподнять модуль.
+        state.mark_ok();
         ticker.tick().await;
     }
     state.set_status("Stopped");

@@ -566,6 +566,68 @@ async fn view_only_stops_journal_writes() {
     let _ = h.tmp.path();
 }
 
+/// Наборы сигналов Charts: автосостав (`last`) и именованные наборы живут в
+/// файле рядом с db_config.json — на сервере, а не в localStorage браузера
+/// (origin desktop-окна меняется из-за эфемерного порта).
+#[tokio::test(flavor = "multi_thread")]
+async fn chart_presets_roundtrip() {
+    let h = Harness::start().await;
+
+    // До первой записи — пусто, но не ошибка.
+    let empty = h.get_json("/api/charts/presets").await;
+    assert!(empty["last"].is_null(), "первый запуск без автосостава: {empty}");
+    assert!(empty["sets"].as_array().unwrap().is_empty());
+
+    // Автосостав (без имени) — два окна, активное второе.
+    h.post_json(
+        "/api/charts/presets/save",
+        json!({ "windows": [[12, 40], [7]], "active": 1 }),
+    )
+    .await;
+    let list = h.get_json("/api/charts/presets").await;
+    assert_eq!(list["last"]["windows"], json!([[12, 40], [7]]));
+    assert_eq!(list["last"]["active"], 1);
+    assert!(list["last"]["saved_at"].is_string(), "время сохранения видно");
+
+    // Именованный набор — рядом с автосоставом, не вместо него.
+    h.post_json(
+        "/api/charts/presets/save",
+        json!({ "name": "Цех 1 — линия", "windows": [[5]], "active": 0 }),
+    )
+    .await;
+    let list = h.get_json("/api/charts/presets").await;
+    let sets = list["sets"].as_array().unwrap();
+    assert_eq!(sets.len(), 1, "именованный набор в списке: {list}");
+    assert_eq!(sets[0]["name"], "Цех 1 — линия");
+    assert_eq!(sets[0]["signals"], 1, "размер набора для подписи в UI");
+    assert_eq!(list["last"]["windows"], json!([[12, 40], [7]]), "автосостав не потерян");
+
+    // Файл — рядом с db_config.json, то есть переживает перезапуск приложения.
+    let file = h.tmp.path().join("pda_charts_presets.json");
+    assert!(file.is_file(), "наборы в файле рядом с db_config.json");
+
+    // Мусор в составе отбивается (ручная правка/сбой фронта).
+    let bad = h
+        .http
+        .post(format!("{}/api/charts/presets/save", h.base))
+        .json(&json!({ "windows": "не список" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+
+    // Удаление именованного набора; автосостав остаётся.
+    let del = h
+        .post_json("/api/charts/presets/delete", json!({ "name": "Цех 1 — линия" }))
+        .await;
+    assert_eq!(del["removed"], true);
+    let list = h.get_json("/api/charts/presets").await;
+    assert!(list["sets"].as_array().unwrap().is_empty());
+    assert!(!list["last"].is_null());
+
+    h.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn helpers_and_validation_endpoints() {
     let h = Harness::start().await;
@@ -1178,6 +1240,74 @@ async fn virtual_signal_live_and_history() {
         .await;
     let arr = s["series"].as_array().unwrap();
     assert_eq!(arr.len(), 2, "две серии (реальная + виртуальная): {s:?}");
+    let series_of = |id: i64| -> Vec<Value> {
+        arr.iter()
+            .find(|x| x["tag_id"] == json!(id))
+            .map(|x| x["values"].as_array().unwrap().clone())
+            .unwrap_or_default()
+    };
+    // Регресс: виртуал от тега, который добавлен на ЭТОТ ЖЕ график как обычный
+    // сигнал. Раньше такой тег исключался из чтения операндов, виртуал
+    // оставался без данных, а фронт при пустом ответе держал прежние точки —
+    // на Live реальная кривая едет влево, а виртуальная стоит на месте.
+    let real_vals = series_of(t_real);
+    let virt_vals = series_of(t_double);
+    assert!(
+        !real_vals.is_empty() && !virt_vals.is_empty(),
+        "обе серии с данными (real={}, virt={}): {s:?}",
+        real_vals.len(),
+        virt_vals.len()
+    );
+    // Времена виртуала доходят до того же правого края, что и операнд: иначе
+    // при live-тиках линия не растёт вправо и «отстаёт» от реальной.
+    // Значение null в JSON = NaN (пустой бакет прореженной сетки) — uPlot
+    // рисует по таким точкам разрыв, это штатно для обеих серий.
+    let pairs_of = |id: i64| -> Vec<(i64, Option<f64>)> {
+        arr.iter()
+            .find(|x| x["tag_id"] == json!(id))
+            .map(|x| {
+                x["times"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .zip(x["values"].as_array().unwrap().iter())
+                    .map(|(t, v)| ((t.as_f64().unwrap() * 1000.0).round() as i64, v.as_f64()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (rp, vp) = (pairs_of(t_real), pairs_of(t_double));
+    let virt_at: std::collections::BTreeMap<i64, Option<f64>> = vp.into_iter().collect();
+    assert!(
+        !rp.is_empty() && !virt_at.is_empty(),
+        "обе серии с данными (real={}, virt={}): {s:?}",
+        rp.len(),
+        virt_at.len()
+    );
+    for (ms, r) in &rp {
+        let v = virt_at
+            .get(ms)
+            .unwrap_or_else(|| panic!("нет точки виртуала на t={ms} (rp={rp:?}): {s:?}"));
+        match (r, v) {
+            (Some(r), Some(v)) => assert!(
+                (v - r * 2.0).abs() < 1e-6,
+                "виртуал = 2×операнда в каждой общей точке (t={ms}, real={r}, virt={v})"
+            ),
+            // Пустой бакет прореживания обязан совпасть у обеих серий —
+            // иначе кривые расходятся «лесенкой» при зуме/сдвиге.
+            (None, None) => {}
+            _ => panic!(
+                "дыры в данных не совпали: t={ms}, real={r:?}, virt={v:?}"
+            ),
+        }
+    }
+    let rp_last = rp.iter().map(|(t, _)| *t).max().unwrap();
+    let vp_last = *virt_at.keys().next_back().unwrap();
+    // ±1 мс — допуск на округление при переводе секунд с дробной частью в мс.
+    assert!(
+        vp_last >= rp_last - 1,
+        "правый край виртуала не отстаёт от операнда (rp_last={rp_last}, vp_last={vp_last})"
+    );
 
     // Виртуал в data_points не пишется — журнал его пропускает.
     let db = h.core.db_snapshot().await;

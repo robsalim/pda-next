@@ -5,9 +5,9 @@
 //! соединений и планов чтения у S7 и Modbus различается.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use parking_lot::Mutex;
@@ -27,6 +27,14 @@ pub struct Stats {
     pub hz: f64,
 }
 
+/// Миллисекунды от старта процесса — монотонные, перевод системных часов
+/// (NTP, ручная коррекция) не должен устраивать ложные «потеряли связь».
+fn mono_ms() -> u64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// Разделяемое состояние одного драйвера: читается DriverManager'ом,
 /// GUI и веб-сервером, пишется задачей опроса.
 pub struct DriverState {
@@ -37,6 +45,10 @@ pub struct DriverState {
     pub status: Mutex<String>,
     pub stats: Mutex<Stats>,
     pub last_error: Mutex<Option<String>>,
+    /// Миллисекунды монотонного времени последнего успешного цикла опроса.
+    /// Супервизор (DriverManager::watchdog_tick) по ней определяет, что модуль
+    /// «запущен, но связи нет», и перезапускает его.
+    pub last_ok_ms: AtomicU64,
 }
 
 impl DriverState {
@@ -49,6 +61,10 @@ impl DriverState {
             status: Mutex::new("Stopped".into()),
             stats: Mutex::new(Stats::default()),
             last_error: Mutex::new(None),
+            // Отсчёт «нет связи» начинается с момента спавна задачи: модуль,
+            // который ни разу не обменялся с ПЛК, — такой же кандидат на
+            // перезапуск, как и тот, у кого связь оборвалась.
+            last_ok_ms: AtomicU64::new(mono_ms()),
         })
     }
 
@@ -65,6 +81,19 @@ impl DriverState {
         *self.status.lock() = "Stopped".into();
     }
 
+    /// Драйвер вызывает её на каждом цикле, где транспорт жив (обмен с ПЛК
+    /// состоялся либо тегов нет вовсе). Мягкие ошибки отдельных адресов при
+    /// этом НЕ сбрасывают метку: связь есть, перезапуск не нужен.
+    pub fn mark_ok(&self) {
+        self.last_ok_ms.store(mono_ms(), Ordering::Relaxed);
+    }
+
+    /// Сколько времени прошло с последнего здорового цикла.
+    pub fn stalled_for(&self) -> Duration {
+        let last = self.last_ok_ms.load(Ordering::Relaxed);
+        Duration::from_millis(mono_ms().saturating_sub(last))
+    }
+
     /// Снимок для API/панели.
     pub fn to_json(&self) -> serde_json::Value {
         let stats = self.stats.lock();
@@ -76,6 +105,7 @@ impl DriverState {
             "status": self.status.lock().clone(),
             "last_error": self.last_error.lock().clone(),
             "stats": *stats,
+            "stalled_s": self.stalled_for().as_secs_f64(),
         })
     }
 }

@@ -1244,6 +1244,7 @@ function selectChartWindow(id) {
     document.querySelectorAll('.chart-window').forEach(box => box.classList.toggle('active', Number(box.dataset.windowId) === id));
     // Курсоры у каждого окна свои — в шапке показываем значения активного окна.
     if (activeTab === 'charts') refreshHeaderCursors();
+    saveChartState();
 }
 
 function removeChartWindow(id) {
@@ -1255,6 +1256,7 @@ function removeChartWindow(id) {
     document.querySelector(`.chart-window[data-window-id="${id}"]`)?.remove();
     chartWindows.splice(index, 1);
     if (activeWindowId === id) selectChartWindow(chartWindows[Math.max(0, index - 1)].id);
+    saveChartState();
 }
 
 /// Пакетное добавление сигналов на график активного окна: один batch-запрос
@@ -1290,6 +1292,7 @@ async function addSignals(tagIds) {
         if (win.fullT1 == null || resp.t_end > win.fullT1) win.fullT1 = resp.t_end;
         win.zoomed = false;   // новый состав — вписываем весь интервал
         rebuildChartWindow(win, true);
+        saveChartState();
         if (document.getElementById('charts-mode').value === 'Archive') loadArchOverview();
         // Видимая обратная связь: сколько добавлено и сколько без данных.
         const msg = `Добавлено: ${added}` + (empty ? ` (нет данных: ${empty})` : '');
@@ -1342,6 +1345,7 @@ function removeSignal(tagId) {
     if (!win) return;
     win.signals = win.signals.filter(s => s.tag.id !== tagId);
     rebuildChartWindow(win);
+    saveChartState();
 }
 
 function clearCharts() {
@@ -1349,6 +1353,149 @@ function clearCharts() {
     if (!win) return;
     win.signals = [];
     rebuildChartWindow(win);
+    saveChartState();
+}
+
+// ---------------------------------------------------------- состав Charts
+/// Состав вкладке Charts (какие окна открыты и какие сигналы в каждом) хранится
+/// НА СЕРВЕРЕ — в файле pda_charts_presets.json рядом с db_config.json. Не в
+/// localStorage: desktop-оболочка поднимает сервер на эфемерном порту, origin
+/// получается новый на каждый запуск, и браузерное хранилище не пережило бы
+/// перезапуск pda-desktop.exe (тема окна по той же причине живёт в файле).
+/// «last» — автозапись текущего состава, её восстанавливаем при открытии;
+/// именованные наборы создаёт кнопка «💾 Сохранить набор».
+
+let chartSaveTimer = null;   // debounce автосохранения: drag группы — это десятки вызовов
+let chartSetsCache = [];     // последний список наборов (кнопка «📂 Загрузить набор»)
+// Пока вкладка не восстановлена с сервера, автосохранение молчит: иначе первый
+// addChartWindow() в init() успел бы записать пустой состав поверх сохранённого.
+let chartStateReady = false;
+
+function chartState() {
+    return {
+        windows: chartWindows.map(w => w.signals.map(s => s.tag.id)),
+        active: Math.max(0, chartWindows.findIndex(w => w.id === activeWindowId)),
+    };
+}
+
+/// Автосохранение «последнего состава» (ключ last). Пишется пакетом через
+/// 400 мс после последнего изменения, поэтому перетаскивание всей группы не
+/// превращается в череду запросов.
+function saveChartState() {
+    if (!chartStateReady) return;
+    clearTimeout(chartSaveTimer);
+    chartSaveTimer = setTimeout(() => {
+        apiPost('/api/charts/presets/save', chartState())
+            .catch(e => console.warn('chart preset save', e));
+    }, 400);
+}
+
+/// Применяет состав {windows, active}: досоздаёт окна, разложит сигналы,
+/// вернёт активное окно. Пустой/битый состав — молча ничего не делаем.
+async function applyChartPreset(data) {
+    const windows = data && Array.isArray(data.windows) ? data.windows : [];
+    if (!windows.length) return false;
+    for (let i = 0; i < windows.length; i++) {
+        if (i >= chartWindows.length) addChartWindow();
+        // addSignals работает с активным окном — переключаемся перед добавлением
+        selectChartWindow(chartWindows[i].id);
+        const ids = (Array.isArray(windows[i]) ? windows[i] : [])
+            .map(Number).filter(n => Number.isFinite(n) && n > 0);
+        // Удалённые из конфигурации теги пропустит сам addSignals (их нет в allTags)
+        if (ids.length) {
+            try { await addSignals(ids); } catch (e) { console.warn('chart preset apply', e); }
+        }
+    }
+    const back = chartWindows[data.active] || chartWindows[0];
+    if (back) selectChartWindow(back.id);
+    return true;
+}
+
+/// Восстановление при открытии вкладки: автосостав с сервера.
+async function restoreChartState() {
+    try {
+        const resp = await apiGet('/api/charts/presets');
+        chartSetsCache = (resp && resp.sets) || [];
+        await applyChartPreset(resp && resp.last);
+    } catch (e) {
+        console.warn('chart presets', e); // сервер не ответил — вкладка просто стартует пустой
+    } finally {
+        // Состав больше не живёт в браузере — старый ключ чистим заодно.
+        try { localStorage.removeItem('pda_charts_v1'); } catch (e) {}
+        // Дальше состав меняет пользователь — автосохранение включается.
+        chartStateReady = true;
+    }
+}
+
+// ------------------------------------------------------------- кнопки наборов
+/// «💾 Сохранить набор» — спрашивает имя и пишет именованный набор.
+function saveChartPresetDialog() {
+    const total = chartWindows.reduce((n, w) => n + w.signals.length, 0);
+    if (!total) return chartsStatusLine('Нечего сохранять: окна графиков пусты', true);
+    const def = chartSetsCache.length ? `Набор ${chartSetsCache.length + 1}` : 'Набор 1';
+    openModal(`<h3>Сохранить набор сигналов</h3>
+        <div class="modal-form-row"><label>Имя набора:</label>
+            <input id="cp-name" type="text" value="${treeAttr(def)}"></div>
+        <div class="modal-form-row"><label>Состав:</label><span>${chartWindows.length} окон, ${total} сигналов</span></div>
+        <div class="modal-btns"><button class="btn-del" onclick="closeModal()">Отмена</button>
+        <button class="btn-action" onclick="saveChartPreset()">Сохранить</button></div>`,
+        box => {
+            const inp = box.querySelector('#cp-name');
+            inp.focus();
+            inp.select();
+            inp.addEventListener('keydown', e => { if (e.key === 'Enter') saveChartPreset(); });
+        });
+}
+
+async function saveChartPreset() {
+    const inp = document.getElementById('cp-name');
+    const name = inp ? inp.value.trim() : '';
+    if (!name) return chartsStatusLine('Введите имя набора', true);
+    try {
+        await apiPost('/api/charts/presets/save', Object.assign({ name }, chartState()));
+        closeModal();
+        chartsStatusLine(`Набор «${name}» сохранён`);
+    } catch (e) { chartsStatusLine('Ошибка сохранения набора: ' + e.message, true); }
+}
+
+/// «📂 Загрузить набор» — список сохранённых наборов (свежий, с сервера).
+async function loadChartPresetDialog() {
+    try {
+        const resp = await apiGet('/api/charts/presets');
+        chartSetsCache = (resp && resp.sets) || [];
+    } catch (e) { return chartsStatusLine('Не удалось прочитать наборы: ' + e.message, true); }
+    if (!chartSetsCache.length)
+        return chartsStatusLine('Наборов нет. Сохраните текущий состав: «💾 Сохранить набор»', true);
+    const rows = chartSetsCache.map((s, i) => {
+        const when = s.saved_at ? new Date(s.saved_at).toLocaleString('ru-RU') : '';
+        return `<div class="modal-form-row"><label title="${treeAttr(s.saved_at || '')}">${escHtml(s.name)}</label>
+            <span>${s.signals} сигн.</span><span>${when}</span>
+            <button class="btn-action" onclick="applyChartSet(${i})">Загрузить</button>
+            <button class="btn-del" onclick="deleteChartSet(${i})" title="Удалить набор">✕</button></div>`;
+    }).join('');
+    openModal(`<h3>Загрузить набор сигналов</h3>${rows}
+        <div class="modal-btns"><button class="btn-action" onclick="closeModal()">Закрыть</button></div>`);
+}
+
+/// Набор заменяет текущий состав: лишние окна закрываем, оставшееся чистим.
+async function applyChartSet(i) {
+    const set = chartSetsCache[i];
+    if (!set) return;
+    closeModal();
+    while (chartWindows.length > 1) removeChartWindow(chartWindows[chartWindows.length - 1].id);
+    clearCharts();
+    const ok = await applyChartPreset(set);
+    chartsStatusLine(ok ? `Загружен набор «${set.name}»` : `Набор «${set.name}» пуст`, !ok);
+}
+
+async function deleteChartSet(i) {
+    const set = chartSetsCache[i];
+    if (!set) return;
+    if (!(await confirmBox(`Удалить набор «${set.name}»?`, { yes: 'Удалить', no: 'Отмена' }))) return;
+    try {
+        await apiPost('/api/charts/presets/delete', { name: set.name });
+        await loadChartPresetDialog(); // список перечитан и снова открыт
+    } catch (e) { chartsStatusLine('Ошибка удаления набора: ' + e.message, true); }
 }
 
 function fmtHoverValue(v) {
@@ -2299,6 +2446,7 @@ setInterval(refreshAppBadge, 5000);
     if (ioSearch) ioSearch.value = '';
     await fetchTags();
     addChartWindow();
+    await restoreChartState();
     connectLiveWs();
     refreshAppBadge();
     // Справочник драйверов нужен IO-вкладке сразу (конструкторы адресов)

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use pda_core::core::tag_registry::TagRegistry;
 use pda_core::database::db_service::{DatabaseService, DbConfig};
-use pda_core::drivers::driver_manager::DriverManager;
+use pda_core::drivers::driver_manager::{DriverManager, WatchdogConfig};
 use tokio::sync::{broadcast, RwLock};
 
 /// Период рассылки live-снимков в WebSocket (мс).
@@ -155,6 +155,32 @@ impl AppCore {
         }
         *self.db.write().await = new_db;
         Ok(())
+    }
+
+    /// Фоновая задача-супервизор: раз в `WatchdogConfig::tick_ms` проверяет
+    /// модули опроса и перезапускает те, что умерли (задача завершилась) или
+    /// долго не обменивались с устройством. Нужен потому, что переподключение
+    /// внутри цикла опроса помогает не всегда: Modbus-сервер с занятым портом
+    /// вообще не поднимается, а зависший сокет S7有时 держит сессию ПЛК.
+    pub fn spawn_watchdog(self: &Arc<Self>) {
+        let core = self.clone();
+        tokio::spawn(async move {
+            let cfg = WatchdogConfig::default();
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_millis(cfg.tick_ms));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                // В «только просмотр» модулей нет (список пуст) — не мешаем.
+                if core.is_view_only() {
+                    continue;
+                }
+                let restarted = core.manager.write().await.watchdog_tick(&cfg);
+                for m in restarted {
+                    tracing::warn!("[Watchdog] Автоперезапуск: {m}");
+                }
+            }
+        });
     }
 
     /// Фоновая задача: каждые LIVE_PUSH_MS мс отдаёт снимок реестра всем

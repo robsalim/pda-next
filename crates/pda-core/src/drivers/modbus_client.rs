@@ -336,6 +336,13 @@ pub async fn run_modbus_client(
             .map(|e| e.contains("timeout") || e.contains("connection") || e.contains("Connection"))
             .unwrap_or(false);
 
+        // Супервизору: цикл прошёл по живому транспорту (мягкие ошибки
+        // отдельных адресов и пустой план чтением не считаются).
+        if !transport_fault {
+            state.mark_ok();
+        }
+
+
         let now = Local::now();
         let mut values: HashMap<i64, f64> = HashMap::new();
         for t in &tags {

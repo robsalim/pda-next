@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use pda_core::database::db_service::{DatabaseService, DbConfig, DbConfigStore};
 use pda_core::models::{Connection, Tag};
 
+use crate::charts_preset;
 use crate::state::AppCore;
 
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -584,55 +585,85 @@ pub async fn series(
         },
     };
 
-    // Виртуальные теги считаем из историй их операндов; реальные операнды
-    // добавляем к окну чтения, чтобы не делать второй заход в БД.
+    // Виртуальные теги не пишутся в журнал — их прошлое считается из историй
+    // операндов (virtual_calc::eval_history).
+    //
+    // uPlot строит все серии графика по ОДНОМУ общему массиву X (он берётся от
+    // первой серии), поэтому времени-сетки в пределах одного ответа обязаны
+    // совпадать побакетно. Решение о прореживании принимается один раз на окно
+    // внутри get_series_window, и операнды читаются тем же пакетом, что и
+    // обычные сигналы: отдельное чтение дало бы свой bucket (окно длиннее на
+    // AVG-запас и 1 мс) — кривые разъехались бы по X при зуме и сдвиге.
+    //
+    // Окно чтения расширяем влево на максимальное окно AVG и вправо на 1 мс
+    // (границы окон усечены до мс, журнал хранит микросекунды — точка ровно на
+    // границе оказалась бы за окном). Расширение возвращается назад одинаковым
+    // для всех серий фильтром по [start_ms; end_ms].
+    //
+    // Операнды НЕ исключаются из чтения, даже когда тот же тег запрошен как
+    // обычный сигнал: раньше их выкидывали из «виртуального» пакета, виртуал от
+    // добавленного на этот же график тега оставался без операнда и возвращался
+    // пустым, а фронт при пустом ответе держит прежние точки — «сигнал едет
+    // влево, а виртуал стоит».
     let idx = build_virtual_index(&db).await?;
     let virt_wanted: Vec<i64> = tag_ids.iter().copied().filter(|id| idx.virt.contains_key(id)).collect();
     let real_wanted: Vec<i64> = tag_ids.iter().copied().filter(|id| !idx.virt.contains_key(id)).collect();
-    let mut read_ids = real_wanted.clone();
-    // Для виртуалов с AVG читаем операнды с запасом влево на размер окна.
-    let virt_start = if virt_wanted.is_empty() {
-        start_dt
+    let operands = idx.operand_ids(&virt_wanted);
+
+    let has_virt = !virt_wanted.is_empty();
+    let lead_ms = if has_virt { idx.avg_lead_ms(&virt_wanted).max(0) } else { 0 };
+    let read_start = start_dt - chrono::Duration::milliseconds(lead_ms);
+    let read_end = if has_virt {
+        end_dt + chrono::Duration::milliseconds(1)
     } else {
-        let lead_ms = idx.avg_lead_ms(&virt_wanted).max(0);
-        start_dt - chrono::Duration::milliseconds(lead_ms)
+        end_dt
     };
-    if !virt_wanted.is_empty() {
-        for op in idx.operand_ids(&virt_wanted) {
-            if !read_ids.contains(&op) {
-                read_ids.push(op);
-            }
+
+    let mut read_ids = real_wanted.clone();
+    for op in &operands {
+        if !read_ids.contains(op) {
+            read_ids.push(*op);
         }
     }
 
     let window = if read_ids.is_empty() {
         Vec::new()
     } else {
-        db.get_series_window(&read_ids, virt_start, end_dt).await?
+        db.get_series_window(&read_ids, read_start, read_end).await?
     };
-    // Точки операндов до virt_start нужны только для AVG — наружу (в реальные
-    // серии) они не попадают, window фильтруется ниже по real_wanted.
+
     let start_ms = start_dt.timestamp_millis();
+    let end_ms = end_dt.timestamp_millis();
+    // Окно наружу срезаем только когда чтение расширяли — иначе поведение
+    // чисто реальных графиков остаётся прежним (первый бакет сетки может лежать
+    // левее start).
+    let to_ms = |sec: f64| (sec * 1000.0).round() as i64;
+    let in_window = |sec: f64| !has_virt || {
+        let ms = to_ms(sec);
+        ms >= start_ms && ms <= end_ms
+    };
+
     let mut series: Vec<Value> = window
         .iter()
         .filter(|(id, _)| real_wanted.contains(id))
         .map(|(tag_id, points)| {
-            let (times, values): (Vec<f64>, Vec<f64>) = points_payload(points.clone()).into_iter().unzip();
+            let (times, values): (Vec<f64>, Vec<f64>) = points_payload(points.clone())
+                .into_iter()
+                .filter(|(sec, _)| in_window(*sec))
+                .unzip();
             json!({ "tag_id": tag_id, "times": times, "values": values })
         })
         .collect();
 
-    if !virt_wanted.is_empty() {
-        // Сырые точки операндов из окна чтения (уже прочитано выше).
+    if has_virt {
+        // Сетка операндов — та же, что у реальных серий этого ответа.
         let mut real_hist: std::collections::BTreeMap<i64, Vec<(i64, f64)>> = Default::default();
-        for (id, points) in &window {
-            if !real_wanted.contains(id) {
-                let pts = points_payload(points.clone())
-                    .into_iter()
-                    .map(|(sec, v)| ((sec * 1000.0).round() as i64, v))
-                    .collect();
-                real_hist.insert(*id, pts);
-            }
+        for (id, points) in window.iter().filter(|(id, _)| operands.contains(id)) {
+            let pts: Vec<(i64, f64)> = points_payload(points.clone())
+                .into_iter()
+                .map(|(sec, v)| (to_ms(sec), v))
+                .collect();
+            real_hist.insert(*id, pts);
         }
         let virt_out = pda_core::core::virtual_calc::eval_history(
             &virt_wanted,
@@ -642,7 +673,7 @@ pub async fn series(
         for (tag_id, s) in virt_out {
             let (times, values): (Vec<f64>, Vec<f64>) = s
                 .into_iter()
-                .filter(|(t, _)| *t >= start_ms)
+                .filter(|(t, _)| *t >= start_ms && *t <= end_ms)
                 .map(|(t, v)| (t as f64 / 1000.0, v))
                 .unzip();
             series.push(json!({ "tag_id": tag_id, "times": times, "values": values }));
@@ -775,6 +806,60 @@ pub async fn set_polling(
         "view_only": view_only,
         "running": running,
     }))
+}
+
+// ------------------------------------------------- наборы сигналов на Charts
+//
+// Хранятся на сервере (файл рядом с db_config.json), а не в localStorage:
+// desktop поднимает сервер на эфемерном порту, origin каждый запуск новый, и
+// браузерное хранилище не переживает перезапуск приложения.
+
+/// Файл наборов текущего экземпляра приложения.
+fn presets_file(core: &AppCore) -> std::path::PathBuf {
+    charts_preset::presets_path(&core.db_config_path)
+}
+
+/// Что уже сохранено: автосостав (`last`) + именованные наборы (`sets`).
+pub async fn chart_presets(State(core): State<Arc<AppCore>>) -> Json<Value> {
+    Json(charts_preset::list(&presets_file(&core)))
+}
+
+#[derive(serde::Deserialize)]
+pub struct PresetBody {
+    /// Пусто/нет — записать автосостав (`last`), иначе — именованный набор.
+    #[serde(default)]
+    pub name: String,
+    pub windows: Value,
+    #[serde(default)]
+    pub active: Value,
+}
+
+/// Сохранить набор. Тот же ручка для автосохранения (без имени) и для кнопки
+/// «💾 Сохранить набор» (с именем, перезапись по имени).
+pub async fn save_chart_preset(
+    State(core): State<Arc<AppCore>>,
+    Json(b): Json<PresetBody>,
+) -> ApiResult<Json<Value>> {
+    let body = json!({ "windows": b.windows, "active": b.active });
+    match charts_preset::put(&presets_file(&core), &b.name, &body) {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err(ApiError(format!("Не сохранить набор: {e}"))),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct PresetName {
+    pub name: String,
+}
+
+pub async fn delete_chart_preset(
+    State(core): State<Arc<AppCore>>,
+    Json(b): Json<PresetName>,
+) -> ApiResult<Json<Value>> {
+    match charts_preset::remove(&presets_file(&core), &b.name) {
+        Ok(removed) => Ok(Json(json!({ "ok": true, "removed": removed }))),
+        Err(e) => Err(ApiError(format!("Не удалить набор: {e}"))),
+    }
 }
 
 // ---------------------------------------------------------------- IO: подключения
@@ -1651,6 +1736,9 @@ pub fn router(core: Arc<AppCore>) -> Router {
         .route("/status", get(status))
         .route("/retention", post(set_retention))
         .route("/polling", post(set_polling))
+        .route("/charts/presets", get(chart_presets))
+        .route("/charts/presets/save", post(save_chart_preset))
+        .route("/charts/presets/delete", post(delete_chart_preset))
         .route("/connections", get(connections).post(add_connection))
         .route(
             "/connections/:id",

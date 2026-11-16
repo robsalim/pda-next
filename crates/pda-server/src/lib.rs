@@ -7,6 +7,7 @@
 //!                       в нативном окне (WebView2), без отдельного exe.
 
 pub mod api;
+pub mod charts_preset;
 pub mod state;
 pub mod ws;
 
