@@ -1,22 +1,22 @@
 //! Наборы сигналов на вкладке Charts — хранение на стороне сервера.
 //!
-//! Почему не localStorage фронтенда: desktop-оболочка поднимает сервер на
-//! эфемерном порту (`127.0.0.1:0`), а localStorage изолирован по origin
-//! (host:port). Значит при каждом запуске `pda-desktop.exe` браузерное
-//! хранилище оказывается новым — состав «слетает» при перезапуске. Тот же
-//! приём, что уже применён к теме окна и ручным паузам драйверов, — файл рядом
-//! с `db_config.json`: переживает рестарт процесса, перезагрузку ПК, смену
-//! порта и любой браузер, открывший интерфейс.
+//! Хранилище общее для всех клиентов: файл лежит рядом с `db_config.json` и
+//! доступен любому браузеру, открывшему интерфейс этого сервера. Не
+//! localStorage: desktop-оболочка поднимает сервер на эфемерном порту
+//! (`127.0.0.1:0`), а localStorage изолирован по origin (host:port), поэтому
+//! браузерное хранилище не пережило бы перезапуск `pda-desktop.exe`.
 //!
-//! Формат файла `pda_charts_presets.json`:
+//! В хранилище только именованные наборы, сохранённые кнопкой
+//! «💾 Сохранить набор». Текущий состав НЕ автозаписывается: старт и
+//! обновление вкладки — пустой график, выбор одного клиента не меняет экран
+//! другим. Файл `pda_charts_presets.json`:
 //! ```json
 //! {
-//!   "last":  { "windows": [[12, 40], [3]], "active": 0, "saved_at": "..." },
 //!   "named": { "Цех 1 — линия": { "windows": [[12]], "active": 0, "saved_at": "..." } }
 //! }
 //! ```
-//! `last` — автозапись текущего состава (восстанавливается при открытии),
-//! `named` — наборы, сохранённые кнопкой «💾 Сохранить набор».
+//! Ключ `last` (старое автосохранилище состава) больше не пишется и
+//! игнорируется при чтении — файлы прошлых версий совместимы.
 
 use std::path::{Path, PathBuf};
 
@@ -24,8 +24,9 @@ use serde_json::{json, Value};
 
 /// Имя файла наборов (рядом с db_config.json).
 pub const PRESET_FILE: &str = "pda_charts_presets.json";
-/// Ключ автосохранения: состав, который восстановить при старте.
-pub const LAST_KEY: &str = "last";
+/// Устаревший ключ автосохранения состава. Больше не пишется; удаляется из
+/// файлов старых версий при первой записи набора.
+const LAST_KEY: &str = "last";
 
 /// Разумные пределы: состав приходит из UI, но файл правится и руками.
 const MAX_WINDOWS: usize = 32;
@@ -128,7 +129,7 @@ fn clean_name(name: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-/// Список для кнопки «📂 Загрузить набор»: последний состав + именованные.
+/// Список для кнопки «📂 Загрузить набор»: только именованные наборы.
 pub fn list(path: &Path) -> Value {
     let _g = STORE_LOCK.lock().ok();
     let store = load(path);
@@ -161,31 +162,27 @@ pub fn list(path: &Path) -> Value {
     sets.sort_by(|a, b| {
         a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
     });
-    json!({
-        "last": store.get(LAST_KEY).cloned().unwrap_or(Value::Null),
-        "sets": sets,
-    })
+    json!({ "sets": sets })
 }
 
-/// Сохранить состав. Пустое имя — в `last` (автосостав), иначе — в именованные
-/// (перезапись по имени — ожидаемое поведение кнопки «Сохранить»).
+/// Сохранить именованный набор (перезапись по имени — ожидаемое поведение
+/// кнопки «Сохранить»). Пустого имени больше нет: это было автосоздание
+/// общего «last» состава, из-за которого клиенты перезаписывали экран друг
+/// друга.
 pub fn put(path: &Path, name: &str, data: &Value) -> Result<Value, String> {
     let clean = sanitize(data)?;
-    let name = if name.trim().is_empty() {
-        None
-    } else {
-        Some(clean_name(name)?)
-    };
+    let name = clean_name(name)?;
     let _g = STORE_LOCK.lock().ok();
     let mut store = load(path);
-    match &name {
-        None => store[LAST_KEY] = clean.clone(),
-        Some(n) => store["named"][n] = clean.clone(),
+    store["named"][&name] = clean.clone();
+    // Старое автосохранилище вычищаем при первой записи — оно больше не нужно.
+    if let Some(obj) = store.as_object_mut() {
+        obj.remove(LAST_KEY);
     }
     save(path, &store)?;
     Ok(json!({
         "ok": true,
-        "name": name.clone().unwrap_or_else(|| LAST_KEY.to_string()),
+        "name": name,
         "saved_at": clean["saved_at"],
     }))
 }
@@ -226,18 +223,19 @@ mod tests {
     }
 
     #[test]
-    fn last_and_named_coexist_in_one_file() {
+    fn only_named_sets_are_stored() {
         let path = tmp_file("mix");
         let _ = std::fs::remove_file(&path);
         assert!(list(&path)["sets"].as_array().unwrap().is_empty(), "первый запуск пуст");
-        assert!(list(&path)["last"].is_null());
+        assert!(list(&path).get("last").is_none(), "автосостава больше нет в ответе");
 
-        put(&path, "", &json!({"windows": [[1]], "active": 0})).unwrap();
+        // Пустое имя (бывшее автосохранение last) теперь запрещено.
+        assert!(put(&path, "", &json!({"windows": [[1]], "active": 0})).is_err());
+
         put(&path, "Цех 1", &json!({"windows": [[2, 3]], "active": 0})).unwrap();
         put(&path, "Цех 2", &json!({"windows": [[4]], "active": 0})).unwrap();
 
         let l = list(&path);
-        assert_eq!(l["last"]["windows"], json!([[1]]), "автосостав отдельно от именованных");
         let names: Vec<&str> = l["sets"]
             .as_array()
             .unwrap()
@@ -256,7 +254,20 @@ mod tests {
         assert!(!remove(&path, "Цех 1").unwrap(), "повторное удаление — просто false");
         assert_eq!(list(&path)["sets"].as_array().unwrap().len(), 1);
 
-        // Пустое имя зарезервировано за автосоставом.
+        // Файл от старой версии с ключом last: при записи он вычищается,
+        // а именованные наборы прочитались бы и до записи.
+        std::fs::write(
+            &path,
+            r#"{"last":{"windows":[[7]]},"named":{"Старый":{"windows":[[8]],"active":0}}}"#,
+        )
+        .unwrap();
+        assert_eq!(list(&path)["sets"].as_array().unwrap().len(), 1, "старый last не мешает");
+        put(&path, "Новый", &json!({"windows": [[1]], "active": 0})).unwrap();
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw.get("last").is_none(), "устаревший last удалён из файла");
+        assert_eq!(raw["named"].as_object().unwrap().len(), 2);
+
+        // Пустое имя зарезервировано, управляющие символы — ошибка.
         assert!(clean_name("   ").is_err());
         assert!(clean_name("a\u{1}b").is_err());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

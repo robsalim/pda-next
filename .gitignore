@@ -17,6 +17,7 @@ dist/
 *.log
 check_out.txt
 db_config.json
+pda_charts_presets.json
 *.db
 *.db-shm
 *.db-wal

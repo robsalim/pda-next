@@ -810,23 +810,24 @@ pub async fn set_polling(
 
 // ------------------------------------------------- наборы сигналов на Charts
 //
-// Хранятся на сервере (файл рядом с db_config.json), а не в localStorage:
-// desktop поднимает сервер на эфемерном порту, origin каждый запуск новый, и
-// браузерное хранилище не переживает перезапуск приложения.
+// Общее для всех клиентов хранилище именованных наборов: файл на сервере
+// (рядом с db_config.json), а не в localStorage. Текущий состав не
+// автосохраняется — старт/обновление вкладки пустое, выбор одного клиента не
+// мешает другим.
 
 /// Файл наборов текущего экземпляра приложения.
 fn presets_file(core: &AppCore) -> std::path::PathBuf {
     charts_preset::presets_path(&core.db_config_path)
 }
 
-/// Что уже сохранено: автосостав (`last`) + именованные наборы (`sets`).
-pub async fn chart_presets(State(core): State<Arc<AppCore>>) -> Json<Value> {
-    Json(charts_preset::list(&presets_file(&core)))
+/// Что уже сохранено: именованные наборы (`sets`).
+pub async fn chart_presets(State(core): State<Arc<AppCore>>) -> ApiResult<Json<Value>> {
+    Ok(Json(charts_preset::list(&presets_file(&core))))
 }
 
 #[derive(serde::Deserialize)]
 pub struct PresetBody {
-    /// Пусто/нет — записать автосостав (`last`), иначе — именованный набор.
+    /// Обязательное имя именованного набора (перезапись по имени).
     #[serde(default)]
     pub name: String,
     pub windows: Value,
@@ -834,8 +835,7 @@ pub struct PresetBody {
     pub active: Value,
 }
 
-/// Сохранить набор. Тот же ручка для автосохранения (без имени) и для кнопки
-/// «💾 Сохранить набор» (с именем, перезапись по имени).
+/// Сохранить именованный набор кнопкой «💾 Сохранить набор».
 pub async fn save_chart_preset(
     State(core): State<Arc<AppCore>>,
     Json(b): Json<PresetBody>,

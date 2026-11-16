@@ -566,41 +566,44 @@ async fn view_only_stops_journal_writes() {
     let _ = h.tmp.path();
 }
 
-/// Наборы сигналов Charts: автосостав (`last`) и именованные наборы живут в
-/// файле рядом с db_config.json — на сервере, а не в localStorage браузера
-/// (origin desktop-окна меняется из-за эфемерного порта).
+/// Наборы сигналов Charts: именованные наборы живут в файле рядом с
+/// db_config.json — на сервере, а не в localStorage браузера (origin
+/// desktop-окна меняется из-за эфемерного порта). Текущий состав не
+/// автосохраняется: пустое имя — ошибка, ключ `last` из старых файлов удаляется.
 #[tokio::test(flavor = "multi_thread")]
 async fn chart_presets_roundtrip() {
     let h = Harness::start().await;
 
     // До первой записи — пусто, но не ошибка.
     let empty = h.get_json("/api/charts/presets").await;
-    assert!(empty["last"].is_null(), "первый запуск без автосостава: {empty}");
     assert!(empty["sets"].as_array().unwrap().is_empty());
+    assert!(empty.get("last").is_none(), "автосостава больше нет в ответе");
 
-    // Автосостав (без имени) — два окна, активное второе.
+    // Именованный набор — два окна, активное второе.
     h.post_json(
         "/api/charts/presets/save",
-        json!({ "windows": [[12, 40], [7]], "active": 1 }),
-    )
-    .await;
-    let list = h.get_json("/api/charts/presets").await;
-    assert_eq!(list["last"]["windows"], json!([[12, 40], [7]]));
-    assert_eq!(list["last"]["active"], 1);
-    assert!(list["last"]["saved_at"].is_string(), "время сохранения видно");
-
-    // Именованный набор — рядом с автосоставом, не вместо него.
-    h.post_json(
-        "/api/charts/presets/save",
-        json!({ "name": "Цех 1 — линия", "windows": [[5]], "active": 0 }),
+        json!({ "name": "Цех 1 — линия", "windows": [[12, 40], [3]], "active": 1 }),
     )
     .await;
     let list = h.get_json("/api/charts/presets").await;
     let sets = list["sets"].as_array().unwrap();
     assert_eq!(sets.len(), 1, "именованный набор в списке: {list}");
     assert_eq!(sets[0]["name"], "Цех 1 — линия");
-    assert_eq!(sets[0]["signals"], 1, "размер набора для подписи в UI");
-    assert_eq!(list["last"]["windows"], json!([[12, 40], [7]]), "автосостав не потерян");
+    assert_eq!(sets[0]["windows"], json!([[12, 40], [3]]));
+    assert_eq!(sets[0]["active"], 1);
+    assert_eq!(sets[0]["signals"], 3, "размер набора для подписи в UI");
+    assert!(sets[0]["saved_at"].is_string(), "время сохранения видно");
+
+    // Автосостав (пустое имя) больше не принимается — иначе клиенты
+    // перезаписывали бы экран друг друга.
+    let aut = h
+        .http
+        .post(format!("{}/api/charts/presets/save", h.base))
+        .json(&json!({ "windows": [[1]], "active": 0 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(aut.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
 
     // Файл — рядом с db_config.json, то есть переживает перезапуск приложения.
     let file = h.tmp.path().join("pda_charts_presets.json");
@@ -610,20 +613,37 @@ async fn chart_presets_roundtrip() {
     let bad = h
         .http
         .post(format!("{}/api/charts/presets/save", h.base))
-        .json(&json!({ "windows": "не список" }))
+        .json(&json!({ "name": "мусор", "windows": "не список" }))
         .send()
         .await
         .unwrap();
     assert_eq!(bad.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
 
-    // Удаление именованного набора; автосостав остаётся.
+    // Старый файл с ключом last: перечитывается, last игнорируется и вычищается.
+    std::fs::write(
+        &file,
+        r#"{"last":{"windows":[[7]]},"named":{"Цех 1 — линия":{"windows":[[5]],"active":0}}}"#,
+    )
+    .unwrap();
+    let l = h.get_json("/api/charts/presets").await;
+    assert!(l.get("last").is_none(), "last больше не отдаётся");
+    assert_eq!(l["sets"].as_array().unwrap().len(), 1);
+    h.post_json(
+        "/api/charts/presets/save",
+        json!({ "name": "Цех 1 — линия", "windows": [[6]], "active": 0 }),
+    )
+    .await;
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert!(raw.get("last").is_none(), "устаревший last удалён из файла");
+
+    // Удаление именованного набора.
     let del = h
         .post_json("/api/charts/presets/delete", json!({ "name": "Цех 1 — линия" }))
         .await;
     assert_eq!(del["removed"], true);
     let list = h.get_json("/api/charts/presets").await;
     assert!(list["sets"].as_array().unwrap().is_empty());
-    assert!(!list["last"].is_null());
 
     h.stop().await;
 }

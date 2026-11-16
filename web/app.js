@@ -1244,7 +1244,6 @@ function selectChartWindow(id) {
     document.querySelectorAll('.chart-window').forEach(box => box.classList.toggle('active', Number(box.dataset.windowId) === id));
     // Курсоры у каждого окна свои — в шапке показываем значения активного окна.
     if (activeTab === 'charts') refreshHeaderCursors();
-    saveChartState();
 }
 
 function removeChartWindow(id) {
@@ -1256,7 +1255,6 @@ function removeChartWindow(id) {
     document.querySelector(`.chart-window[data-window-id="${id}"]`)?.remove();
     chartWindows.splice(index, 1);
     if (activeWindowId === id) selectChartWindow(chartWindows[Math.max(0, index - 1)].id);
-    saveChartState();
 }
 
 /// Пакетное добавление сигналов на график активного окна: один batch-запрос
@@ -1292,7 +1290,6 @@ async function addSignals(tagIds) {
         if (win.fullT1 == null || resp.t_end > win.fullT1) win.fullT1 = resp.t_end;
         win.zoomed = false;   // новый состав — вписываем весь интервал
         rebuildChartWindow(win, true);
-        saveChartState();
         if (document.getElementById('charts-mode').value === 'Archive') loadArchOverview();
         // Видимая обратная связь: сколько добавлено и сколько без данных.
         const msg = `Добавлено: ${added}` + (empty ? ` (нет данных: ${empty})` : '');
@@ -1345,7 +1342,6 @@ function removeSignal(tagId) {
     if (!win) return;
     win.signals = win.signals.filter(s => s.tag.id !== tagId);
     rebuildChartWindow(win);
-    saveChartState();
 }
 
 function clearCharts() {
@@ -1353,41 +1349,24 @@ function clearCharts() {
     if (!win) return;
     win.signals = [];
     rebuildChartWindow(win);
-    saveChartState();
 }
 
 // ---------------------------------------------------------- состав Charts
-/// Состав вкладке Charts (какие окна открыты и какие сигналы в каждом) хранится
-/// НА СЕРВЕРЕ — в файле pda_charts_presets.json рядом с db_config.json. Не в
-/// localStorage: desktop-оболочка поднимает сервер на эфемерном порту, origin
-/// получается новый на каждый запуск, и браузерное хранилище не пережило бы
-/// перезапуск pda-desktop.exe (тема окна по той же причине живёт в файле).
-/// «last» — автозапись текущего состава, её восстанавливаем при открытии;
-/// именованные наборы создаёт кнопка «💾 Сохранить набор».
+/// Хранилище наборов Charts — НА СЕРВЕРЕ, в файле pda_charts_presets.json
+/// рядом с db_config.json: общее для всех клиентов и независимое от origin
+/// (desktop поднимает сервер на эфемерном порту, localStorage бы не пережил
+/// перезапуск). Но это хранилище ИМЕНОВАННЫХ наборов — текущий состав нигде
+/// не автозаписывается: при открытии и обновлении страница вкладка пустая,
+/// каждый клиент работает со своим составом и не мешает другим.
+/// «💾 Сохранить набор» / «📂 Загрузить набор» — общие наборы на всех.
 
-let chartSaveTimer = null;   // debounce автосохранения: drag группы — это десятки вызовов
 let chartSetsCache = [];     // последний список наборов (кнопка «📂 Загрузить набор»)
-// Пока вкладка не восстановлена с сервера, автосохранение молчит: иначе первый
-// addChartWindow() в init() успел бы записать пустой состав поверх сохранённого.
-let chartStateReady = false;
 
 function chartState() {
     return {
         windows: chartWindows.map(w => w.signals.map(s => s.tag.id)),
         active: Math.max(0, chartWindows.findIndex(w => w.id === activeWindowId)),
     };
-}
-
-/// Автосохранение «последнего состава» (ключ last). Пишется пакетом через
-/// 400 мс после последнего изменения, поэтому перетаскивание всей группы не
-/// превращается в череду запросов.
-function saveChartState() {
-    if (!chartStateReady) return;
-    clearTimeout(chartSaveTimer);
-    chartSaveTimer = setTimeout(() => {
-        apiPost('/api/charts/presets/save', chartState())
-            .catch(e => console.warn('chart preset save', e));
-    }, 400);
 }
 
 /// Применяет состав {windows, active}: досоздаёт окна, разложит сигналы,
@@ -1411,20 +1390,11 @@ async function applyChartPreset(data) {
     return true;
 }
 
-/// Восстановление при открытии вкладки: автосостав с сервера.
-async function restoreChartState() {
-    try {
-        const resp = await apiGet('/api/charts/presets');
-        chartSetsCache = (resp && resp.sets) || [];
-        await applyChartPreset(resp && resp.last);
-    } catch (e) {
-        console.warn('chart presets', e); // сервер не ответил — вкладка просто стартует пустой
-    } finally {
-        // Состав больше не живёт в браузере — старый ключ чистим заодно.
-        try { localStorage.removeItem('pda_charts_v1'); } catch (e) {}
-        // Дальше состав меняет пользователь — автосохранение включается.
-        chartStateReady = true;
-    }
+/// При открытии вкладки ничего не восстанавливаем (пустой состав по умолчанию)
+/// — только чистим ключи старых версий: автосостав living в localStorage
+/// (pda_charts_v1) и на сервере (last).
+function resetLegacyChartState() {
+    try { localStorage.removeItem('pda_charts_v1'); } catch (e) {}
 }
 
 // ------------------------------------------------------------- кнопки наборов
@@ -2446,7 +2416,7 @@ setInterval(refreshAppBadge, 5000);
     if (ioSearch) ioSearch.value = '';
     await fetchTags();
     addChartWindow();
-    await restoreChartState();
+    resetLegacyChartState();
     connectLiveWs();
     refreshAppBadge();
     // Справочник драйверов нужен IO-вкладке сразу (конструкторы адресов)
