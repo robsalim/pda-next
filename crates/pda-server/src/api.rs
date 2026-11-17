@@ -1451,14 +1451,27 @@ pub async fn export_file(
 
 // ---------------------------------------------------------------- шрифт с кириллицей
 
-/// Пытается загрузить DejaVuSans.ttf (поддерживает кириллицу) из каталога fonts/
-/// рядом с ejecutable. Возвращает PdfFontHandle или None — тогда будет Helvetica.
+/// Пытается загрузить шрифт с поддержкой кириллицы (DejaVuSans.ttf).
+/// Ищет в нескольких местах: fonts/ рядом с exe, системные шрифты Windows,
+/// рабочая директория. Возвращает PdfFontHandle или None — тогда Helvetica.
 fn load_cyrillic_font(doc: &mut printpdf::PdfDocument) -> Option<printpdf::PdfFontHandle> {
-    for path in ["fonts/DejaVuSans.ttf", "./fonts/DejaVuSans.ttf"] {
-        if let Ok(bytes) = std::fs::read(path) {
-            if let Some(font) = ParsedFont::from_bytes(&bytes, 0, &mut Vec::new()) {
-                let font_id = doc.add_font(&font);
-                return Some(printpdf::PdfFontHandle::External(font_id));
+    let font_names = ["DejaVuSans.ttf", "dejavusans.ttf", "DejaVuSansCondensed.ttf"];
+    let current_dir = std::env::current_dir().unwrap_or_default().to_string_lossy().to_string();
+    let search_dirs = [
+        "fonts",
+        "./fonts",
+        "C:/Windows/Fonts",
+        "C:/WINNT/Fonts",
+        current_dir.as_str(),
+    ];
+    for dir in &search_dirs {
+        for name in &font_names {
+            let path = format!("{dir}/{name}");
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Some(font) = ParsedFont::from_bytes(&bytes, 0, &mut Vec::new()) {
+                    let font_id = doc.add_font(&font);
+                    return Some(printpdf::PdfFontHandle::External(font_id));
+                }
             }
         }
     }
@@ -1572,12 +1585,14 @@ pub async fn export_pdf(
     }
 
     // 2) Параметры страницы: A4 landscape 297×210 мм.
+    //    Минимальные поля, чтобы график занимал почти всю страницу.
     let mm_to_pt = 2.834_646_f32;
     let page_w_mm = 297_f32;
     let page_h_mm = 210_f32;
     let page_w = page_w_mm * mm_to_pt;
     let page_h = page_h_mm * mm_to_pt;
-    let margin = 15_f32 * mm_to_pt;
+    let margin = 6_f32 * mm_to_pt;   // ~17 pt — узкие поля
+    let table_reserve_h = 55.0;      // место под таблицу сигналов снизу
 
     let mut doc = printpdf::PdfDocument::new(&format!("PDA Next — {doc_title}"));
 
@@ -1623,8 +1638,10 @@ pub async fn export_pdf(
         });
 
         let chart_area_w = page_w - margin * 2.0;
+        // Доступная высота под графики (с учётом заголовка и таблицы снизу)
+        let _avail_h = page_h - margin * 2.0 - table_reserve_h - 10.0;
 
-        let mut y_cursor = page_h - margin - 20.0;
+        let mut y_cursor = page_h - margin - 8.0;
         let mut page_charts: Vec<usize> = Vec::new();
 
         // Подбираем графики, которые помещаются на эту страницу
@@ -1632,10 +1649,10 @@ pub async fn export_pdf(
             let page = &charts[chart_pos];
             let aspect = page.chart_h / page.chart_w;
             let chart_h_pt = chart_area_w * aspect;
-            let title_h = 18.0;
-            let block_h = title_h + chart_h_pt + 6.0;
+            let title_h = 14.0;
+            let block_h = title_h + chart_h_pt + 4.0;
 
-            if y_cursor - block_h < margin + 60.0 && !page_charts.is_empty() {
+            if y_cursor - block_h < table_reserve_h && !page_charts.is_empty() {
                 break;
             }
 
@@ -1650,18 +1667,17 @@ pub async fn export_pdf(
         }
 
         // Рисуем все графики этой страницы
-        let mut draw_y = page_h - margin - 20.0;
+        let mut draw_y = page_h - margin - 8.0;
         for &ci in &page_charts {
             let page = &charts[ci];
             let img_rgba = image::load_from_memory(&page.png)
                 .map_err(|e| ApiError(format!("chart_{ci} некорректный PNG: {e}")))?
                 .to_rgba8();
             let (img_w, img_h) = (img_rgba.width() as usize, img_rgba.height() as usize);
-            let aspect = page.chart_h / page.chart_w;
-            let _chart_h_pt = chart_area_w * aspect;
-            let title_h = 17.0;
+            let _aspect = page.chart_h / page.chart_w;
+            let title_h = 13.0;
 
-            // Заголовок графика
+            // Заголовок графика (компактный)
             let page_title = if page.title.is_empty() {
                 format!("График {}", ci + 1)
             } else {
@@ -1673,7 +1689,7 @@ pub async fn export_pdf(
             });
             ops.push(printpdf::Op::SetFont {
                 font: title_font.clone(),
-                size: printpdf::Pt(11.0),
+                size: printpdf::Pt(10.0),
             });
             ops.push(printpdf::Op::SetTextCursor {
                 pos: printpdf::Point {
@@ -1686,11 +1702,13 @@ pub async fn export_pdf(
             });
             ops.push(printpdf::Op::EndTextSection);
 
-            // PNG графика (высота берётся из реального размера окна на экране)
-            draw_y -= title_h + 4.0;
-            let scale = (chart_area_w / img_w as f32).min((draw_y - margin) / img_h as f32);
-            let draw_x = margin + (chart_area_w - img_w as f32 * scale) / 2.0;
-            let img_draw_y = margin + (draw_y - margin - img_h as f32 * scale) / 2.0;
+            // PNG графика — берём максимум по ширине и высоте (как на экране)
+            draw_y -= title_h + 3.0;
+            let max_img_h = draw_y - table_reserve_h; // до зарезервированного места под таблицу
+            let scale = (chart_area_w / img_w as f32).min(max_img_h / img_h as f32);
+            let draw_x = margin; // по левому краю
+            // В PDF origin — левый НИЖНИЙ угол, картинка рисуется от её левого нижнего угла
+            let img_draw_y = draw_y - img_h as f32 * scale;
 
             let raw = printpdf::RawImage {
                 pixels: printpdf::RawImageData::U8(img_rgba.into_raw()),
@@ -1713,11 +1731,11 @@ pub async fn export_pdf(
                 },
             });
 
-            draw_y = img_draw_y - 5.0;
+            draw_y = img_draw_y + img_h as f32 * scale + 4.0;
         } // конец цикла по графикам страницы
 
         // Таблица сигналов внизу страницы (общая для всех графиков на странице)
-        let table_top = margin - 8.0;
+        let table_top = margin + table_reserve_h;
         let row_h = 13.0;
         let all_names: Vec<&String> = page_charts.iter().map(|&ci| &charts[ci].legend_names).flat_map(|v| v.iter()).collect();
         let all_colors: Vec<&String> = page_charts.iter().map(|&ci| &charts[ci].legend_colors).flat_map(|v| v.iter()).collect();
