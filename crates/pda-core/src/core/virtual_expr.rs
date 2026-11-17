@@ -11,7 +11,7 @@
 //! * /               умножение/деление
 //! ! - (унарн.)      отрицание, логическое НЕ
 //! ()                группировка
-//! AVG([id], ms)     скользящее среднее сигнала за окно миллисекунд
+//! AVG([id], ms)     экспоненциальное сглаживание сигнала (τ = ms)
 //! ```
 //!
 //! Числа и результаты — f64; логические/сравнения дают 1.0 (истина) или 0.0
@@ -19,9 +19,13 @@
 
 use std::collections::HashSet;
 
-/// Верхняя граница окна AVG, мс (10 минут): ограничивает живые буферы
-/// вычислителя и размер расширенного окна чтения истории.
-pub const MAX_AVG_WINDOW_MS: f64 = 600_000.0;
+/// Верхняя граница постоянной времени AVG, мс (10 минут): ограничивает
+/// состояние сглаживания вычислителя и размер расширенного окна истории.
+pub const MAX_AVG_TAU_MS: f64 = 600_000.0;
+
+/// Во сколько раз τ нужно расширить чтение истории, чтобы экспоненциальное
+/// сглаживание прогрелось: 1-e^-4 ≈ 98% веса приходится на прочитанный участок.
+pub const EMA_WARMUP: f64 = 4.0;
 
 /// Узел абстрактного синтаксиса.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,9 +48,9 @@ pub enum Node {
     Ne(Box<Node>, Box<Node>),
     And(Box<Node>, Box<Node>),
     Or(Box<Node>, Box<Node>),
-    /// Скользящее среднее: сигнал `id` за окно `window_ms` миллисекунд,
-    /// включая границу `[now - window_ms, now]`.
-    Avg { id: i64, window_ms: f64 },
+    /// Экспоненциальное сглаживание (EMA) сигнала `id` с постоянной времени
+    /// `tau_ms` миллисекунд. α = 1 - e^(-dt/τ), где dt — шаг между отсчётами.
+    Avg { id: i64, tau_ms: f64 },
 }
 
 /// Одно место в токенах для отчёта об ошибке.
@@ -114,11 +118,12 @@ pub fn deps_of(src: &str) -> Result<Vec<i64>, ParseError> {
     Ok(v)
 }
 
-/// Все AVG-узлы: (id операнда, окно мс). Нужно для живой буферизации окон.
+/// Все AVG-узлы: (id операнда, постоянная времени τ мс). Нужно для ведения
+/// состояния экспоненциального сглаживания.
 pub fn avg_calls(node: &Node, out: &mut Vec<(i64, f64)>) {
     match node {
         Node::Num(_) | Node::Ref(_) => {}
-        Node::Avg { id, window_ms } => out.push((*id, *window_ms)),
+        Node::Avg { id, tau_ms } => out.push((*id, *tau_ms)),
         Node::Neg(a) | Node::Not(a) => avg_calls(a, out),
         Node::Add(a, b)
         | Node::Sub(a, b)
@@ -138,34 +143,34 @@ pub fn avg_calls(node: &Node, out: &mut Vec<(i64, f64)>) {
     }
 }
 
-/// Максимальное окно AVG в выражении, мс (0 — функции нет).
-pub fn max_window_ms(node: &Node) -> f64 {
+/// Максимальная постоянная времени AVG в выражении, мс (0 — функции нет).
+pub fn max_tau_ms(node: &Node) -> f64 {
     let mut v = Vec::new();
     avg_calls(node, &mut v);
     v.iter().map(|(_, w)| *w).fold(0.0, f64::max)
 }
 
-/// Контекст вычисления: откуда брать мгновенные значения операндов и средние
-/// по окну для AVG.
+/// Контекст вычисления: откуда брать мгновенные значения операндов и сглаженные
+/// значения для AVG.
 pub struct Context<'a> {
     /// Мгновенное значение сигнала (None — недоступен).
     pub lookup: &'a mut dyn FnMut(i64) -> Option<f64>,
-    /// Среднее сигнала id по окну window_ms мс перед now_ms (None — нет
-    /// источника окна; тогда AVG вырождается в lookup).
+    /// Сглаженное (EMA) сигнала id с постоянной времени tau_ms мс на момент
+    /// now_ms (None — нет источника сглаживания; тогда AVG вырождается в lookup).
     pub avg: Option<&'a mut dyn FnMut(i64, f64) -> Option<f64>>,
-    /// Момент «сейчас» для окон AVG, мс эпохи Unix.
+    /// Момент «сейчас» для AVG, мс эпохи Unix.
     pub now_ms: i64,
 }
 
-/// Вычислить AST по контексту (мгновенные значения + окна AVG).
+/// Вычислить AST по контексту (мгновенные значения + AVG-сглаживание).
 pub fn eval_ctx(node: &Node, cx: &mut Context) -> Option<f64> {
     match node {
         Node::Num(v) => Some(*v),
         Node::Ref(id) => (cx.lookup)(*id),
-        Node::Avg { id, window_ms } => match cx.avg.as_mut() {
-            Some(w) => (*w)(*id, *window_ms),
-            // Нет источника окна (live-реестр без буфера) — среднее по одному
-            // текущему отсчёту, т.е. мгновенное значение.
+        Node::Avg { id, tau_ms } => match cx.avg.as_mut() {
+            Some(w) => (*w)(*id, *tau_ms),
+            // Нет источника сглаживания (live-реестр без буфера) — одно
+            // текущее значение, т.е. мгновенное показание.
             None => (cx.lookup)(*id),
         },
         Node::Neg(a) => eval_ctx(a, cx).map(|v| -v),
@@ -212,7 +217,7 @@ fn eval2_ctx(
 
 /// Вычислить AST, доставая значения операндов через `lookup`.
 /// Любой отсутствующий (None) операнд обваливает результат в None.
-/// AVG без окна источника вырождается в lookup (один текущий отсчёт).
+/// AVG без источника сглаживания вырождается в lookup.
 pub fn eval(node: &Node, lookup: &mut impl FnMut(i64) -> Option<f64>) -> Option<f64> {
     let mut cx = Context {
         lookup: lookup as &mut dyn FnMut(i64) -> Option<f64>,
@@ -566,7 +571,7 @@ impl Parser {
                     }
                 };
                 self.expect(TokKind::Comma)?;
-                let window_ms = match self.peek().map(|t| t.kind.clone()) {
+                let tau_ms = match self.peek().map(|t| t.kind.clone()) {
                     Some(TokKind::Num(v)) => {
                         self.i += 1;
                         v
@@ -574,21 +579,21 @@ impl Parser {
                     _ => {
                         return Err(ParseError::new(
                             self.pos(),
-                            "у AVG второй аргумент — окно в миллисекундах",
+                            "у AVG второй аргумент — постоянная времени τ в миллисекундах",
                         ))
                     }
                 };
                 self.expect(TokKind::RParen)?;
-                if !(window_ms.is_finite() && window_ms > 0.0) {
-                    return Err(ParseError::new(pos, "окно AVG должно быть больше 0 мс"));
+                if !(tau_ms.is_finite() && tau_ms > 0.0) {
+                    return Err(ParseError::new(pos, "τ AVG должно быть больше 0 мс"));
                 }
-                if window_ms > MAX_AVG_WINDOW_MS {
+                if tau_ms > MAX_AVG_TAU_MS {
                     return Err(ParseError::new(
                         pos,
-                        format!("окно AVG {window_ms:.0} мс превышает максимум {MAX_AVG_WINDOW_MS:.0} мс"),
+                        format!("τ AVG {tau_ms:.0} мс превышает максимум {MAX_AVG_TAU_MS:.0} мс"),
                     ));
                 }
-                Ok(Node::Avg { id, window_ms })
+                Ok(Node::Avg { id, tau_ms })
             }
             Some(TokKind::Num(v)) => {
                 self.i += 1;
@@ -712,17 +717,17 @@ mod tests {
     fn avg_parses_and_fills_deps() {
         assert!(matches!(
             parse("AVG([12], 5000)").unwrap(),
-            Node::Avg { id: 12, window_ms: w } if (w - 5000.0).abs() < 1e-9
+            Node::Avg { id: 12, tau_ms: w } if (w - 5000.0).abs() < 1e-9
         ));
         // запись без пробелов должна парситься так же
         assert!(matches!(
             parse("AVG([28],1000)").unwrap(),
-            Node::Avg { id: 28, window_ms: w } if (w - 1000.0).abs() < 1e-9
+            Node::Avg { id: 28, tau_ms: w } if (w - 1000.0).abs() < 1e-9
         ));
         // регистронезависимость и в составе выражения
         let n = parse("avg([3], 1e3) + [4]").unwrap();
         assert_eq!(deps_of_node(&n), vec![3, 4]);
-        assert!((max_window_ms(&n) - 1000.0).abs() < 1e-9);
+        assert!((max_tau_ms(&n) - 1000.0).abs() < 1e-9);
     }
 
     fn deps_of_node(n: &Node) -> Vec<i64> {
@@ -756,9 +761,9 @@ mod tests {
 
     #[test]
     fn avg_parse_errors() {
-        assert!(parse("AVG([12])").is_err()); // нет окна
-        assert!(parse("AVG(12, 500)").is_err()); // окно, но id без []
-        assert!(parse("AVG([12], 0)").is_err()); // нулевое окно
+        assert!(parse("AVG([12])").is_err()); // нет τ
+        assert!(parse("AVG(12, 500)").is_err()); // τ, но id без []
+        assert!(parse("AVG([12], 0)").is_err()); // нулевая τ
         assert!(parse("AVG([12], 700000)").is_err()); // за максимумом
         assert!(parse("MEAN([12], 5)  ").is_err()); // неизвестная функция
         assert!(parse("AVG [12], 5").is_err()); // без скобок

@@ -16,7 +16,7 @@ use chrono::Local;
 
 use crate::core::tag_point::{QUALITY_BAD, QUALITY_GOOD};
 use crate::core::tag_registry::TagRegistry;
-use crate::core::virtual_calc::VirtualPlan;
+use crate::core::virtual_calc::{self, VirtualPlan};
 use crate::core::virtual_expr;
 use crate::models::Connection;
 
@@ -36,7 +36,7 @@ pub fn address_info() -> serde_json::Value {
             ("&& || !", "логика"),
             (
                 "AVG([id], ms)",
-                "скользящее среднее сигнала за окно миллисекунд",
+                "экспоненциальное сглаживание сигнала (τ — постоянная времени, мс)",
             ),
         ],
         &[
@@ -44,14 +44,14 @@ pub fn address_info() -> serde_json::Value {
             ("[40] * 0.1 + 20", "FLOAT", "масштабирование"),
             ("[12] > 100", "BOOL", "условие «перегрев»"),
             ("([1] > 80) && ([2] < 50)", "BOOL", "комбинация условий"),
-            ("AVG([12], 5000)", "FLOAT", "среднее за 5 секунд"),
-            ("AVG([12], 60000) - [12]", "FLOAT", "отклонение от минуты среднего"),
+            ("AVG([12], 5000)", "FLOAT", "плавно сглаженное значение (τ = 5 с)"),
+            ("AVG([12], 60000) - [12]", "FLOAT", "отклонение от сглаженного за минуту"),
         ],
     )
 }
 
 /// Проверка выражения (для /api/validate/address virtual-подключений).
-/// Максимум окна AVG проверяет парсер — здесь только синтаксис.
+/// Максимум τ AVG проверяет парсер — здесь только синтаксис.
 pub fn validate_expression(src: &str) -> Option<String> {
     match virtual_expr::parse(src) {
         Ok(_) => None,
@@ -66,67 +66,27 @@ pub fn validate_expression(src: &str) -> Option<String> {
     }
 }
 
-/// Скользящие буферы отсчётов для AVG в живых вычислениях.
+/// Состояние экспоненциального сглаживания AVG в живых вычислениях.
 ///
-/// Для каждого тега, встречающегося внутри AVG, храним последние отсчёты
-/// (время мс, значение) не старше максимального окна. Обновление — только
-/// при новом timestamp, поэтому дребезг/повторы одного опроса не удваивают
-/// точки буфера.
+/// На каждую пару (сигнал, τ) хранится одно число — сглаженное значение и
+/// момент последнего учтённого отсчёта. Продвижение только при новом
+/// timestamp, поэтому дребезг/повторы одного опроса не сдвигают результат.
 #[derive(Default)]
 pub struct AvgBuffers {
-    inner: HashMap<i64, std::collections::VecDeque<(i64, f64)>>,
+    inner: std::collections::BTreeMap<(i64, i64), (i64, f64)>,
 }
 
 impl AvgBuffers {
-    /// Страховка от разрастания при больших окнах и частом опросе:
-    /// лишние старейшие отсчёты вытесняются.
-    const MAX_SAMPLES: usize = 20_000;
-
-    /// Зарегистрировать отсчёт тега, если он свежее последнего.
-    fn push(&mut self, id: i64, ts_ms: i64, value: f64, cap_ms: f64) {
-        let dq = self.inner.entry(id).or_default();
-        if let Some(last) = dq.back_mut() {
-            if last.0 == ts_ms {
-                // Тот же такт опроса — последнее показание выигрывает.
-                last.1 = value;
-                return;
-            }
-            if last.0 > ts_ms {
-                return;
-            }
-        }
-        dq.push_back((ts_ms, value));
-        // Обрезаем старьё за пределами максимального окна этого тега.
-        let floor = ts_ms - cap_ms.ceil() as i64;
-        while dq.front().map_or(false, |&(t, _)| t < floor) {
-            dq.pop_front();
-        }
-        while dq.len() > Self::MAX_SAMPLES {
-            dq.pop_front();
-        }
+    /// Учесть отсчёт тега (ts_ms, value) в сглаживании с постоянной τ.
+    fn advance(&mut self, id: i64, tau_ms: f64, ts_ms: i64, value: f64) {
+        virtual_calc::advance_ema(&mut self.inner, id, tau_ms, ts_ms, value);
     }
 
-    /// Среднее по окну (now_ms - window_ms, now_ms]. Пусто — None.
-    fn mean(&self, id: i64, now_ms: i64, window_ms: f64) -> Option<f64> {
-        let dq = self.inner.get(&id)?;
-        let floor = now_ms - window_ms.ceil() as i64;
-        let mut sum = 0.0;
-        let mut n = 0usize;
-        for &(t, v) in dq.iter().rev() {
-            if t <= floor {
-                break;
-            }
-            if t > now_ms {
-                continue; // часы устройства спешат — будущий отсчёт не в окне
-            }
-            sum += v;
-            n += 1;
-        }
-        if n == 0 {
-            None
-        } else {
-            Some(sum / n as f64)
-        }
+    /// Сглаженное значение (None — годных отсчётов ещё не было).
+    fn get(&self, id: i64, tau_ms: f64) -> Option<f64> {
+        self.inner
+            .get(&(id, virtual_calc::tau_key(tau_ms)))
+            .map(|(_, e)| *e)
     }
 }
 
@@ -150,7 +110,7 @@ pub async fn run_virtual(
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(period_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Скользящие буферы живут между циклами (для AVG).
+    // Состояние AVG живёт между циклами (для AVG).
     let mut buffers = AvgBuffers::default();
 
     loop {
@@ -175,7 +135,7 @@ pub async fn run_virtual(
 /// Публикация идёт через тот же registry.update_value(), что и драйверы
 /// опроса: scale/offset применяются реестром, а value=None в выражении
 /// операнды уже масштабированные значения (как их видит оператор).
-/// `buffers` — скользящие окна для AVG; заполняются отсчётами тегов,
+/// `buffers` — состояние сглаживания AVG; продвигается отсчётами тегов,
 /// зарегистрированных в плане как операнды AVG.
 pub fn compute_once(
     registry: &TagRegistry,
@@ -197,20 +157,17 @@ pub fn compute_once(
     let now = Local::now();
     let now_ms = now.timestamp_millis();
 
-    // Окна AVG: наполняем буферы последними известными отсчётами операндов
-    // из реестра (виртуалы-операнды — их значения с прошлого цикла;
-    // результат текущего цикла попадёт в буфер на следующем префилле).
+    // Сглаживание AVG: продвигаем состояние свежими отсчётами операндов из
+    // реестра (виртуалы-операнды — их значения с прошлого цикла; результат
+    // текущего цикла попадёт в состояние на следующем префилле). Шаг α
+    // считается по timestamp отсчёта, как при пересчёте истории.
     // plan.avg_needs заполняется в VirtualPlan::build.
-    if !guard.avg_needs.is_empty() {
-        let ids: Vec<i64> = guard.avg_needs.keys().copied().collect();
-        for id in ids {
-            let cap = guard.avg_needs[&id];
-            if let Some(p) = registry.get(id) {
-                let (ts, value, quality) = p.live_triple();
-                if quality == QUALITY_GOOD {
-                    if let (Some(ts), Some(v)) = (ts, value) {
-                        buffers.push(id, ts.timestamp_millis(), v, cap);
-                    }
+    for &(id, tau) in &guard.avg_needs {
+        if let Some(p) = registry.get(id) {
+            let (ts, value, quality) = p.live_triple();
+            if quality == QUALITY_GOOD {
+                if let (Some(ts), Some(v)) = (ts, value) {
+                    buffers.advance(id, tau, ts.timestamp_millis(), v);
                 }
             }
         }
@@ -232,9 +189,8 @@ pub fn compute_once(
             value
         };
         let mut window = |id: i64, w: f64| -> Option<f64> {
-            // Буфер AVG операнда наполнен в префилле (значения реестра на
-            // момент прошлого цикла) — среднее берётся только из него.
-            buffers.mean(id, now_ms, w)
+            // Состояние AVG продвинуто в префилле отсчётами реестра.
+            buffers.get(id, w)
         };
         let mut cx = virtual_expr::Context {
             lookup: &mut lookup,
@@ -371,57 +327,77 @@ mod tests {
         // Обрыв на конце -> без позиции, но с текстом ошибки.
         let e2 = validate_expression("[1] +").unwrap();
         assert!(!e2.is_empty());
-        // AVG: синтаксис валиден, слишком большое окно — ошибка парсера.
+        // AVG: синтаксис валиден, слишком большая τ — ошибка парсера.
         assert!(validate_expression("AVG([1], 5000)").is_none());
         assert!(validate_expression("AVG([1], 9999999)").unwrap().contains("AVG"));
     }
 
     #[test]
-    fn avg_buffers_window_math() {
+    fn avg_buffers_ema_math() {
         let mut b = AvgBuffers::default();
-        // Отсчёты на t=0,10,20,30 (мс) со значениями 1,2,3,4
+        // Отсчёты на t=0,10,20,30 (мс) со значениями 1,2,3,4 при τ = 1000 мс.
+        let a = 1.0 - (-10.0f64 / 1000.0).exp();
+        let mut e = 1.0;
         for (t, v) in [(0, 1.0), (10, 2.0), (20, 3.0), (30, 4.0)] {
-            b.push(5, t, v, 1000.0);
+            b.advance(5, 1000.0, t, v);
+            if t > 0 {
+                e += a * (v - e);
+            }
+            let got = b.get(5, 1000.0).unwrap();
+            assert!((got - e).abs() < 1e-12, "t={t}: {got} != {e}");
         }
-        // Повтор/старый ts игнорируются
-        b.push(5, 25, 99.0, 1000.0);
-        assert_eq!(b.mean(5, 30, 1000.0), Some(2.5)); // (1+2+3+4)/4
-        assert_eq!(b.mean(5, 30, 20.0), Some(3.5)); // (10,30] -> {3,4}
-        assert_eq!(b.mean(5, 30, 11.0), Some(3.5)); // (19,30] -> {3,4}
-        assert_eq!(b.mean(5, 30, 5.0), Some(4.0)); // (25,30] -> {4}
-        assert_eq!(b.mean(5, 30, 100_000.0), Some(2.5)); // всё окно
-        assert_eq!(b.mean(42, 30, 100.0), None); // нет такого тега
+        // Тот же отсчёт уже учтён, старый ts — состояние не сдвигается.
+        b.advance(5, 1000.0, 25, 99.0);
+        b.advance(5, 1000.0, 30, 99.0);
+        assert!((b.get(5, 1000.0).unwrap() - e).abs() < 1e-12);
+        // Другая τ — собственное состояния; неизвестный тег — None.
+        assert_eq!(b.get(5, 2000.0), None);
+        assert_eq!(b.get(42, 1000.0), None);
     }
 
     #[tokio::test]
-    async fn live_avg_over_recent_cycles() {
+    async fn live_avg_smooths_operand_steps() {
         let registry = std::sync::Arc::new(TagRegistry::new());
         registry.replace_all(&[
             Tag { id: 10, connection_id: 1, ..Default::default() },
             Tag {
                 id: 20,
                 connection_id: 7,
-                address_str: "AVG([10], 500000)".into(),
+                address_str: "AVG([10], 1000)".into(),
                 ..Default::default()
             },
         ]);
-        let plan = plan_for(&[(20, "AVG([10], 500000)")]);
-        assert_eq!(plan.read().unwrap().avg_needs.get(&10), Some(&500_000.0));
+        let plan = plan_for(&[(20, "AVG([10], 1000)")]);
+        assert_eq!(plan.read().unwrap().avg_needs, vec![(10, 1000.0)]);
 
-        // Три цикла вычислений с разнесёнными метками: каждое новое показание
-        // попадает в буфер, среднее по большому окну = среднее всех показаний.
+        // Три цикла с отсчётами раз в секунду при τ = 1 с: сглаженное значение
+        // плавно тянется к сигналу, а не прыгает к последнему показанию.
         let mut buffers = AvgBuffers::default();
+        let mut prev_ms: Option<i64> = None;
+        let mut expect: Option<f64> = None;
         for (i, v) in [10.0, 20.0, 30.0].into_iter().enumerate() {
             let ts = Local::now() - chrono::Duration::seconds((2 - i) as i64);
+            let ts_ms = ts.timestamp_millis();
             registry.update_value(10, Some(v), QUALITY_GOOD, Some(ts));
             compute_once(&registry, &plan, None, &mut buffers);
+            expect = Some(match (expect, prev_ms) {
+                (Some(e), Some(p)) => {
+                    let a = 1.0 - (-(ts_ms - p) as f64 / 1000.0).exp();
+                    e + a * (v - e)
+                }
+                _ => v,
+            });
+            prev_ms = Some(ts_ms);
         }
-        assert_eq!(registry.get(20).unwrap().live_triple().1, Some(20.0));
+        let got = registry.get(20).unwrap().live_triple().1.unwrap();
+        assert!((got - expect.unwrap()).abs() < 1e-9, "{got}");
+        // 10 → 20 → 30: значение строго между крайними отсчётами (плавно).
+        assert!(got > 10.0 && got < 30.0, "{got}");
     }
 
     #[tokio::test]
     async fn avg_operand_missing_gives_bad() {
-        // Тег без значений вообще — окно пустое, результат недоступен.
+        // Тег без значений вообще — состояния сглаживания нет, результат недоступен.
         let registry = std::sync::Arc::new(TagRegistry::new());
         registry.replace_all(&[
             Tag { id: 10, connection_id: 1, ..Default::default() },

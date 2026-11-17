@@ -33,9 +33,9 @@ pub struct VirtualPlan {
     pub order: Vec<VirtualItem>,
     /// tag_id -> текст ошибки (битое/циклическое выражение).
     pub errors: HashMap<i64, String>,
-    /// Сигналы, используемые внутри AVG: tag_id -> максимальное окно, мс.
-    /// Живой вычислитель ведёт скользящие буферы только для этих тегов.
-    pub avg_needs: HashMap<i64, f64>,
+    /// Сигналы, используемые внутри AVG: уникальные пары (tag_id, τ мс).
+    /// Живой вычислитель ведёт состояние сглаживания для каждой пары.
+    pub avg_needs: Vec<(i64, f64)>,
 }
 
 impl VirtualPlan {
@@ -115,15 +115,18 @@ impl VirtualPlan {
             }
         }
 
-        // Окна AVG: буферизуем все операнды функции с запасом по максимальному
-        // окну (виртуалы-операнды — их собственные результаты).
+        // AVG: состояние сглаживания нужно на каждую пару (сигнал, τ) —
+        // разные τ одного сигнала не переиспользуют результат друг друга.
         for item in &plan.order {
             let mut calls = Vec::new();
             virtual_expr::avg_calls(&item.node, &mut calls);
-            for (id, w) in calls {
-                let e = plan.avg_needs.entry(id).or_insert(0.0);
-                if w > *e {
-                    *e = w;
+            for (id, tau) in calls {
+                if !plan
+                    .avg_needs
+                    .iter()
+                    .any(|(i, t)| *i == id && tau_key(*t) == tau_key(tau))
+                {
+                    plan.avg_needs.push((id, tau));
                 }
             }
         }
@@ -132,6 +135,37 @@ impl VirtualPlan {
 
     pub fn is_ok(&self) -> bool {
         self.errors.is_empty()
+    }
+}
+
+/// Ключ постоянной времени для состояний AVG (τ приходит из разобранного
+/// выражения, дубликаты сливаются по округлению до миллисекунды).
+pub fn tau_key(tau_ms: f64) -> i64 {
+    tau_ms.round() as i64
+}
+
+/// Продвинуть состояние экспоненциального сглаживания на новый отсчёт.
+/// Первый отсчёт задаёт значение; дальше α = 1 - e^(-dt/τ), поэтому кривая
+/// плавно тянется к сигналу с постоянной времени τ, а не обрывается краем окна.
+pub fn advance_ema(
+    ema: &mut BTreeMap<(i64, i64), (i64, f64)>,
+    id: i64,
+    tau_ms: f64,
+    ts_ms: i64,
+    value: f64,
+) {
+    let key = (id, tau_key(tau_ms));
+    match ema.get_mut(&key) {
+        Some((last, e)) if ts_ms > *last => {
+            let dt = (ts_ms - *last) as f64;
+            let a = 1.0 - (-dt / tau_ms).exp();
+            *e += a * (value - *e);
+            *last = ts_ms;
+        }
+        Some(_) => {} // тот же или более поздний отсчёт уже учтён
+        None => {
+            ema.insert(key, (ts_ms, value));
+        }
     }
 }
 
@@ -265,48 +299,46 @@ fn eval_on_union(node: &Node, operand: &BTreeMap<i64, Vec<(i64, f64)>>) -> Vec<(
         }
     }
     let mut out = Vec::with_capacity(grid.len());
-    // Префиксные суммы незанулённых (не-NaN) отсчётов для AVG по истории.
-    // NaN (пустые бакеты прореженной сетки) в среднее не входят.
-    let mut avg_data: BTreeMap<i64, (Vec<i64>, Vec<f64>)> = BTreeMap::new();
-    for (id, s) in operand {
-        let mut ts = Vec::with_capacity(s.len());
-        let mut pre = Vec::with_capacity(s.len());
-        let mut sum = 0.0f64;
-        for (t, v) in s {
-            if !v.is_nan() {
-                ts.push(*t);
-                sum += v;
-                pre.push(sum);
+    // Сглаживание AVG по истории: состояние на каждую пару (сигнал, τ).
+    // Продвигается только на новых отсчётах операнда — ровно как живой
+    // вычислитель, поэтому линия архива совпадает с Live.
+    let mut avg_pairs: Vec<(i64, f64)> = Vec::new();
+    {
+        let mut calls = Vec::new();
+        virtual_expr::avg_calls(node, &mut calls);
+        for (id, tau) in calls {
+            if !avg_pairs
+                .iter()
+                .any(|(i, t)| *i == id && tau_key(*t) == tau_key(tau))
+            {
+                avg_pairs.push((id, tau));
             }
         }
-        avg_data.insert(*id, (ts, pre));
     }
-    let win_avg = |id: i64, now_ms: i64, w: f64| -> Option<f64> {
-        let (ts, pre) = avg_data.get(&id)?;
-        if ts.is_empty() {
-            return None;
-        }
-        // Отсчёты в (now_ms - w, now_ms]
-        let floor = now_ms - w.ceil() as i64;
-        let hi = ts.partition_point(|t| *t <= now_ms);
-        let lo = ts.partition_point(|t| *t <= floor);
-        if hi <= lo {
-            return None;
-        }
-        let sum = pre[hi - 1] - if lo > 0 { pre[lo - 1] } else { 0.0 };
-        Some(sum / (hi - lo) as f64)
-    };
+    let mut ema: BTreeMap<(i64, i64), (i64, f64)> = BTreeMap::new();
     for t in grid {
         for c in cursors.iter_mut() {
             while c.pos < c.series.len() && c.series[c.pos].0 <= t {
-                let v = c.series[c.pos].1;
+                let (ts, v) = c.series[c.pos];
                 if !v.is_nan() {
                     c.last = Some(v);
+                    for &(id, tau) in &avg_pairs {
+                        if id == *c.id {
+                            advance_ema(&mut ema, id, tau, ts, v);
+                        }
+                    }
                 }
                 c.pos += 1;
             }
         }
-        let mut window = |id: i64, w: f64| win_avg(id, t, w);
+        let mut window = |id: i64, w: f64| -> Option<f64> {
+            // Только в пределах занятых данных операнда (как lookup).
+            cursors
+                .iter()
+                .any(|c| *c.id == id && t >= c.busy_from && t <= c.busy_to)
+                .then(|| ema.get(&(id, tau_key(w))).map(|(_, e)| *e))
+                .flatten()
+        };
         let mut cx = virtual_expr::Context {
             lookup: &mut |id| {
                 cursors
@@ -469,19 +501,19 @@ mod tests {
 
     #[test]
     fn history_avg_over_operand() {
-        // AVG([10], 20): окно (t-20, t], NaN-дыры не участвуют в среднем.
+        // AVG([10], 20): экспоненциальное сглаживание с τ = 20 мс; NaN-дыра
+        // (пустой бакет) — не отсчёт, но время идёт, поэтому следующий шаг
+        // берёт dt от последнего годного отсчёта.
         let out = hist(
             &[(1, "AVG([10], 20)")],
             vec![(10, vec![(0, 1.0), (10, 3.0), (20, f64::NAN), (30, 5.0)])],
         );
-        // t=0: окно (-20,0] -> {1.0} => 1.0
-        // t=10: (-10,10] -> {1,3} => 2.0
-        // t=20: (0,20] -> {3} (NaN не входит, 1.0 на floor исключена) => 3.0
-        // t=30: (10,30] -> {5} (3.0 на t=10 = floor исключена) => 5.0
-        assert_eq!(out[0].1, 1.0);
-        assert_eq!(out[1].1, 2.0);
-        assert_eq!(out[2].1, 3.0);
-        assert_eq!(out[3].1, 5.0);
+        let e1 = 1.0 + (1.0 - (-10.0f64 / 20.0).exp()) * (3.0 - 1.0);
+        let e2 = e1 + (1.0 - (-20.0f64 / 20.0).exp()) * (5.0 - e1);
+        assert_eq!(out[0].1, 1.0); // первый отсчёт задаёт значение
+        assert!((out[1].1 - e1).abs() < 1e-9, "{:?}", out[1]);
+        assert!((out[2].1 - e1).abs() < 1e-9, "{:?}", out[2]); // дыра — без шага
+        assert!((out[3].1 - e2).abs() < 1e-9, "{:?}", out[3]);
     }
 
     #[test]
@@ -490,21 +522,25 @@ mod tests {
             &[(1, "[10] - AVG([10], 15)")],
             vec![(10, vec![(0, 10.0), (10, 20.0), (20, 30.0)])],
         );
-        // t=0: 10 - 10 = 0; t=10: 20 - avg(10,20)=15 => 5; t=20: 30 - 25 = 5
-        // (окно 15: на t=20 в (5,20] входят точки 10 и 20 => среднее 25)
-        assert_eq!(out[0].1, 0.0);
-        assert_eq!(out[1].1, 5.0);
-        assert_eq!(out[2].1, 5.0);
+        let a = 1.0 - (-10.0f64 / 15.0).exp();
+        let e1 = 10.0 + a * (20.0 - 10.0);
+        let e2 = e1 + a * (30.0 - e1);
+        assert_eq!(out[0].1, 0.0); // 10 - 10
+        assert!((out[1].1 - (20.0 - e1)).abs() < 1e-9, "{:?}", out[1]);
+        assert!((out[2].1 - (30.0 - e2)).abs() < 1e-9, "{:?}", out[2]);
     }
 
     #[test]
     fn plan_collects_avg_needs() {
-        // v1 = AVG([10], 5000): буфер нужен для реального 10 с окном 5000.
+        // v1 = AVG([10], 5000): состояние сглаживания для пары (10, 5000).
         let plan = VirtualPlan::build(&[tag(1, "AVG([10], 5000)")]);
         assert!(plan.is_ok());
-        assert_eq!(plan.avg_needs.get(&10), Some(&5000.0));
-        // окно берётся максимумом по всем вызовам одного тега
+        assert_eq!(plan.avg_needs, vec![(10, 5000.0)]);
+        // разные τ одного сигнала — отдельные состояния
         let plan = VirtualPlan::build(&[tag(1, "AVG([10], 5000) + AVG([10], 20000)")]);
-        assert_eq!(plan.avg_needs.get(&10), Some(&20000.0));
+        assert_eq!(plan.avg_needs, vec![(10, 5000.0), (10, 20000.0)]);
+        // повтор одинакового вызова не дублируется
+        let plan = VirtualPlan::build(&[tag(1, "AVG([10], 5000) * AVG([10], 5000)")]);
+        assert_eq!(plan.avg_needs, vec![(10, 5000.0)]);
     }
 }
