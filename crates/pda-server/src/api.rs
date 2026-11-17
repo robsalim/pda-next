@@ -1485,9 +1485,11 @@ fn css_rgb(s: &str) -> printpdf::Color {
     }
 }
 
-/// Одна страница PDF: PNG графика + заголовок окна + легенда.
+/// Данные одного окна графика для PDF: PNG + размер окна с экрана + легенда.
 struct ChartPage {
     png: Vec<u8>,
+    chart_w: f32,   // ширина окна графика на экране (px)
+    chart_h: f32,   // высота окна графика на экране (px)
     title: String,
     legend_names: Vec<String>,
     legend_colors: Vec<String>,
@@ -1541,12 +1543,16 @@ pub async fn export_pdf(
         let (key, idx) = split_field_index(&raw_name);
         let page = pages.entry(idx.unwrap_or(0)).or_insert_with(|| ChartPage {
             png: Vec::new(),
+            chart_w: 1000.0,
+            chart_h: 400.0,
             title: String::new(),
             legend_names: Vec::new(),
             legend_colors: Vec::new(),
         });
         match key {
             "chart" => page.png = bytes.to_vec(),
+            "chart_w" => page.chart_w = String::from_utf8_lossy(&bytes).parse().unwrap_or(1000.0),
+            "chart_h" => page.chart_h = String::from_utf8_lossy(&bytes).parse().unwrap_or(400.0),
             "title" => page.title = String::from_utf8_lossy(&bytes).to_string(),
             "legend_name" => page
                 .legend_names
@@ -1594,8 +1600,11 @@ pub async fn export_pdf(
         }
     }
 
-    // 4) Один график на страницу A4 ландшафт + таблица сигналов снизу.
-    for (idx, page) in charts.iter().enumerate() {
+    // 4) Плотно упаковываем графики на страницу A4 ландшафт.
+    //    Высота каждого графика берётся из реального размера окна на экране.
+    let mut chart_pos = 0;
+
+    while chart_pos < charts.len() {
         let mut ops: Vec<printpdf::Op> = Vec::new();
 
         // Белый фон страницы
@@ -1613,76 +1622,107 @@ pub async fn export_pdf(
             },
         });
 
-        let img_rgba = image::load_from_memory(&page.png)
-            .map_err(|e| ApiError(format!("chart_{idx} некорректный PNG: {e}")))?
-            .to_rgba8();
-        let (img_w, img_h) = (img_rgba.width() as usize, img_rgba.height() as usize);
-
-        // Заголовок графика сверху (минимальный зазор)
-        let page_title = if page.title.is_empty() {
-            format!("График {}", idx + 1)
-        } else {
-            page.title.clone()
-        };
-        let title_y = page_h - margin - 10.0;
-        ops.push(printpdf::Op::StartTextSection);
-        ops.push(printpdf::Op::SetFillColor {
-            col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
-        });
-        ops.push(printpdf::Op::SetFont {
-            font: title_font.clone(),
-            size: printpdf::Pt(12.0),
-        });
-        ops.push(printpdf::Op::SetTextCursor {
-            pos: printpdf::Point {
-                x: printpdf::Pt(margin),
-                y: printpdf::Pt(title_y),
-            },
-        });
-        ops.push(printpdf::Op::ShowText {
-            items: vec![printpdf::TextItem::Text(page_title)],
-        });
-        ops.push(printpdf::Op::EndTextSection);
-
-        // График сразу под заголовком, без лишних промежутков.
-        let chart_top = title_y - 14.0;
-        let chart_area_h = chart_top - margin;
         let chart_area_w = page_w - margin * 2.0;
 
-        // Масштаб изображения (px → pt), с сохранением пропорций
-        let scale = (chart_area_w / img_w as f32).min(chart_area_h / img_h as f32);
-        let draw_x = margin + (chart_area_w - img_w as f32 * scale) / 2.0;
-        let draw_y = margin + (chart_area_h - img_h as f32 * scale) / 2.0;
+        let mut y_cursor = page_h - margin - 20.0;
+        let mut page_charts: Vec<usize> = Vec::new();
 
-        let raw = printpdf::RawImage {
-            pixels: printpdf::RawImageData::U8(img_rgba.into_raw()),
-            width: img_w,
-            height: img_h,
-            data_format: printpdf::RawImageFormat::RGBA8,
-            tag: Vec::new(),
-        };
-        let img_id = doc.add_image(&raw);
+        // Подбираем графики, которые помещаются на эту страницу
+        while chart_pos < charts.len() {
+            let page = &charts[chart_pos];
+            let aspect = page.chart_h / page.chart_w;
+            let chart_h_pt = chart_area_w * aspect;
+            let title_h = 18.0;
+            let block_h = title_h + chart_h_pt + 6.0;
 
-        // График. ВАЖНО: printpdf 0.12 рисует изображение в квадрате 1×1 и
-        // сам подставляет масштаб (px → pt по dpi) только при
-        // no_auto_scale = false. dpi = 72 даёт 1 px = 1 pt.
-        ops.push(printpdf::Op::UseXobject {
-            id: img_id,
-            transform: printpdf::XObjectTransform {
-                translate_x: Some(printpdf::Pt(draw_x)),
-                translate_y: Some(printpdf::Pt(draw_y)),
-                rotate: None,
-                scale_x: Some(scale),
-                scale_y: Some(scale),
-                dpi: Some(72.0),
-                no_auto_scale: false,
-            },
-        });
+            if y_cursor - block_h < margin + 60.0 && !page_charts.is_empty() {
+                break;
+            }
 
-        // Таблица сигналов снизу графика (минимальный зазор)
-        let table_top = margin - 10.0;
-        let row_h = 14.0;
-        let table_h = (page.legend_names.len().max(1) as f32 + 1.0) * row_h + 8.0;
+            page_charts.push(chart_pos);
+            y_cursor -= block_h;
+            chart_pos += 1;
+        }
+
+        if page_charts.is_empty() {
+            page_charts.push(chart_pos);
+            chart_pos += 1;
+        }
+
+        // Рисуем все графики этой страницы
+        let mut draw_y = page_h - margin - 20.0;
+        for &ci in &page_charts {
+            let page = &charts[ci];
+            let img_rgba = image::load_from_memory(&page.png)
+                .map_err(|e| ApiError(format!("chart_{ci} некорректный PNG: {e}")))?
+                .to_rgba8();
+            let (img_w, img_h) = (img_rgba.width() as usize, img_rgba.height() as usize);
+            let aspect = page.chart_h / page.chart_w;
+            let _chart_h_pt = chart_area_w * aspect;
+            let title_h = 17.0;
+
+            // Заголовок графика
+            let page_title = if page.title.is_empty() {
+                format!("График {}", ci + 1)
+            } else {
+                page.title.clone()
+            };
+            ops.push(printpdf::Op::StartTextSection);
+            ops.push(printpdf::Op::SetFillColor {
+                col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
+            });
+            ops.push(printpdf::Op::SetFont {
+                font: title_font.clone(),
+                size: printpdf::Pt(11.0),
+            });
+            ops.push(printpdf::Op::SetTextCursor {
+                pos: printpdf::Point {
+                    x: printpdf::Pt(margin),
+                    y: printpdf::Pt(draw_y),
+                },
+            });
+            ops.push(printpdf::Op::ShowText {
+                items: vec![printpdf::TextItem::Text(page_title)],
+            });
+            ops.push(printpdf::Op::EndTextSection);
+
+            // PNG графика (высота берётся из реального размера окна на экране)
+            draw_y -= title_h + 4.0;
+            let scale = (chart_area_w / img_w as f32).min((draw_y - margin) / img_h as f32);
+            let draw_x = margin + (chart_area_w - img_w as f32 * scale) / 2.0;
+            let img_draw_y = margin + (draw_y - margin - img_h as f32 * scale) / 2.0;
+
+            let raw = printpdf::RawImage {
+                pixels: printpdf::RawImageData::U8(img_rgba.into_raw()),
+                width: img_w,
+                height: img_h,
+                data_format: printpdf::RawImageFormat::RGBA8,
+                tag: Vec::new(),
+            };
+            let img_id = doc.add_image(&raw);
+            ops.push(printpdf::Op::UseXobject {
+                id: img_id,
+                transform: printpdf::XObjectTransform {
+                    translate_x: Some(printpdf::Pt(draw_x)),
+                    translate_y: Some(printpdf::Pt(img_draw_y)),
+                    rotate: None,
+                    scale_x: Some(scale),
+                    scale_y: Some(scale),
+                    dpi: Some(72.0),
+                    no_auto_scale: false,
+                },
+            });
+
+            draw_y = img_draw_y - 5.0;
+        } // конец цикла по графикам страницы
+
+        // Таблица сигналов внизу страницы (общая для всех графиков на странице)
+        let table_top = margin - 8.0;
+        let row_h = 13.0;
+        let all_names: Vec<&String> = page_charts.iter().map(|&ci| &charts[ci].legend_names).flat_map(|v| v.iter()).collect();
+        let all_colors: Vec<&String> = page_charts.iter().map(|&ci| &charts[ci].legend_colors).flat_map(|v| v.iter()).collect();
+        let n_rows = all_names.len().max(1);
+        let table_h = (n_rows as f32 + 1.0) * row_h + 8.0;
         let table_y = table_top - table_h;
 
         // Рамка таблицы
@@ -1720,15 +1760,9 @@ pub async fn export_pdf(
         });
         ops.push(printpdf::Op::EndTextSection);
 
-        // Строки таблицы: номер + имя + цветной квадрат
+        // Строки таблицы
         let mut ty = table_y + table_h - row_h * 2.0 - 2.0;
-        for (i, (name, color_str)) in page
-            .legend_names
-            .iter()
-            .zip(page.legend_colors.iter())
-            .enumerate()
-        {
-            // Цветной квадрат
+        for (i, (name, color_str)) in all_names.iter().zip(all_colors.iter()).enumerate() {
             ops.push(printpdf::Op::SetFillColor {
                 col: css_rgb(color_str),
             });
@@ -1742,7 +1776,6 @@ pub async fn export_pdf(
                     winding_order: None,
                 },
             });
-            // Номер + имя
             ops.push(printpdf::Op::StartTextSection);
             ops.push(printpdf::Op::SetFillColor {
                 col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
