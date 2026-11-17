@@ -1594,15 +1594,8 @@ pub async fn export_pdf(
         }
     }
 
-    // 4) Два графика на страницу (A4 ландшафт, бок-о-бок).
-    const CHARTS_PER_PAGE: usize = 2;
-    let total_pages = (charts.len() + CHARTS_PER_PAGE - 1) / CHARTS_PER_PAGE;
-
-    for page_idx in 0..total_pages {
-        let start = page_idx * CHARTS_PER_PAGE;
-        let end = (start + CHARTS_PER_PAGE).min(charts.len());
-        let page_charts = &charts[start..end];
-
+    // 4) Один график на страницу A4 ландшафт + таблица сигналов снизу.
+    for (idx, page) in charts.iter().enumerate() {
         let mut ops: Vec<printpdf::Op> = Vec::new();
 
         // Белый фон страницы
@@ -1620,110 +1613,157 @@ pub async fn export_pdf(
             },
         });
 
-        let chart_area_w = (page_w - margin * 3.0) / CHARTS_PER_PAGE as f32;
-        let chart_area_h = page_h - margin * 3.0;
+        let img_rgba = image::load_from_memory(&page.png)
+            .map_err(|e| ApiError(format!("chart_{idx} некорректный PNG: {e}")))?
+            .to_rgba8();
+        let (img_w, img_h) = (img_rgba.width() as usize, img_rgba.height() as usize);
 
-        for (col, page) in page_charts.iter().enumerate() {
-            let cx = margin + col as f32 * (chart_area_w + margin);
+        // Заголовок графика сверху (минимальный зазор)
+        let page_title = if page.title.is_empty() {
+            format!("График {}", idx + 1)
+        } else {
+            page.title.clone()
+        };
+        let title_y = page_h - margin - 10.0;
+        ops.push(printpdf::Op::StartTextSection);
+        ops.push(printpdf::Op::SetFillColor {
+            col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
+        });
+        ops.push(printpdf::Op::SetFont {
+            font: title_font.clone(),
+            size: printpdf::Pt(12.0),
+        });
+        ops.push(printpdf::Op::SetTextCursor {
+            pos: printpdf::Point {
+                x: printpdf::Pt(margin),
+                y: printpdf::Pt(title_y),
+            },
+        });
+        ops.push(printpdf::Op::ShowText {
+            items: vec![printpdf::TextItem::Text(page_title)],
+        });
+        ops.push(printpdf::Op::EndTextSection);
 
-            let img_rgba = image::load_from_memory(&page.png)
-                .map_err(|e| ApiError(format!("chart_{} некорректный PNG: {e}", start + col)))?
-                .to_rgba8();
-            let (img_w, img_h) = (img_rgba.width() as usize, img_rgba.height() as usize);
+        // График сразу под заголовком, без лишних промежутков.
+        let chart_top = title_y - 14.0;
+        let chart_area_h = chart_top - margin;
+        let chart_area_w = page_w - margin * 2.0;
 
-            // Масштаб изображения (px → pt), с сохранением пропорций
-            let scale = (chart_area_w / img_w as f32).min(chart_area_h / img_h as f32);
-            let draw_x = cx + (chart_area_w - img_w as f32 * scale) / 2.0;
-            let draw_y = margin + (chart_area_h - img_h as f32 * scale) / 2.0;
+        // Масштаб изображения (px → pt), с сохранением пропорций
+        let scale = (chart_area_w / img_w as f32).min(chart_area_h / img_h as f32);
+        let draw_x = margin + (chart_area_w - img_w as f32 * scale) / 2.0;
+        let draw_y = margin + (chart_area_h - img_h as f32 * scale) / 2.0;
 
-            let raw = printpdf::RawImage {
-                pixels: printpdf::RawImageData::U8(img_rgba.into_raw()),
-                width: img_w,
-                height: img_h,
-                data_format: printpdf::RawImageFormat::RGBA8,
-                tag: Vec::new(),
-            };
-            let img_id = doc.add_image(&raw);
+        let raw = printpdf::RawImage {
+            pixels: printpdf::RawImageData::U8(img_rgba.into_raw()),
+            width: img_w,
+            height: img_h,
+            data_format: printpdf::RawImageFormat::RGBA8,
+            tag: Vec::new(),
+        };
+        let img_id = doc.add_image(&raw);
 
-            // График. ВАЖНО: printpdf 0.12 рисует изображение в квадрате 1×1 и
-            // сам подставляет масштаб (px → pt по dpi) только при
-            // no_auto_scale = false. dpi = 72 даёт 1 px = 1 pt.
-            ops.push(printpdf::Op::UseXobject {
-                id: img_id,
-                transform: printpdf::XObjectTransform {
-                    translate_x: Some(printpdf::Pt(draw_x)),
-                    translate_y: Some(printpdf::Pt(draw_y)),
-                    rotate: None,
-                    scale_x: Some(scale),
-                    scale_y: Some(scale),
-                    dpi: Some(72.0),
-                    no_auto_scale: false,
+        // График. ВАЖНО: printpdf 0.12 рисует изображение в квадрате 1×1 и
+        // сам подставляет масштаб (px → pt по dpi) только при
+        // no_auto_scale = false. dpi = 72 даёт 1 px = 1 pt.
+        ops.push(printpdf::Op::UseXobject {
+            id: img_id,
+            transform: printpdf::XObjectTransform {
+                translate_x: Some(printpdf::Pt(draw_x)),
+                translate_y: Some(printpdf::Pt(draw_y)),
+                rotate: None,
+                scale_x: Some(scale),
+                scale_y: Some(scale),
+                dpi: Some(72.0),
+                no_auto_scale: false,
+            },
+        });
+
+        // Таблица сигналов снизу графика (минимальный зазор)
+        let table_top = margin - 10.0;
+        let row_h = 14.0;
+        let table_h = (page.legend_names.len().max(1) as f32 + 1.0) * row_h + 8.0;
+        let table_y = table_top - table_h;
+
+        // Рамка таблицы
+        ops.push(printpdf::Op::SetFillColor {
+            col: printpdf::Color::Rgb(printpdf::Rgb::new(0.95, 0.95, 0.95, None)),
+        });
+        ops.push(printpdf::Op::DrawRectangle {
+            rectangle: printpdf::Rect {
+                x: printpdf::Pt(margin),
+                y: printpdf::Pt(table_y),
+                width: printpdf::Pt(page_w - margin * 2.0),
+                height: printpdf::Pt(table_h),
+                mode: None,
+                winding_order: None,
+            },
+        });
+
+        // Заголовок таблицы
+        ops.push(printpdf::Op::StartTextSection);
+        ops.push(printpdf::Op::SetFillColor {
+            col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
+        });
+        ops.push(printpdf::Op::SetFont {
+            font: title_font.clone(),
+            size: printpdf::Pt(10.0),
+        });
+        ops.push(printpdf::Op::SetTextCursor {
+            pos: printpdf::Point {
+                x: printpdf::Pt(margin + 4.0),
+                y: printpdf::Pt(table_y + table_h - row_h - 2.0),
+            },
+        });
+        ops.push(printpdf::Op::ShowText {
+            items: vec![printpdf::TextItem::Text("Сигналы".to_string())],
+        });
+        ops.push(printpdf::Op::EndTextSection);
+
+        // Строки таблицы: номер + имя + цветной квадрат
+        let mut ty = table_y + table_h - row_h * 2.0 - 2.0;
+        for (i, (name, color_str)) in page
+            .legend_names
+            .iter()
+            .zip(page.legend_colors.iter())
+            .enumerate()
+        {
+            // Цветной квадрат
+            ops.push(printpdf::Op::SetFillColor {
+                col: css_rgb(color_str),
+            });
+            ops.push(printpdf::Op::DrawRectangle {
+                rectangle: printpdf::Rect {
+                    x: printpdf::Pt(margin + 4.0),
+                    y: printpdf::Pt(ty - 3.0),
+                    width: printpdf::Pt(10.0),
+                    height: printpdf::Pt(10.0),
+                    mode: None,
+                    winding_order: None,
                 },
             });
-
-            // Заголовок графика (над картинкой)
-            let page_title = if page.title.is_empty() {
-                format!("График {}", start + col + 1)
-            } else {
-                page.title.clone()
-            };
+            // Номер + имя
             ops.push(printpdf::Op::StartTextSection);
             ops.push(printpdf::Op::SetFillColor {
                 col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
             });
             ops.push(printpdf::Op::SetFont {
-                font: title_font.clone(),
-                size: printpdf::Pt(11.0),
+                font: body_font.clone(),
+                size: printpdf::Pt(9.0),
             });
             ops.push(printpdf::Op::SetTextCursor {
                 pos: printpdf::Point {
-                    x: printpdf::Pt(cx),
-                    y: printpdf::Pt(page_h - margin - 12.0),
+                    x: printpdf::Pt(margin + 18.0),
+                    y: printpdf::Pt(ty),
                 },
             });
             ops.push(printpdf::Op::ShowText {
-                items: vec![printpdf::TextItem::Text(page_title)],
+                items: vec![printpdf::TextItem::Text(
+                    format!("{}. {}", i + 1, name),
+                )],
             });
             ops.push(printpdf::Op::EndTextSection);
-
-            // Легенда под заголовком
-            let mut ly = page_h - margin - 12.0 - 14.0;
-            for (name, color_str) in page.legend_names.iter().zip(page.legend_colors.iter()) {
-                // Квадрат цвета
-                ops.push(printpdf::Op::SetFillColor {
-                    col: css_rgb(color_str),
-                });
-                ops.push(printpdf::Op::DrawRectangle {
-                    rectangle: printpdf::Rect {
-                        x: printpdf::Pt(cx),
-                        y: printpdf::Pt(ly - 3.0),
-                        width: printpdf::Pt(8.0),
-                        height: printpdf::Pt(8.0),
-                        mode: None,
-                        winding_order: None,
-                    },
-                });
-                // Текст (с шрифтом с кириллицей)
-                ops.push(printpdf::Op::StartTextSection);
-                ops.push(printpdf::Op::SetFillColor {
-                    col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
-                });
-                ops.push(printpdf::Op::SetFont {
-                    font: body_font.clone(),
-                    size: printpdf::Pt(9.0),
-                });
-                ops.push(printpdf::Op::SetTextCursor {
-                    pos: printpdf::Point {
-                        x: printpdf::Pt(cx + 11.0),
-                        y: printpdf::Pt(ly),
-                    },
-                });
-                ops.push(printpdf::Op::ShowText {
-                    items: vec![printpdf::TextItem::Text(name.clone())],
-                });
-                ops.push(printpdf::Op::EndTextSection);
-                ly -= 12.0;
-            }
+            ty -= row_h;
         }
 
         doc.pages.push(printpdf::PdfPage::new(

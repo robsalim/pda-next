@@ -2061,8 +2061,11 @@ function chartPngBlob(win, lightMode = false) {
         const data = [baseTimes];
         const { series } = buildChartSeries(win);
         win.signals.forEach((s) => data.push(s.values));
-        const tMin = win.signals[0].t_start || baseTimes[0];
-        const tMax = win.signals[0].t_end || baseTimes[baseTimes.length - 1];
+
+        // Текущий видимый диапазон X (с учётом зума пользователя), а не полный диапазон данных.
+        const curX = win.chart?.scales?.x;
+        const tMin = curX ? curX.min : (win.signals[0].t_start || baseTimes[0]);
+        const tMax = curX ? curX.max : (win.signals[0].t_end || baseTimes[baseTimes.length - 1]);
         const origChart = win.chart;
 
         // Создаём временный график с белой темой
@@ -2110,7 +2113,8 @@ async function exportActiveChartPng() {
         return;
     }
     try {
-        const blob = await chartPngBlob(win, true); // light mode
+        // Экспорт PNG — то, что видит пользователь на экране (текущая тема + зум).
+        const blob = await chartPngBlob(win, false);
         if (!blob) throw new Error('canvas не вернул изображение');
         const name = `pda_chart_${exportStamp()}.png`;
         const r = await fetch(`/api/export/png?name=${encodeURIComponent(name)}`, {
