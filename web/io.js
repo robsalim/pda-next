@@ -85,10 +85,11 @@ function ioDotClass(connId) {
 }
 
 /// Кнопка точечного стопа/старта модуля на узле дерева.
+/// Для виртуальных модулей — не нужна: нет опроса оборудования.
 /// Остановленный в конфигурации (enabled=false) модуль драйвером не управляет —
 /// кнопки нет: его «пуск» это правка конфига, а не runtime-пауза.
 function ioToggleBtn(conn) {
-    if (!conn.enabled) return '';
+    if (conn.driver_type === 'virtual' || !conn.enabled) return '';
     const paused = ioPaused.has(conn.id);
     const icon = paused ? '▶' : '⏸';
     const title = paused ? 'Запустить опрос модуля' : 'Остановить опрос модуля';
@@ -99,9 +100,10 @@ function ioToggleBtn(conn) {
 /// Краткая строка опроса для дерева модулей — как в Python-версии, где напротив
 /// S7 и Modbus-клиента было видно фактическое время цикла. Собирается из
 /// метрик драйвера (stats), а не парсится из текстового статуса.
-/// «Период опроса» в диалоге — это цель, а не факт; без этих чисел реальный
-/// цикл (упор в отклик ЦПУ, ПЕРЕГРУЗ) не увидеть.
+/// Виртуальные модули не опрашивают оборудование — сводка не нужна.
 function ioPollSummary(connId) {
+    const c = ioConns.find(x => x.id === connId);
+    if (c && c.driver_type === 'virtual') return '';
     const d = ioStatus[connId];
     const s = d && d.stats;
     if (!d || !d.running || !s || !s.cycle_ms) return '';
@@ -475,8 +477,8 @@ function ioConnForm(conn, autoTsap) {
             [1,2,3,4,5,6,7].map(n => `<option value="${n}"${n === tsapDefault ? ' selected' : ''}>${n} — ${tsapLabel(n)}</option>`).join('')
         }</select><div id="c-tsap-hint" style="font-size:12px;color:var(--warn);margin-top:4px;${hintStyle}">Для LOGO! 8 (6ED1052-...-0BA2) ставьте <b>3 — Basic</b>. В LOGO!Soft Comfort: Tools → Ethernet Connections → Server Connection, Local TSAP = 0x0300.</div></div>
         <div class="modal-form-row" id="c-row-slave"><label>Slave ID:</label><input id="c-slave" type="number" min="1" max="255" value="${cfg.slave_id ?? 1}"></div>
-        <div class="modal-form-row"><label>Период опроса (мс):</label><input id="c-poll" type="number" min="1" max="60000" step="5" value="${c.poll_interval_ms ?? 100}"></div>
-        <div class="modal-form-row"><label>Включено:</label><input id="c-enabled" type="checkbox"${conn ? (c.enabled ? ' checked' : '') : ' checked'} style="flex:0"></div>
+        <div class="modal-form-row" id="c-row-poll"><label>Период опроса (мс):</label><input id="c-poll" type="number" min="1" max="60000" step="5" value="${c.poll_interval_ms ?? 100}"></div>
+        <div class="modal-form-row" id="c-row-enabled"><label>Включено:</label><input id="c-enabled" type="checkbox"${conn ? (c.enabled ? ' checked' : '') : ' checked'} style="flex:0"></div>
         <div class="modal-btns">
             <button class="btn-del" onclick="closeModal()">Отмена</button>
             <button class="btn-action" onclick="ioConnSave(${conn ? conn.id : 0})">Сохранить</button>
@@ -501,7 +503,7 @@ function isSnap7(key) { return key === 'snap7' || key === 'snap7_s200'; }
 function ioConnDriverChanged(isNew) {
     const dt = document.getElementById('c-driver').value;
     const isS7 = isSnap7(dt);
-    // Виртуальный модуль — выражения, сетевые параметры ему не нужны.
+    // Виртуальный модуль — выражения, сетевые и runtime-параметры ему не нужны.
     const isVirt = dt === 'virtual';
     document.getElementById('c-row-ip').style.display = isVirt ? 'none' : '';
     document.getElementById('c-row-port').style.display = isVirt ? 'none' : '';
@@ -509,10 +511,9 @@ function ioConnDriverChanged(isNew) {
     document.getElementById('c-row-slot').style.display = isS7 ? '' : 'none';
     document.getElementById('c-row-tsap').style.display = isS7 ? '' : 'none';
     document.getElementById('c-row-slave').style.display = dt === 'modbus_client' ? '' : 'none';
+    document.getElementById('c-row-poll').style.display = isVirt ? 'none' : '';
+    document.getElementById('c-row-enabled').style.display = isVirt ? 'none' : '';
     if (!isVirt) document.getElementById('c-port').value = isS7 ? 102 : 502;
-    // Для виртуалов период опроса = частота пересчёта выражений.
-    const pollLabel = document.querySelector('#c-poll').closest('.modal-form-row').querySelector('label');
-    pollLabel.textContent = isVirt ? 'Период пересчёта (мс):' : 'Период опроса (мс):';
     // Автоподстановка TSAP только для новых подключений
     if (isNew && isS7) {
         const tsap = document.getElementById('c-tsap');
@@ -542,8 +543,8 @@ async function ioConnSave(id) {
     const body = {
         name: document.getElementById('c-name').value.trim() || 'Connection',
         driver_type: dt,
-        enabled: document.getElementById('c-enabled').checked,
-        poll_interval_ms: Number(document.getElementById('c-poll').value),
+        enabled: dt === 'virtual' ? true : document.getElementById('c-enabled').checked,
+        poll_interval_ms: dt === 'virtual' ? 500 : Number(document.getElementById('c-poll').value),
         config,
     };
     try {
