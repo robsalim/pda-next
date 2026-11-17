@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
+use printpdf::ParsedFont;
 use serde_json::{json, Value};
 
 use pda_core::database::db_service::{DatabaseService, DbConfig, DbConfigStore};
@@ -1448,6 +1449,22 @@ pub async fn export_file(
     ))
 }
 
+// ---------------------------------------------------------------- шрифт с кириллицей
+
+/// Пытается загрузить DejaVuSans.ttf (поддерживает кириллицу) из каталога fonts/
+/// рядом с ejecutable. Возвращает PdfFontHandle или None — тогда будет Helvetica.
+fn load_cyrillic_font(doc: &mut printpdf::PdfDocument) -> Option<printpdf::PdfFontHandle> {
+    for path in ["fonts/DejaVuSans.ttf", "./fonts/DejaVuSans.ttf"] {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Some(font) = ParsedFont::from_bytes(&bytes, 0, &mut Vec::new()) {
+                let font_id = doc.add_font(&font);
+                return Some(printpdf::PdfFontHandle::External(font_id));
+            }
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------- экспорт PDF
 
 /// Цвет RGB из строки CSS: rgb(r, g, b) → (r/255, g/255, b/255).
@@ -1490,8 +1507,7 @@ fn split_field_index(name: &str) -> (&str, Option<usize>) {
 }
 
 /// Экспорт PDF: клиент присылает PNG всех окон графиков + легенды.
-/// Каждое окно — отдельная страница A4 landscape: график по центру,
-/// под ним заголовок окна и легенда.
+/// Два графика на страницу A4 landscape (бок-о-бок), под каждым — заголовок и легенда.
 ///
 /// Поля multipart: `chart_{i}`, `title_{i}`, `legend_name_{i}[]`,
 /// `legend_color_{i}[]`; `title` без индекса — общий заголовок (имя файла).
@@ -1559,36 +1575,33 @@ pub async fn export_pdf(
 
     let mut doc = printpdf::PdfDocument::new(&format!("PDA Next — {doc_title}"));
 
-    // 3) Каждое окно графика — отдельная страница.
-    for (idx, page) in pages.iter() {
+    // Шрифт с поддержкой кириллицы (DejaVu Sans), с fallback на Helvetica.
+    let cyr_font = load_cyrillic_font(&mut doc);
+    let title_font = cyr_font
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| printpdf::PdfFontHandle::Builtin(printpdf::BuiltinFont::HelveticaBold));
+    let body_font = cyr_font
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| printpdf::PdfFontHandle::Builtin(printpdf::BuiltinFont::Helvetica));
+
+    // 3) Собираем валидные страницы в вектор.
+    let charts: Vec<ChartPage> = pages.into_values().collect();
+    for (i, page) in charts.iter().enumerate() {
         if page.png.len() < PNG_MAGIC.len() || page.png[..PNG_MAGIC.len()] != PNG_MAGIC {
-            return Err(ApiError(format!("chart_{idx} не является PNG")));
+            return Err(ApiError(format!("chart_{i} не является PNG")));
         }
-        let img_rgba = image::load_from_memory(&page.png)
-            .map_err(|e| ApiError(format!("Не удалось декодировать PNG {idx}: {e}")))?
-            .to_rgba8();
-        let (img_w, img_h) = (img_rgba.width() as usize, img_rgba.height() as usize);
+    }
 
-        // Высота легенды зависит от числа строк: заголовок окна + строки.
-        let rows = page.legend_names.len().min(page.legend_colors.len());
-        let legend_h = 18.0 + rows as f32 * 12.0 + 6.0;
-        let chart_area_w = page_w - 2.0 * margin;
-        let chart_area_h = (page_h - 2.0 * margin - legend_h).max(60.0);
+    // 4) Два графика на страницу (A4 ландшафт, бок-о-бок).
+    const CHARTS_PER_PAGE: usize = 2;
+    let total_pages = (charts.len() + CHARTS_PER_PAGE - 1) / CHARTS_PER_PAGE;
 
-        // Масштаб изображения (px → pt), с сохранением пропорций
-        let scale = (chart_area_w / img_w as f32).min(chart_area_h / img_h as f32);
-        let draw_x = margin + (chart_area_w - img_w as f32 * scale) / 2.0;
-        // PDF origin — снизу; график сверху, легенда снизу
-        let draw_y = margin + legend_h + (chart_area_h - img_h as f32 * scale) / 2.0;
-
-        let raw = printpdf::RawImage {
-            pixels: printpdf::RawImageData::U8(img_rgba.into_raw()),
-            width: img_w,
-            height: img_h,
-            data_format: printpdf::RawImageFormat::RGBA8,
-            tag: Vec::new(),
-        };
-        let img_id = doc.add_image(&raw);
+    for page_idx in 0..total_pages {
+        let start = page_idx * CHARTS_PER_PAGE;
+        let end = (start + CHARTS_PER_PAGE).min(charts.len());
+        let page_charts = &charts[start..end];
 
         let mut ops: Vec<printpdf::Op> = Vec::new();
 
@@ -1607,102 +1620,120 @@ pub async fn export_pdf(
             },
         });
 
-        // График. ВАЖНО: printpdf 0.12 рисует изображение в квадрате 1×1 и
-        // сам подставляет масштаб (px → pt по dpi) только при
-        // no_auto_scale = false. С true картинка сжималась до ~1 pt —
-        // страница выглядела пустой. dpi = 72 даёт 1 px = 1 pt, дальше
-        // scale_x/y — наш вписывающий масштаб, translate — позиция.
-        ops.push(printpdf::Op::UseXobject {
-            id: img_id,
-            transform: printpdf::XObjectTransform {
-                translate_x: Some(printpdf::Pt(draw_x)),
-                translate_y: Some(printpdf::Pt(draw_y)),
-                rotate: None,
-                scale_x: Some(scale),
-                scale_y: Some(scale),
-                dpi: Some(72.0),
-                no_auto_scale: false,
-            },
-        });
+        let chart_area_w = (page_w - margin * 3.0) / CHARTS_PER_PAGE as f32;
+        let chart_area_h = page_h - margin * 3.0;
 
+        for (col, page) in page_charts.iter().enumerate() {
+            let cx = margin + col as f32 * (chart_area_w + margin);
 
-        // 4) Легенда под графиком
-        let mut ly = margin + legend_h - 8.0; // отсчёт сверху вниз
+            let img_rgba = image::load_from_memory(&page.png)
+                .map_err(|e| ApiError(format!("chart_{} некорректный PNG: {e}", start + col)))?
+                .to_rgba8();
+            let (img_w, img_h) = (img_rgba.width() as usize, img_rgba.height() as usize);
 
-        // Название графика
-        let page_title = if page.title.is_empty() {
-            format!("График {}", idx + 1)
-        } else {
-            page.title.clone()
-        };
-        ops.push(printpdf::Op::StartTextSection);
-        ops.push(printpdf::Op::SetFillColor {
-            col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
-        });
-        ops.push(printpdf::Op::SetFont {
-            font: printpdf::PdfFontHandle::Builtin(printpdf::BuiltinFont::HelveticaBold),
-            size: printpdf::Pt(11.0),
-        });
-        ops.push(printpdf::Op::SetTextCursor {
-            pos: printpdf::Point {
-                x: printpdf::Pt(margin),
-                y: printpdf::Pt(ly),
-            },
-        });
-        ops.push(printpdf::Op::ShowText {
-            items: vec![printpdf::TextItem::Text(page_title)],
-        });
-        ops.push(printpdf::Op::EndTextSection);
+            // Масштаб изображения (px → pt), с сохранением пропорций
+            let scale = (chart_area_w / img_w as f32).min(chart_area_h / img_h as f32);
+            let draw_x = cx + (chart_area_w - img_w as f32 * scale) / 2.0;
+            let draw_y = margin + (chart_area_h - img_h as f32 * scale) / 2.0;
 
-        ly -= 14.0;
+            let raw = printpdf::RawImage {
+                pixels: printpdf::RawImageData::U8(img_rgba.into_raw()),
+                width: img_w,
+                height: img_h,
+                data_format: printpdf::RawImageFormat::RGBA8,
+                tag: Vec::new(),
+            };
+            let img_id = doc.add_image(&raw);
 
-        // Строки легенды
-        for (name, color_str) in page.legend_names.iter().zip(page.legend_colors.iter()) {
-            // Квадрат цвета
-            ops.push(printpdf::Op::SetFillColor {
-                col: css_rgb(color_str),
-            });
-            ops.push(printpdf::Op::DrawRectangle {
-                rectangle: printpdf::Rect {
-                    x: printpdf::Pt(margin),
-                    y: printpdf::Pt(ly - 3.0),
-                    width: printpdf::Pt(8.0),
-                    height: printpdf::Pt(8.0),
-                    mode: None,
-                    winding_order: None,
+            // График. ВАЖНО: printpdf 0.12 рисует изображение в квадрате 1×1 и
+            // сам подставляет масштаб (px → pt по dpi) только при
+            // no_auto_scale = false. dpi = 72 даёт 1 px = 1 pt.
+            ops.push(printpdf::Op::UseXobject {
+                id: img_id,
+                transform: printpdf::XObjectTransform {
+                    translate_x: Some(printpdf::Pt(draw_x)),
+                    translate_y: Some(printpdf::Pt(draw_y)),
+                    rotate: None,
+                    scale_x: Some(scale),
+                    scale_y: Some(scale),
+                    dpi: Some(72.0),
+                    no_auto_scale: false,
                 },
             });
-            // Текст
+
+            // Заголовок графика (над картинкой)
+            let page_title = if page.title.is_empty() {
+                format!("График {}", start + col + 1)
+            } else {
+                page.title.clone()
+            };
             ops.push(printpdf::Op::StartTextSection);
             ops.push(printpdf::Op::SetFillColor {
                 col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
             });
             ops.push(printpdf::Op::SetFont {
-                font: printpdf::PdfFontHandle::Builtin(printpdf::BuiltinFont::Helvetica),
-                size: printpdf::Pt(9.0),
+                font: title_font.clone(),
+                size: printpdf::Pt(11.0),
             });
             ops.push(printpdf::Op::SetTextCursor {
                 pos: printpdf::Point {
-                    x: printpdf::Pt(margin + 11.0),
-                    y: printpdf::Pt(ly),
+                    x: printpdf::Pt(cx),
+                    y: printpdf::Pt(page_h - margin - 12.0),
                 },
             });
             ops.push(printpdf::Op::ShowText {
-                items: vec![printpdf::TextItem::Text(name.clone())],
+                items: vec![printpdf::TextItem::Text(page_title)],
             });
             ops.push(printpdf::Op::EndTextSection);
-            ly -= 12.0;
+
+            // Легенда под заголовком
+            let mut ly = page_h - margin - 12.0 - 14.0;
+            for (name, color_str) in page.legend_names.iter().zip(page.legend_colors.iter()) {
+                // Квадрат цвета
+                ops.push(printpdf::Op::SetFillColor {
+                    col: css_rgb(color_str),
+                });
+                ops.push(printpdf::Op::DrawRectangle {
+                    rectangle: printpdf::Rect {
+                        x: printpdf::Pt(cx),
+                        y: printpdf::Pt(ly - 3.0),
+                        width: printpdf::Pt(8.0),
+                        height: printpdf::Pt(8.0),
+                        mode: None,
+                        winding_order: None,
+                    },
+                });
+                // Текст (с шрифтом с кириллицей)
+                ops.push(printpdf::Op::StartTextSection);
+                ops.push(printpdf::Op::SetFillColor {
+                    col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
+                });
+                ops.push(printpdf::Op::SetFont {
+                    font: body_font.clone(),
+                    size: printpdf::Pt(9.0),
+                });
+                ops.push(printpdf::Op::SetTextCursor {
+                    pos: printpdf::Point {
+                        x: printpdf::Pt(cx + 11.0),
+                        y: printpdf::Pt(ly),
+                    },
+                });
+                ops.push(printpdf::Op::ShowText {
+                    items: vec![printpdf::TextItem::Text(name.clone())],
+                });
+                ops.push(printpdf::Op::EndTextSection);
+                ly -= 12.0;
+            }
         }
 
-        // 5) Добавляем страницу
         doc.pages.push(printpdf::PdfPage::new(
             printpdf::Mm(page_w_mm),
             printpdf::Mm(page_h_mm),
             ops,
         ));
-    } // конец цикла по окнам графиков
+    } // конец цикла по страницам
 
-    // 6) Сохраняем
+    // 5) Сохраняем
     let path = unique_path(&dir, &safe_export_name(Some(&doc_title), "pdf"));
     let mut warnings = Vec::new();
     let bytes = doc.save(&printpdf::PdfSaveOptions::default(), &mut warnings);

@@ -212,13 +212,15 @@ function ioSelectGroup(g) {
 }
 
 // ------------------------------------------------------------------ таблица
-const IO_COLS = ['ID', 'Name', 'Группа', 'Address', 'Type', 'Scale', 'Offset', 'Unit', 'Value', 'Time'];
+const IO_COLS = ['ID', 'Цвет', 'Name', 'Группа', 'Address', 'Type', 'Scale', 'Offset', 'Unit', 'Value', 'Time'];
 // Маппинг названия колонки → поле тега (null = не в теге, а в liveRows)
 const COL_FIELD = {
-    'ID': 'id', 'Name': 'name', 'Группа': 'group_name', 'Address': 'address_str',
+    'ID': 'id', 'Цвет': null, 'Name': 'name', 'Группа': 'group_name', 'Address': 'address_str',
     'Type': 'data_type', 'Scale': 'scale', 'Offset': 'offset_val', 'Unit': 'unit',
     'Value': null, 'Time': null,
 };
+// Палитра цветов для сигналов в таблице (та же, что и в графиках app.js)
+const IO_TAG_COLORS = ['#667EEA', '#FF6384', '#4BC0C0', '#FF9F40', '#9966FF', '#FFCD56', '#00E676', '#E91E63'];
 let ioSortCol = null, ioSortDir = 1;
 let ioSelRows = new Set();    // выделенные строки (клик/Ctrl/Shift, как QTableView)
 let ioLastRow = null;         // якорь для shift-диапазона
@@ -304,6 +306,7 @@ function ioRenderTags() {
             ondblclick="ioEditTag(${t.id})" oncontextmenu="ioRowMenu(event, ${t.id})"
             ondragstart="ioRowDragStart(event, ${t.id})">
             <td>${t.id}</td>
+            <td style="text-align:center"><div class="io-color-cell" style="background:${IO_TAG_COLORS[tags.indexOf(t) % IO_TAG_COLORS.length]}"></div></td>
             <td><input type="checkbox"${checked} onclick="ioToggleCheck(${t.id}, this.checked); event.stopPropagation();"> ${fav ? '★ ' : ''}${escHtml(t.name)}</td>
             <td>${escHtml(t.group_name || 'Общие')}</td>
             <td>${escHtml(t.address_str)}</td>

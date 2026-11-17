@@ -286,3 +286,13 @@ table.io-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .modal-btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
 .confirm-text { color: var(--text); margin-bottom: 16px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 .confirm-btns { display: flex; gap: 8px; justify-content: flex-end; }
+
+/* Цветная ячейка сигнала в таблице I/O */
+.io-color-cell {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    box-shadow: 0 0 2px rgba(0,0,0,0.3);
+}
