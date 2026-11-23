@@ -196,15 +196,43 @@ async fn read_block(
     Ok(cells)
 }
 
+/// Транспортная ли это ошибка (обрыв/таймаут сокета), а не soft-ответ ПЛК.
+///
+/// tokio-modbus все ошибки отдаёт как `std::io::Error`: Modbus-exceptions
+/// (IllegalDataAddress и т.п.) приходят с kind = Other/Uncategorized, а
+/// обрыв/таймаут сокета — с kinds из списка ниже. Строковый поиск по тексту
+/// сообщения ненадёжен: на Windows "Broken pipe" и "unexpected EOF during
+/// read" не содержат слов "timeout"/"connection", из-за чего watchdog раньше
+/// не видел потерю связи и не перезапускал модуль.
+fn is_transport_io_err(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind as K;
+    matches!(
+        e.kind(),
+        K::BrokenPipe
+            | K::UnexpectedEof
+            | K::ConnectionReset
+            | K::ConnectionRefused
+            | K::ConnectionAborted
+            | K::TimedOut
+            | K::NotConnected
+            | K::WriteZero
+    )
+}
+
 /// Читает все блоки всех областей -> {(область, смещение): значение}.
 /// Ошибки отдельных блоков мягкие: записываем в last_error и идём дальше.
+/// `transport_fault` выставляется, если хотя бы одна ошибка — транспортного
+/// уровня (обрыв/таймаут сокета): драйвер обязан сбросить ctx, супервизор —
+/// не считать цикл успешным.
 pub async fn read_blocks(
     ctx: &mut MbContext,
     plan: &[(String, Vec<Block>)],
     req_count: &mut usize,
     last_error: &mut Option<String>,
+    transport_fault: &mut bool,
 ) -> HashMap<(String, u32), Cell> {
     let mut cells: HashMap<(String, u32), Cell> = HashMap::new();
+    *transport_fault = false;
     for (area, blocks) in plan {
         for &(start, count) in blocks {
             match read_block(ctx, area, start, count).await {
@@ -215,6 +243,9 @@ pub async fn read_blocks(
                     }
                 }
                 Err(e) => {
+                    if is_transport_io_err(&e) {
+                        *transport_fault = true;
+                    }
                     *last_error = Some(format!("FC{area} {start}+{count}: {e}"));
                 }
             }
@@ -327,14 +358,9 @@ pub async fn run_modbus_client(
         let c = ctx.as_mut().expect("есть соединение");
         let plan = plan_by_area(&tags, merge_gap);
         let t_read = Instant::now();
-        let cells = read_blocks(c, &plan, &mut requests, &mut last_error).await;
+        let mut transport_fault = false;
+        let cells = read_blocks(c, &plan, &mut requests, &mut last_error, &mut transport_fault).await;
         let read_ms = t_read.elapsed().as_secs_f64();
-
-        // Транспорт умер? (обрыв, таймаут сокета) — в следующем цикле переподключимся
-        let transport_fault = last_error
-            .as_deref()
-            .map(|e| e.contains("timeout") || e.contains("connection") || e.contains("Connection"))
-            .unwrap_or(false);
 
         // Супервизору: цикл прошёл по живому транспорту (мягкие ошибки
         // отдельных адресов и пустой план чтением не считаются).
@@ -455,5 +481,38 @@ mod tests {
         assert_eq!(decode_raw(&t, &cells).unwrap(), 1.0);
         let t = tag(5, "IR5", "UINT16");
         assert_eq!(decode_raw(&t, &cells), None);
+    }
+
+    /// Обрыв сокета (BrokenPipe/UnexpectedEof/ConnectionReset/TimedOut) —
+    /// транспортная ошибка: watchdog обязан увидеть потерю связи и перезапустить
+    /// модуль. Строковый поиск по `e.to_string()` такие тексты на Windows не
+    /// ловил — "Broken pipe" и "unexpected EOF during read" не содержат ни
+    /// "timeout", ни "connection".
+    #[test]
+    fn transport_io_errors_are_recognised() {
+        use std::io::{Error, ErrorKind as K};
+        for kind in [
+            K::BrokenPipe,
+            K::UnexpectedEof,
+            K::ConnectionReset,
+            K::ConnectionRefused,
+            K::ConnectionAborted,
+            K::TimedOut,
+            K::NotConnected,
+            K::WriteZero,
+        ] {
+            let e = Error::new(kind, "synthetic");
+            assert!(is_transport_io_err(&e), "{kind:?} must be transport");
+        }
+    }
+
+    /// Modbus-exception (IllegalDataAddress и т.п.) tokio-modbus отдаёт как
+    /// io::Error с kind = Other — это НЕ потеря связи: ПЛК отвечает, перезапуск
+    /// не нужен, watchdog не должен вмешиваться.
+    #[test]
+    fn modbus_exception_is_not_transport() {
+        use std::io::{Error, ErrorKind as K};
+        let e = Error::new(K::Other, "Exception response: code 2 (IllegalDataAddress)");
+        assert!(!is_transport_io_err(&e));
     }
 }
