@@ -789,6 +789,34 @@ function autoScaleY() {
     if (win && win.chart) fitYToVisible(win.chart);
 }
 
+/// Перенести временные границы АКТИВНОГО окна графика на все остальные окна.
+/// Интервал берётся из канвы (u.scales.x), а не из fullRangeOf: нужен именно
+/// тот участок, который оператор разглядывает сейчас, а не весь загруженный.
+/// Окна без сигналов пропускаем — масштабировать нечего. Догрузка данных под
+/// новый интервал не нужна руками: setScale дёргает хук setScale, а он сам
+/// зовёт scheduleZoomReload, если окно вышло за загруженное покрытие.
+function syncZoomToAll() {
+    const src = getActiveWindow();
+    if (!src || !src.chart) { chartsStatusLine('Перенос масштаба: нет активного графика', true); return; }
+    let t0 = src.chart.scales.x.min, t1 = src.chart.scales.x.max;
+    if (!(t1 > t0)) {
+        const r = fullRangeOf(src);        // окно на авто-шкале — берём загруженный интервал
+        if (!r) { chartsStatusLine('Перенос масштаба: у активного графика нет данных', true); return; }
+        [t0, t1] = r;
+    }
+    const targets = chartWindows.filter(w => w !== src && w.chart && w.signals.length);
+    if (!targets.length) { chartsStatusLine('Перенос масштаба: других графиков с сигналами нет'); return; }
+    for (const w of targets) {
+        // Флаг ставим сами: хук setScale может не отработать, если в этот момент
+        // идёт live-тик (suppressReload), а окно после переноса точно ЗУМИРОВАНО.
+        w.zoomed = true;
+        w.chart.setScale('x', { min: t0, max: t1 });
+    }
+    if (src.id === activeWindowId) userZoomedCharts = true;
+    chartsStatusLine(`Масштаб ${formatTime(t0)} — ${formatTime(t1)} перенесён на ${targets.length} гр.`);
+}
+
+
 /// Автомасштаб по времени для графика бит. Интервал загрузки помним отдельно:
 /// после зума payload.t_start/t_end перезаписываются видимым окном.
 function autoScaleXBits() {
