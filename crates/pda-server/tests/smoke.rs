@@ -1111,8 +1111,9 @@ async fn export_pdf_places_chart_at_real_size() {
     });
     assert!(has_img, "в PDF есть Image XObject 1500 px");
 
-    // В потоке содержимого перед Do масштаб cm обязан быть ~757×353 pt
-    // (область A4 минус поля), а не 0.5 pt — признак сжатого в точку рисунка.
+    // В потоке содержимого перед Do масштаб cm обязан быть ~808×377 pt
+    // (область A4 минус поля по ширине, сжатый по ширине график по высоте),
+    // а не 0.5 pt — признак сжатого в точку рисунка.
     let content = doc.get_and_decode_page_content(pages[0]).expect("content stream");
     let ops = &content.operations;
     let mut found = false;
@@ -1126,7 +1127,8 @@ async fn export_pdf_places_chart_at_real_size() {
         let a = cm.operands[0].as_float().unwrap_or_default();
         let d = cm.operands[3].as_float().unwrap_or_default();
         assert!(
-            (700.0..800.0).contains(&a) && (320.0..400.0).contains(&d),
+            (790.0..830.0).contains(&a) && (360.0..410.0).contains(&d),
+
             "график вписан в страницу в реальную величину, а не сжат в точку: cm=[{a},{d}]"
         );
         found = true;

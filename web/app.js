@@ -2202,22 +2202,19 @@ async function exportAllChartsPdf() {
         }
         if (!charts.length) throw new Error('Не удалось захватить графики');
 
-        // 2) Отправляем на сервер: chart_i.png, chart_w_i/chart_h_i (размер окна с экрана),
-        // title_i, legend_name_i[]/legend_color_i[]
+        // 2) Отправляем на сервер: chart_i.png, title_i, legend_name_i[]/legend_color_i[]
         const formData = new FormData();
         formData.append('title', title);
         for (let i = 0; i < charts.length; i++) {
             const { win, pngBlob } = charts[i];
-            const c = win.chart?.ctx?.canvas;
             formData.append(`chart_${i}`, pngBlob, `chart_${i}.png`);
-            formData.append(`chart_w_${i}`, String(c?.width ?? 1000));
-            formData.append(`chart_h_${i}`, String(c?.height ?? 400));
             formData.append(`title_${i}`, chartWindowTitle(win));
             for (const row of collectLegendRows(win)) {
                 formData.append(`legend_name_${i}[]`, row.name);
                 formData.append(`legend_color_${i}[]`, row.color);
             }
         }
+
 
         // 3) Запрашиваем PDF
         const r = await fetch('/api/export/pdf?count=' + charts.length, {

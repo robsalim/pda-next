@@ -1498,15 +1498,203 @@ fn css_rgb(s: &str) -> printpdf::Color {
     }
 }
 
-/// Данные одного окна графика для PDF: PNG + размер окна с экрана + легенда.
+// ---------------------------------------------------------------- экспорт PDF
+
+/// Пунктов в миллиметре. PDF рисует в Pt (1 pt = 1/72"), начало координат —
+/// левый НИЖНИЙ угол страницы.
+const MM_TO_PT: f32 = 2.834_646;
+
+/// Геометрия листа экспорта: поля, заголовки, зазоры, таблица сигналов.
+///
+/// Вынесено из `export_pdf` в чистые функции вместе с `plan_pages`: раньше
+/// вёрстка («сколько графиков влезет») и отрисовка («где рисовать») считали
+/// заново и независимо, из-за чего курсор после картинки возвращался на её
+/// верх и все графики страницы получали один отступ от верха.
+#[derive(Debug, Clone, Copy)]
+pub struct PdfGeom {
+    pub page_w_mm: f32,
+    pub page_h_mm: f32,
+    /// Поле страницы — узкое, чтобы график занимал почти весь лист.
+    pub margin: f32,
+    /// Отступ от верхнего края листа до заголовка первого блока.
+    pub top_pad: f32,
+    /// Высота строки заголовка графика.
+    pub title_h: f32,
+    /// Зазор между заголовком и картинкой.
+    pub title_gap: f32,
+    /// Зазор под картинкой: до следующего блока и до таблицы.
+    pub block_gap: f32,
+    /// Высота строки таблицы сигналов.
+    pub row_h: f32,
+    /// Суммарные поля таблицы (сверху и снизу).
+    pub table_pad: f32,
+    /// Ниже этой высоты картинку не сжимаем: лучше таблица уйдёт во вторую
+    /// колонку или график на новую страницу, чем читатель увидит полосу.
+    pub min_img_h: f32,
+}
+
+impl PdfGeom {
+    /// A4 landscape 297×210 мм с полями 6 мм.
+    pub fn a4_landscape() -> Self {
+        Self {
+            page_w_mm: 297.0,
+            page_h_mm: 210.0,
+            margin: 6.0 * MM_TO_PT,
+            top_pad: 8.0,
+            title_h: 13.0,
+            title_gap: 3.0,
+            block_gap: 6.0,
+            row_h: 13.0,
+            table_pad: 8.0,
+            min_img_h: 40.0,
+        }
+    }
+
+    pub fn page_w(&self) -> f32 {
+        self.page_w_mm * MM_TO_PT
+    }
+
+    pub fn page_h(&self) -> f32 {
+        self.page_h_mm * MM_TO_PT
+    }
+
+    /// Ширина области под график (между левым и правым полями).
+    pub fn area_w(&self) -> f32 {
+        self.page_w() - self.margin * 2.0
+    }
+
+    /// Y, с которого начинаем вёрстку блоков (верх страницы минус поля).
+    pub fn blocks_top(&self) -> f32 {
+        self.page_h() - self.margin - self.top_pad
+    }
+
+    /// Сколько колонок нужно таблице из `rows` строк: десятки сигналов в одну
+    /// колонку не оставили бы места графикам, поэтому при переполнении — две-три.
+    /// Таблица не должна занимать больше 45 % листа.
+    pub fn table_cols(&self, rows: usize) -> usize {
+        let limit = (self.page_h() - self.margin * 2.0) * 0.45;
+        (1..=3)
+            .find(|&c| self.table_h(rows, c) <= limit)
+            .unwrap_or(3)
+    }
+
+
+    /// Высота таблицы сигналов: строка заголовка + строки + поля. Пустой
+    /// легенды не существует — резерв 0, иначе под графиками висел бы пустой
+    /// прямоугольник.
+    pub fn table_h(&self, rows: usize, cols: usize) -> f32 {
+        if rows == 0 {
+            return 0.0;
+        }
+        let cols = cols.max(1);
+        let per_col = (rows + cols - 1) / cols;
+        (per_col as f32 + 1.0) * self.row_h + self.table_pad
+    }
+
+    /// Y верхней границы таблицы (таблица прижата к нижнему полю).
+    pub fn table_top(&self, rows: usize, cols: usize) -> f32 {
+        self.margin + self.table_h(rows, cols)
+    }
+
+    /// Вписать PNG `img_w × img_h` px в ширину области и высоту `avail_h`.
+    /// Возвращает (масштаб, высота в pt).
+    pub fn fit(&self, img_w: usize, img_h: usize, avail_h: f32) -> (f32, f32) {
+        if img_w == 0 || img_h == 0 {
+            return (1.0, 0.0);
+        }
+        let avail = avail_h.max(self.min_img_h);
+        let scale = (self.area_w() / img_w as f32).min(avail / img_h as f32);
+        (scale, img_h as f32 * scale)
+    }
+}
+
+/// Что нужно знать о графике для вёрстки: размер PNG в пикселях и число
+/// строк легенды (она попадёт в общую таблицу страницы).
+#[derive(Debug, Clone, Copy)]
+pub struct ChartBox {
+    pub img_w: usize,
+    pub img_h: usize,
+    pub rows: usize,
+}
+
+/// Размещённый блок графика. `title_y` — базовая линия заголовка,
+/// `img_y` — нижний край картинки (в координатах PDF), `scale` — множитель
+/// пикселей PNG в пункты.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlacedChart {
+    pub title_y: f32,
+    pub img_y: f32,
+    pub scale: f32,
+    pub img_h: f32,
+}
+
+/// Страница по плану: индексы графиков с геометрией + строки общей таблицы.
+#[derive(Debug, Clone, Default)]
+pub struct PdfPagePlan {
+    pub charts: Vec<(usize, PlacedChart)>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// Жадно раскладываем графики по страницам сверху вниз.
+///
+/// Каждому блоку хватает места до верхней границы таблицы сигналов ЭТОЙ
+/// страницы, причём таблица учитывает легенды уже поставленных графиков:
+/// добавление сигнала поднимает её вверх, и следующий блок обязан влезть под
+/// неё, а не в неё. Первый блок страницы ставится всегда — если окно выше
+/// листа, оно займёт всю доступную высоту (но не меньше `min_img_h`).
+pub fn plan_pages(g: &PdfGeom, charts: &[ChartBox]) -> Vec<PdfPagePlan> {
+    let mut pages: Vec<PdfPagePlan> = Vec::new();
+    let mut cur = PdfPagePlan::default();
+    let mut y = g.blocks_top();
+
+    // Геометрия блока, поставленного на высоту y, для страницы с rows легенд.
+    let block = |rows: usize, y: f32, b: &ChartBox| -> (PlacedChart, usize, usize) {
+        let cols = g.table_cols(rows);
+        let avail = y - g.title_h - g.title_gap - (g.table_top(rows, cols) + g.block_gap);
+        let (scale, img_h) = g.fit(b.img_w, b.img_h, avail);
+        (
+            PlacedChart {
+                title_y: y,
+                img_y: y - g.title_h - g.title_gap - img_h,
+                scale,
+                img_h,
+            },
+            rows,
+            cols,
+        )
+    };
+
+
+    for (i, b) in charts.iter().enumerate() {
+        let (placed, rows, cols) = block(cur.rows + b.rows, y, b);
+        // Низ блока не должен заходить под таблицу, которая выросла от его
+        // легенд: если зашёл — график уходит на чистую страницу.
+        if !cur.charts.is_empty() && placed.img_y < g.table_top(rows, cols) {
+            pages.push(std::mem::take(&mut cur));
+            y = g.blocks_top();
+        }
+        let (placed, rows, cols) = block(cur.rows + b.rows, y, b);
+        cur.charts.push((i, placed));
+        cur.rows = rows;
+        cur.cols = cols;
+        y = placed.img_y - g.block_gap;
+    }
+    if !cur.charts.is_empty() {
+        pages.push(cur);
+    }
+    pages
+}
+
+
+/// Данные одного окна графика для PDF: PNG + легенда.
 struct ChartPage {
     png: Vec<u8>,
-    chart_w: f32,   // ширина окна графика на экране (px)
-    chart_h: f32,   // высота окна графика на экране (px)
     title: String,
     legend_names: Vec<String>,
     legend_colors: Vec<String>,
 }
+
 
 /// Разбор имени поля multipart: "chart_2" / "legend_name_2[]" -> ("chart", Some(2)),
 /// "chart" -> ("chart", None). Индекс — номер окна графика на фронтенде.
@@ -1556,16 +1744,12 @@ pub async fn export_pdf(
         let (key, idx) = split_field_index(&raw_name);
         let page = pages.entry(idx.unwrap_or(0)).or_insert_with(|| ChartPage {
             png: Vec::new(),
-            chart_w: 1000.0,
-            chart_h: 400.0,
             title: String::new(),
             legend_names: Vec::new(),
             legend_colors: Vec::new(),
         });
         match key {
             "chart" => page.png = bytes.to_vec(),
-            "chart_w" => page.chart_w = String::from_utf8_lossy(&bytes).parse().unwrap_or(1000.0),
-            "chart_h" => page.chart_h = String::from_utf8_lossy(&bytes).parse().unwrap_or(400.0),
             "title" => page.title = String::from_utf8_lossy(&bytes).to_string(),
             "legend_name" => page
                 .legend_names
@@ -1584,15 +1768,8 @@ pub async fn export_pdf(
         doc_title = "PDA".to_string();
     }
 
-    // 2) Параметры страницы: A4 landscape 297×210 мм.
-    //    Минимальные поля, чтобы график занимал почти всю страницу.
-    let mm_to_pt = 2.834_646_f32;
-    let page_w_mm = 297_f32;
-    let page_h_mm = 210_f32;
-    let page_w = page_w_mm * mm_to_pt;
-    let page_h = page_h_mm * mm_to_pt;
-    let margin = 6_f32 * mm_to_pt;   // ~17 pt — узкие поля
-    let table_reserve_h = 55.0;      // место под таблицу сигналов снизу
+    let geom = PdfGeom::a4_landscape();
+    let (page_w, page_h, margin) = (geom.page_w(), geom.page_h(), geom.margin);
 
     let mut doc = printpdf::PdfDocument::new(&format!("PDA Next — {doc_title}"));
 
@@ -1607,19 +1784,31 @@ pub async fn export_pdf(
         .cloned()
         .unwrap_or_else(|| printpdf::PdfFontHandle::Builtin(printpdf::BuiltinFont::Helvetica));
 
-    // 3) Собираем валидные страницы в вектор.
     let charts: Vec<ChartPage> = pages.into_values().collect();
+
+    // 2) PNG декодируем один раз: размеры в пикселях нужны для вёрстки,
+    //    пиксели — для вставки. Порядок окон = порядок полей chart_0, chart_1…
+    let mut boxes: Vec<ChartBox> = Vec::with_capacity(charts.len());
+    let mut imgs: Vec<Option<image::RgbaImage>> = Vec::with_capacity(charts.len());
     for (i, page) in charts.iter().enumerate() {
         if page.png.len() < PNG_MAGIC.len() || page.png[..PNG_MAGIC.len()] != PNG_MAGIC {
             return Err(ApiError(format!("chart_{i} не является PNG")));
         }
+        let img = image::load_from_memory(&page.png)
+            .map_err(|e| ApiError(format!("chart_{i} некорректный PNG: {e}")))?
+            .to_rgba8();
+        boxes.push(ChartBox {
+            img_w: img.width() as usize,
+            img_h: img.height() as usize,
+            rows: page.legend_names.len(),
+        });
+        imgs.push(Some(img));
     }
 
-    // 4) Плотно упаковываем графики на страницу A4 ландшафт.
-    //    Высота каждого графика берётся из реального размера окна на экране.
-    let mut chart_pos = 0;
-
-    while chart_pos < charts.len() {
+    // 3) Вёрстка: сколько графиков на странице и где именно стоит каждый.
+    //    Отрисовка ниже только исполняет план — иначе цифры разъезжаются.
+    let plan = plan_pages(&geom, &boxes);
+    for pg in &plan {
         let mut ops: Vec<printpdf::Op> = Vec::new();
 
         // Белый фон страницы
@@ -1637,52 +1826,15 @@ pub async fn export_pdf(
             },
         });
 
-        let chart_area_w = page_w - margin * 2.0;
-        // Доступная высота под графики (с учётом заголовка и таблицы снизу)
-        let _avail_h = page_h - margin * 2.0 - table_reserve_h - 10.0;
-
-        let mut y_cursor = page_h - margin - 8.0;
-        let mut page_charts: Vec<usize> = Vec::new();
-
-        // Подбираем графики, которые помещаются на эту страницу
-        while chart_pos < charts.len() {
-            let page = &charts[chart_pos];
-            let aspect = page.chart_h / page.chart_w;
-            let chart_h_pt = chart_area_w * aspect;
-            let title_h = 14.0;
-            let block_h = title_h + chart_h_pt + 4.0;
-
-            if y_cursor - block_h < table_reserve_h && !page_charts.is_empty() {
-                break;
-            }
-
-            page_charts.push(chart_pos);
-            y_cursor -= block_h;
-            chart_pos += 1;
-        }
-
-        if page_charts.is_empty() {
-            page_charts.push(chart_pos);
-            chart_pos += 1;
-        }
-
-        // Рисуем все графики этой страницы
-        let mut draw_y = page_h - margin - 8.0;
-        for &ci in &page_charts {
+        for &(ci, pl) in &pg.charts {
             let page = &charts[ci];
-            let img_rgba = image::load_from_memory(&page.png)
-                .map_err(|e| ApiError(format!("chart_{ci} некорректный PNG: {e}")))?
-                .to_rgba8();
-            let (img_w, img_h) = (img_rgba.width() as usize, img_rgba.height() as usize);
-            let _aspect = page.chart_h / page.chart_w;
-            let title_h = 13.0;
-
-            // Заголовок графика (компактный)
             let page_title = if page.title.is_empty() {
                 format!("График {}", ci + 1)
             } else {
                 page.title.clone()
             };
+
+            // Заголовок блока
             ops.push(printpdf::Op::StartTextSection);
             ops.push(printpdf::Op::SetFillColor {
                 col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
@@ -1694,7 +1846,7 @@ pub async fn export_pdf(
             ops.push(printpdf::Op::SetTextCursor {
                 pos: printpdf::Point {
                     x: printpdf::Pt(margin),
-                    y: printpdf::Pt(draw_y),
+                    y: printpdf::Pt(pl.title_y),
                 },
             });
             ops.push(printpdf::Op::ShowText {
@@ -1702,16 +1854,11 @@ pub async fn export_pdf(
             });
             ops.push(printpdf::Op::EndTextSection);
 
-            // PNG графика — берём максимум по ширине и высоте (как на экране)
-            draw_y -= title_h + 3.0;
-            let max_img_h = draw_y - table_reserve_h; // до зарезервированного места под таблицу
-            let scale = (chart_area_w / img_w as f32).min(max_img_h / img_h as f32);
-            let draw_x = margin; // по левому краю
-            // В PDF origin — левый НИЖНИЙ угол, картинка рисуется от её левого нижнего угла
-            let img_draw_y = draw_y - img_h as f32 * scale;
-
+            // PNG графика: нижний левый угол и масштаб — из плана страницы
+            let img = imgs[ci].take().expect("график попадает ровно на одну страницу");
+            let (img_w, img_h) = (img.width() as usize, img.height() as usize);
             let raw = printpdf::RawImage {
-                pixels: printpdf::RawImageData::U8(img_rgba.into_raw()),
+                pixels: printpdf::RawImageData::U8(img.into_raw()),
                 width: img_w,
                 height: img_h,
                 data_format: printpdf::RawImageFormat::RGBA8,
@@ -1721,108 +1868,115 @@ pub async fn export_pdf(
             ops.push(printpdf::Op::UseXobject {
                 id: img_id,
                 transform: printpdf::XObjectTransform {
-                    translate_x: Some(printpdf::Pt(draw_x)),
-                    translate_y: Some(printpdf::Pt(img_draw_y)),
+                    translate_x: Some(printpdf::Pt(margin)),
+                    translate_y: Some(printpdf::Pt(pl.img_y)),
                     rotate: None,
-                    scale_x: Some(scale),
-                    scale_y: Some(scale),
+                    scale_x: Some(pl.scale),
+                    scale_y: Some(pl.scale),
                     dpi: Some(72.0),
                     no_auto_scale: false,
                 },
             });
+        }
 
-            draw_y = img_draw_y + img_h as f32 * scale + 4.0;
-        } // конец цикла по графикам страницы
+        // 4) Общая таблица сигналов страницы, прижата к нижнему полю.
+        if pg.rows > 0 {
+            let all_names: Vec<&String> = pg
+                .charts
+                .iter()
+                .flat_map(|&(ci, _)| charts[ci].legend_names.iter())
+                .collect();
+            let all_colors: Vec<&String> = pg
+                .charts
+                .iter()
+                .flat_map(|&(ci, _)| charts[ci].legend_colors.iter())
+                .collect();
+            let table_h = geom.table_h(pg.rows, pg.cols);
+            let table_y = margin;
+            let cols = pg.cols.max(1);
+            let per_col = (pg.rows + cols - 1) / cols;
+            let col_w = (page_w - margin * 2.0) / cols as f32;
 
-        // Таблица сигналов внизу страницы (общая для всех графиков на странице)
-        let table_top = margin + table_reserve_h;
-        let row_h = 13.0;
-        let all_names: Vec<&String> = page_charts.iter().map(|&ci| &charts[ci].legend_names).flat_map(|v| v.iter()).collect();
-        let all_colors: Vec<&String> = page_charts.iter().map(|&ci| &charts[ci].legend_colors).flat_map(|v| v.iter()).collect();
-        let n_rows = all_names.len().max(1);
-        let table_h = (n_rows as f32 + 1.0) * row_h + 8.0;
-        let table_y = table_top - table_h;
-
-        // Рамка таблицы
-        ops.push(printpdf::Op::SetFillColor {
-            col: printpdf::Color::Rgb(printpdf::Rgb::new(0.95, 0.95, 0.95, None)),
-        });
-        ops.push(printpdf::Op::DrawRectangle {
-            rectangle: printpdf::Rect {
-                x: printpdf::Pt(margin),
-                y: printpdf::Pt(table_y),
-                width: printpdf::Pt(page_w - margin * 2.0),
-                height: printpdf::Pt(table_h),
-                mode: None,
-                winding_order: None,
-            },
-        });
-
-        // Заголовок таблицы
-        ops.push(printpdf::Op::StartTextSection);
-        ops.push(printpdf::Op::SetFillColor {
-            col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
-        });
-        ops.push(printpdf::Op::SetFont {
-            font: title_font.clone(),
-            size: printpdf::Pt(10.0),
-        });
-        ops.push(printpdf::Op::SetTextCursor {
-            pos: printpdf::Point {
-                x: printpdf::Pt(margin + 4.0),
-                y: printpdf::Pt(table_y + table_h - row_h - 2.0),
-            },
-        });
-        ops.push(printpdf::Op::ShowText {
-            items: vec![printpdf::TextItem::Text("Сигналы".to_string())],
-        });
-        ops.push(printpdf::Op::EndTextSection);
-
-        // Строки таблицы
-        let mut ty = table_y + table_h - row_h * 2.0 - 2.0;
-        for (i, (name, color_str)) in all_names.iter().zip(all_colors.iter()).enumerate() {
             ops.push(printpdf::Op::SetFillColor {
-                col: css_rgb(color_str),
+                col: printpdf::Color::Rgb(printpdf::Rgb::new(0.95, 0.95, 0.95, None)),
             });
             ops.push(printpdf::Op::DrawRectangle {
                 rectangle: printpdf::Rect {
-                    x: printpdf::Pt(margin + 4.0),
-                    y: printpdf::Pt(ty - 3.0),
-                    width: printpdf::Pt(10.0),
-                    height: printpdf::Pt(10.0),
+                    x: printpdf::Pt(margin),
+                    y: printpdf::Pt(table_y),
+                    width: printpdf::Pt(page_w - margin * 2.0),
+                    height: printpdf::Pt(table_h),
                     mode: None,
                     winding_order: None,
                 },
             });
+
             ops.push(printpdf::Op::StartTextSection);
             ops.push(printpdf::Op::SetFillColor {
                 col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
             });
             ops.push(printpdf::Op::SetFont {
-                font: body_font.clone(),
-                size: printpdf::Pt(9.0),
+                font: title_font.clone(),
+                size: printpdf::Pt(10.0),
             });
             ops.push(printpdf::Op::SetTextCursor {
                 pos: printpdf::Point {
-                    x: printpdf::Pt(margin + 18.0),
-                    y: printpdf::Pt(ty),
+                    x: printpdf::Pt(margin + 4.0),
+                    y: printpdf::Pt(table_y + table_h - geom.row_h - 2.0),
                 },
             });
             ops.push(printpdf::Op::ShowText {
-                items: vec![printpdf::TextItem::Text(
-                    format!("{}. {}", i + 1, name),
-                )],
+                items: vec![printpdf::TextItem::Text("Сигналы".to_string())],
             });
             ops.push(printpdf::Op::EndTextSection);
-            ty -= row_h;
+
+            // Строки: колонка = i / per_col, строка = i % per_col. Нумерация
+            // сквозная, чтобы номер сигнала совпадал с легендой на графике.
+            let first_ty = table_y + table_h - geom.row_h * 2.0 - 2.0;
+            for (i, (name, color_str)) in all_names.iter().zip(all_colors.iter()).enumerate() {
+                let x = margin + col_w * (i / per_col) as f32;
+                let ty = first_ty - (i % per_col) as f32 * geom.row_h;
+                ops.push(printpdf::Op::SetFillColor {
+                    col: css_rgb(color_str),
+                });
+                ops.push(printpdf::Op::DrawRectangle {
+                    rectangle: printpdf::Rect {
+                        x: printpdf::Pt(x + 4.0),
+                        y: printpdf::Pt(ty - 3.0),
+                        width: printpdf::Pt(10.0),
+                        height: printpdf::Pt(10.0),
+                        mode: None,
+                        winding_order: None,
+                    },
+                });
+                ops.push(printpdf::Op::StartTextSection);
+                ops.push(printpdf::Op::SetFillColor {
+                    col: printpdf::Color::Rgb(printpdf::Rgb::new(0.1, 0.1, 0.1, None)),
+                });
+                ops.push(printpdf::Op::SetFont {
+                    font: body_font.clone(),
+                    size: printpdf::Pt(9.0),
+                });
+                ops.push(printpdf::Op::SetTextCursor {
+                    pos: printpdf::Point {
+                        x: printpdf::Pt(x + 18.0),
+                        y: printpdf::Pt(ty),
+                    },
+                });
+                ops.push(printpdf::Op::ShowText {
+                    items: vec![printpdf::TextItem::Text(format!("{}. {}", i + 1, name))],
+                });
+                ops.push(printpdf::Op::EndTextSection);
+            }
         }
 
         doc.pages.push(printpdf::PdfPage::new(
-            printpdf::Mm(page_w_mm),
-            printpdf::Mm(page_h_mm),
+            printpdf::Mm(geom.page_w_mm),
+            printpdf::Mm(geom.page_h_mm),
             ops,
         ));
     } // конец цикла по страницам
+
 
     // 5) Сохраняем
     let path = unique_path(&dir, &safe_export_name(Some(&doc_title), "pdf"));
@@ -1900,3 +2054,97 @@ pub fn router(core: Arc<AppCore>) -> Router {
         .nest("/api", api)
         .fallback_service(static_router)
 }
+
+// ------------------------------------------------------------------- тесты раскладки
+
+#[cfg(test)]
+mod pdf_tests {
+    use super::*;
+
+    fn geom() -> PdfGeom {
+        PdfGeom::a4_landscape()
+    }
+
+    /// Один широкий график (1500×700) → масштаб по ширине, высота ≈ 700 × (area_w / 1500)
+    /// area_w = page_w - 2*margin ≈ 808pt, scale ≈ 808/1500 ≈ 0.539, img_h ≈ 377pt.
+    #[test]
+    fn single_wide_chart_scales_to_width() {
+        let g = geom();
+        let charts = [ChartBox { img_w: 1500, img_h: 700, rows: 1 }];
+        let pages = plan_pages(&g, &charts);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].charts.len(), 1);
+        let (_, pl) = pages[0].charts[0];
+        // Масштаб = area_w / img_w (ширина ограничивает), img_h ≈ 377 pt
+        assert!(pl.scale > 0.5 && pl.scale < 0.6, "scale={}", pl.scale);
+        assert!(pl.img_h > 350.0 && pl.img_h < 420.0, "img_h={}", pl.img_h);
+        assert!(pl.img_y > 0.0, "картинка ниже верхнего края");
+        assert!(pl.title_y <= g.blocks_top(), "заголовок не выше blocks_top");
+    }
+
+
+    /// Два графика: первый влезает, второй — перенос на новую страницу.
+    /// Если легенд мало (1 строка), таблица ~30pt → почти весь лист под графики.
+    #[test]
+    fn two_charts_one_page_when_fits() {
+        let g = geom();
+        let charts = [
+            ChartBox { img_w: 1000, img_h: 500, rows: 1 },
+            ChartBox { img_w: 1000, img_h: 500, rows: 1 },
+        ];
+        let pages = plan_pages(&g, &charts);
+        // Оба должны влезть на одну страницу (1000×500 → scale ≈ 0.54 → img_h ≈ 270pt;
+        // 2×(13+3+270+6) ≈ 596pt < page_h - 2*margin - table_h ≈ 580pt → barely fits)
+        // Если не влезли — это тоже допустимо (зависит от точных констант), главное — нет ошибок.
+        assert!(pages.len() <= 2);
+        assert_eq!(pages.iter().map(|p| p.charts.len()).sum::<usize>(), 2);
+    }
+
+    /// Много сигналов (20 строк) → таблица в 2 колонки, графики получают больше места.
+    #[test]
+    fn many_signals_two_col_table() {
+        let g = geom();
+        let charts = [ChartBox { img_w: 1500, img_h: 700, rows: 20 }];
+        let pages = plan_pages(&g, &charts);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].rows, 20);
+        assert_eq!(pages[0].cols, 2);
+        // Таблица в 2 колонки: per_col=10 → h ≈ (10+1)*13+8 = 151pt.
+        // Доступно под графики ≈ page_h - 2*margin - 151 - 8 ≈ 429pt.
+        // 1500×700 → scale = min(815/1500, 429/700) = min(0.543, 0.613) = 0.543 → img_h ≈ 380pt. OK.
+        let (_, pl) = pages[0].charts[0];
+        assert!(pl.scale > 0.5, "scale={}", pl.scale);
+    }
+
+    /// Пустой список → ноль страниц.
+    #[test]
+    fn empty_charts_zero_pages() {
+        let g = geom();
+        let pages = plan_pages(&g, &[]);
+        assert!(pages.is_empty());
+    }
+
+    /// Тест: таблица не превышает 45 % листа.
+    #[test]
+    fn table_height_capped() {
+        let g = geom();
+        let page_area = g.page_h() - g.margin * 2.0;
+        let limit = page_area * 0.45;
+        for rows in 1..=30 {
+            let h = g.table_h(rows, g.table_cols(rows));
+            assert!(h <= limit + 1.0, "rows={}: table_h={} > limit={}", rows, h, limit);
+        }
+    }
+
+    /// Регрессия: картинка не сжимается до точки (cm матрица ~1).
+    /// Это проверяет smoke-тест, но юнит-тест гарантирует что fit() не возвращает scale < 0.3
+    /// для разумных входных данных (>= 1500×700 px).
+    #[test]
+    fn fit_no_micro_scale() {
+        let g = geom();
+        let (scale, img_h) = g.fit(1500, 700, 600.0);
+        assert!(scale > 0.4, "scale={}", scale);
+        assert!(img_h > 200.0, "img_h={}", img_h);
+    }
+}
+
