@@ -609,16 +609,28 @@ const SIZE_TYPES = { B: ['BYTE'], W: ['INT16', 'UINT16'], D: ['FLOAT', 'DWORD'],
 const SIZE_BY_TYPE = { BOOL: 'X', BYTE: 'B', FLOAT: 'D', INT16: 'W', UINT16: 'W', DWORD: 'D' };
 
 // Парсеры адреса (обратный разбор для конструктора).
+/// Размер для конструктора: буква в адресе важнее всего, но каноническая
+/// запись бита Siemens («M100.2», «V100.3», «DB1.DBX0.1» без буквы X у M/I/Q/V)
+/// буквы не содержит — и это именно бит, а не байт. Без этого конструктор
+/// показывал «Размер: B», список типов сжимался до BYTE (BOOL не подставлялся),
+/// строка «Бит» скрывалась, а любое изменение в конструкторе пересобирало
+/// адрес в MB100 и молча теряло бит.
+function s7Size(letter, bit) {
+    if (letter) return letter.toUpperCase();
+    return (bit === undefined || bit === null) ? 'B' : 'X';
+}
+
 function parseS7(address, s200) {
     let m = /^DB(\d+)\.DB([BWDX])(\d+)(?:\.(\d+))?$/i.exec(address.trim());
     if (m) return { area: 'DB', db: +m[1], size: m[2].toUpperCase(), offset: +m[3], bit: +(m[4] ?? 0) };
     // V100.3 / V-память SMART
     m = /^V([BWDX])?(\d+)(?:\.(\d+))?$/i.exec(address.trim());
-    if (m && s200) return { area: 'V', db: 1, size: (m[1] || 'B').toUpperCase(), offset: +m[2], bit: +(m[3] ?? 0) };
+    if (m && s200) return { area: 'V', db: 1, size: s7Size(m[1], m[3]), offset: +m[2], bit: +(m[3] ?? 0) };
     m = /^([MIQ])([BWDX]?)(\d+)(?:\.(\d+))?$/i.exec(address.trim());
-    if (m) return { area: m[1].toUpperCase(), db: 1, size: (m[2] || 'B').toUpperCase(), offset: +m[3], bit: +(m[4] ?? 0) };
+    if (m) return { area: m[1].toUpperCase(), db: 1, size: s7Size(m[2], m[4]), offset: +m[3], bit: +(m[4] ?? 0) };
     return null;
 }
+
 function buildS7(p) {
     if (p.area === 'DB') return `DB${p.db}.DB${p.size}${p.offset}` + (p.size === 'X' ? `.${p.bit}` : '');
     if (p.size === 'X') return `${p.area}${p.offset}.${p.bit}`;   // M3.4, I0.1, V100.3
@@ -697,8 +709,14 @@ function ioTagForm(tag, conn) {
 function ioTagOpen(tag) {
     const conn = ioConns.find(c => c.id === ioSelConn);
     if (!conn) return ioStatusLine('Сначала выберите модуль', true);
-    openModal(ioTagForm(tag, conn), () => { ioTagAddrValidate(); ioS7Gating(); ioVirtRender(); });
+    // ioTagAddrChanged, а не ioTagAddrValidate: он разбирает адрес, заполняет
+    // конструктор и ОБРЕЗАЕТ список типов под размер адреса. Иначе у сигнала
+    // M100.2 с исторически сохранённым BYTE форма показала бы BYTE, хотя бит
+    // может быть только BOOL (сервер при опросе BOOL и так подставляет).
+    openModal(ioTagForm(tag, conn), () => { ioTagAddrChanged(); ioS7Gating(); ioVirtRender(); });
+
 }
+
 function ioAddTag() { ioTagOpen(null); }
 function ioEditTag(id) {
     if (id == null) id = ioSelTagId;

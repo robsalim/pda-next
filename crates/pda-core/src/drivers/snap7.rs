@@ -147,7 +147,16 @@ fn parse_mnemonic(addr: &str, data_type: &str) -> Option<S7Address> {
     let area = area_by_letter(&c[1])?;
     let bit: Option<u32> = c.get(4).map(|m| m.as_str().parse().unwrap_or(0));
     let size = match bit {
-        Some(_) => SizeLetter::X,
+        Some(_) => {
+            // Адрес с битом (например M100.0) требует типа BOOL.
+            // Если передан не-BOOL, автоматически используем BOOL для бита.
+            if data_type.trim().to_uppercase() != "BOOL" {
+                tracing::debug!(
+                    "Адрес {addr} с битом требует типа BOOL, получен {data_type} — использован BOOL"
+                );
+            }
+            SizeLetter::X
+        }
         None => match SizeLetter::from_letter(&c[2]) {
             Some(s) => s,
             None => size_by_data_type(data_type),
@@ -182,6 +191,12 @@ fn parse_v_token(addr: &str, data_type: &str) -> Option<S7Address> {
     let letter = &c[1];
     let bit: Option<u32> = c.get(3).map(|m| m.as_str().parse().unwrap_or(0));
     let size = if bit.is_some() {
+        // Адрес с битом (например V100.3) требует типа BOOL.
+        if data_type.trim().to_uppercase() != "BOOL" {
+            tracing::debug!(
+                "Адрес {addr} с битом требует типа BOOL, получен {data_type} — использован BOOL"
+            );
+        }
         SizeLetter::X
     } else if letter.is_empty() || letter == "X" {
         // без буквы размер берём из типа; X явно означает бит
@@ -227,7 +242,7 @@ const HINT_CLASSIC: &str =
     "Примеры: MW230, MD100, M3.4, I0.1, Q0.0, DB1.DBW4, DB1.DBD0, DB1.DBX0.0";
 const HINT_S200: &str = "Примеры: VW100, VB5, VD20, V100.3, IW0, QW0, MW10; LOGO! 8: V1024 (входы), VW1032 (аналог AI1, WORD 0..1000), V1064 (выходы), VW1072 (аналог AQ1), VW1118 (AM1), M100";
 
-const FORMATS_CLASSIC: &str = "MW230, MB5, MD100, MX3.4, IW64, QW0, DB1.DBW4, DB5.DBD0, DB1.DBX0.0";
+const FORMATS_CLASSIC: &str = "MW230, MB5, MD100, MX3.4, M3.4,  IW64, QW0, DB1.DBW4, DB5.DBD0, DB1.DBX0.0";
 const FORMATS_S200: &str =
     "VB100, VW100, VD100, V100.3 (V-память), IW0/IX0.0, QW0/QX0.1, MW10/MX3.4";
 

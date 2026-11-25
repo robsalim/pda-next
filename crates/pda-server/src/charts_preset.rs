@@ -21,6 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
+use std::sync::atomic::Ordering;
 
 /// Имя файла наборов (рядом с db_config.json).
 pub const PRESET_FILE: &str = "pda_charts_presets.json";
@@ -32,6 +33,138 @@ const LAST_KEY: &str = "last";
 const MAX_WINDOWS: usize = 32;
 const MAX_TAGS_TOTAL: usize = 1024;
 const MAX_NAME_LEN: usize = 64;
+
+/// Единственная заметка на графике
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ChartNote {
+    /// Уникальный ID заметки
+    pub id: String,
+    /// Текст заметки
+    pub text: String,
+    /// X-координата (время/ось времени в единицах графика)
+    pub x: f64,
+    /// Y-координата (величина/ось значения в единицах графика)
+    pub y: f64,
+    /// Время создания (ISO строка)
+    pub created: String,
+}
+
+/// Получить заметки для набора
+
+pub fn get_notes(data: &Value, set_name: &str) -> Vec<ChartNote> {
+    data.get("named")
+        .and_then(|n| n.get(set_name))
+        .and_then(|s| s.get("notes"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|n| n.as_object())
+                .filter_map(|obj| Some(ChartNote {
+                    id: obj.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    text: obj.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    x: obj.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    y: obj.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    created: obj.get("created").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                }))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Добавить заметку в набор
+pub fn add_note(path: &Path, set_name: &str, note: &ChartNote) -> Result<(), String> {
+    let _g = STORE_LOCK.lock().ok();
+    let mut store = load(path);
+    let named = store
+        .get_mut("named")
+        .and_then(Value::as_object_mut)
+        .ok_or("нет named")?;
+
+    let entry = named.entry(set_name.to_string()).or_insert_with(|| {
+        json!({"windows": [], "active": 0, "notes": []})
+    });
+
+    let notes = entry.get_mut("notes").and_then(Value::as_array_mut).ok_or("нет notes array")?;
+    notes.push(json!({
+        "id": note.id,
+        "text": note.text,
+        "x": note.x,
+        "y": note.y,
+        "created": note.created,
+    }));
+
+    save(path, &store)?;
+    Ok(())
+}
+
+/// Удалить заметку по ID
+pub fn remove_note(path: &Path, set_name: &str, note_id: &str) -> Result<usize, String> {
+    let _g = STORE_LOCK.lock().ok();
+    let mut store = load(path);
+    let named = store
+        .get_mut("named")
+        .and_then(Value::as_object_mut)
+        .ok_or("нет named")?;
+
+    if let Some(entry) = named.get_mut(set_name) {
+        if let Some(notes) = entry.get_mut("notes").and_then(Value::as_array_mut) {
+            let initial_len = notes.len();
+            notes.retain(|n| {
+                n.get("id").and_then(|v| v.as_str()) != Some(note_id)
+            });
+            let removed = initial_len - notes.len();
+            if removed > 0 {
+                save(path, &store)?;
+            }
+            return Ok(removed);
+        }
+    }
+    Ok(0)
+}
+
+/// Установить/обновить заметки для набора (полная замена)
+pub fn set_notes(path: &Path, set_name: &str, notes: &[ChartNote]) -> Result<(), String> {
+    let _g = STORE_LOCK.lock().ok();
+    let mut store = load(path);
+    let named = store
+        .get_mut("named")
+        .and_then(Value::as_object_mut)
+        .ok_or("нет named")?;
+
+    let mut notes_array = Vec::with_capacity(notes.len());
+    for note in notes {
+        notes_array.push(json!({
+            "id": note.id,
+            "text": note.text,
+            "x": note.x,
+            "y": note.y,
+            "created": note.created,
+        }));
+    }
+
+    if let Some(entry) = named.get_mut(set_name) {
+        entry["notes"] = Value::Array(notes_array);
+    } else {
+        named.insert(set_name.to_string(), json!({"notes": Value::Array(notes_array)}));
+    }
+
+    save(path, &store)?;
+    Ok(())
+}
+
+/// Добавить заметку (удобная обертка)
+pub fn insert_note(path: &Path, set_name: &str, text: &str, x: f64, y: f64) -> Result<ChartNote, String> {
+    let note_id = format!("note_{}", std::sync::atomic::AtomicU64::new(0).load(Ordering::Relaxed));
+    let note = ChartNote {
+        id: note_id,
+        text: text.to_string(),
+        x,
+        y,
+        created: chrono::Local::now().to_rfc3339(),
+    };
+    add_note(path, set_name, &note)?;
+    Ok(note)
+}
 
 /// Запись/чтение идут read-modify-write, поэтому их надо сериализовать:
 /// два параллельных POST не должны потерять набор друг друга.
