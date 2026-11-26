@@ -2401,7 +2401,7 @@ async function exportAllChartsPdf() {
         for (let i = 0; i < charts.length; i++) {
             const { win, pngBlob } = charts[i];
             formData.append(`chart_${i}`, pngBlob, `chart_${i}.png`);
-            formData.append(`title_${i}`, chartWindowTitle(win));
+            // Титул сигнала сверху не включаем (пользователь попросил убрать)
             for (const row of collectLegendRows(win)) {
                 // Легенда снизу не включаем (пользователь попросил убрать)
             // Курсоры X1/X2/ΔТ остаются dzięki drawCursorExport выше
