@@ -2290,9 +2290,9 @@ function chartPngBlob(win, lightMode = false) {
             ctx.fillRect(0, 0, out.width, out.height);
             ctx.drawImage(tmpCanvas, 0, 0);
             drawCursorExport(ctx, out.width, win.cursors, true);
-            if (window._pdfIncludeLegend) {
-                drawLegend(ctx, out.width, tmpCanvas.height, '#000000');
-            }
+            // Легенда снизу не рисуем на канвасе (пользователь попросил убрать)
+            // Курсоры рисует drawCursorExport выше
+            
             tmpChart.destroy();
             out.toBlob(b => resolve(b), 'image/png');
         });
@@ -2381,10 +2381,7 @@ async function exportAllChartsPdf() {
         return;
     }
 
-    // Спрашиваем, нужна ли легенда внизу PDF
-    const includeLegend = confirm('Включить текст легенд внизу PDF?');
-    if (includeLegend === null) return;  // пользователь нажал Отмена
-    window._pdfIncludeLegend = includeLegend;
+
     const title = `PDA — ${wins.length} график(ов)`;
     try {
         // 1) Захватываем все окна в светлой теме
@@ -2405,10 +2402,9 @@ async function exportAllChartsPdf() {
             formData.append(`chart_${i}`, pngBlob, `chart_${i}.png`);
             formData.append(`title_${i}`, chartWindowTitle(win));
             for (const row of collectLegendRows(win)) {
-                if (window._pdfIncludeLegend) {
-                    formData.append(`legend_name_${i}[]`, row.name);
-                    formData.append(`legend_color_${i}[]`, row.color);
-                }
+                // Легенда снизу не включаем (пользователь попросил убрать)
+            // Курсоры X1/X2/ΔТ остаются dzięki drawCursorExport выше
+            
             }
         }
 
