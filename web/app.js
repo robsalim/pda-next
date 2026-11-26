@@ -2138,21 +2138,69 @@ function chartPngBlob(win, lightMode = false) {
             resolve(null);
             return;
         }
+
+        const root = document.querySelector(`.chart-window[data-window-id=\"${win.id}\"]`);
+        const legendEl = root?.querySelector('.chart-legend');
+
+        // Собираем строки легенды из DOM (как на экране: имя + значение + цвет линии)
+        const legendRows = [];
+        if (legendEl && legendEl.style.display !== 'none') {
+            for (const row of legendEl.querySelectorAll('.legend-row')) {
+                const nameEl = row.querySelector('.legend-name');
+                const lineEl = row.querySelector('.legend-line');
+                const valEl = row.querySelector('.legend-val');
+                if (nameEl && lineEl) {
+                    legendRows.push({
+                        name: nameEl.textContent,
+                        color: lineEl.style.backgroundColor || '#666666',
+                        val: valEl ? valEl.textContent : ''
+                    });
+                }
+            }
+        }
+        const legendRowH = 18;
+        const legendPad = 16;
+        const legendHeight = legendRows.length ? legendRows.length * legendRowH + legendPad : 0;
+
+        const drawLegend = (ctx, width, startY, textColor) => {
+            if (legendRows.length === 0) return;
+            ctx.font = '12px sans-serif';
+            ctx.textBaseline = 'middle';
+            let y = startY + legendPad / 2 + legendRowH / 2;
+            for (const row of legendRows) {
+                // Цветная линия сигнала
+                ctx.fillStyle = row.color;
+                ctx.fillRect(10, y - 2, 30, 4);
+                // Имя сигнала цветом сигнала
+                ctx.fillStyle = row.color;
+                ctx.fillText(row.name, 48, y);
+                // Текущее значение справа, нейтральный цвет
+                if (row.val) {
+                    ctx.fillStyle = textColor;
+                    ctx.textAlign = 'right';
+                    ctx.fillText(row.val, width - 10, y);
+                    ctx.textAlign = 'left';
+                }
+                y += legendRowH;
+            }
+        };
+
         if (!lightMode) {
-            // Текущая тема: берём canvas + фон из CSS-переменной
+            // Текущая тема: берём canvas + фон из CSS-переменной, добавляем легенду под графиком
             const bg = getComputedStyle(document.body).getPropertyValue('--plot-bg').trim() || '#181818';
             const out = document.createElement('canvas');
             out.width = src.width;
-            out.height = src.height;
+            out.height = src.height + legendHeight;
             const ctx = out.getContext('2d');
             ctx.fillStyle = bg;
             ctx.fillRect(0, 0, out.width, out.height);
             ctx.drawImage(src, 0, 0);
+            const textColor = getComputedStyle(document.body).getPropertyValue('--text').trim() || '#ffffff';
+            drawLegend(ctx, out.width, src.height, textColor);
             out.toBlob(b => resolve(b), 'image/png');
             return;
         }
         // Светлая тема: временно пересоздаём uPlot с белой темой
-        const root = document.querySelector(`.chart-window[data-window-id="${win.id}"]`);
         const box = root?.querySelector('.chart-box');
         if (!box) { resolve(null); return; }
 
@@ -2189,15 +2237,14 @@ function chartPngBlob(win, lightMode = false) {
             const tmpCanvas = tmpChart.ctx.canvas;
             const out = document.createElement('canvas');
             out.width = tmpCanvas.width;
-            out.height = tmpCanvas.height;
+            out.height = tmpCanvas.height + legendHeight;
             const ctx = out.getContext('2d');
             ctx.fillStyle = LIGHT_THEME.plotBg;
             ctx.fillRect(0, 0, out.width, out.height);
             ctx.drawImage(tmpCanvas, 0, 0);
-            out.toBlob(b => {
-                tmpChart.destroy();
-                resolve(b);
-            }, 'image/png');
+            drawLegend(ctx, out.width, tmpCanvas.height, '#000000');
+            tmpChart.destroy();
+            out.toBlob(b => resolve(b), 'image/png');
         });
     });
 }
