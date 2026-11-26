@@ -921,6 +921,52 @@ function formatTime(sec) {
     return `${String(d.getDate()).padStart(2,'0')}.${String(d.getMonth()+1).padStart(2,'0')} ${d.toTimeString().split(' ')[0]}.${String(d.getMilliseconds()).padStart(3, '0')}`;
 }
 
+// ΔT между двумя курсорами в формате панели шапки: 13м 30с 000мс.
+function formatCursorDelta(x1, x2) {
+    let dt = Math.abs(x2 - x1);
+    let totalSec = Math.floor(dt);
+    let ms = Math.floor((dt - totalSec) * 1000);
+    let hh = Math.floor(totalSec / 3600);
+    let mm = Math.floor((totalSec % 3600) / 60);
+    let ss = totalSec % 60;
+    let sMM = String(mm).padStart(2, '0'), sSS = String(ss).padStart(2, '0'), sMS = String(ms).padStart(3, '0');
+    return hh > 0
+        ? `ΔT: ${hh}ч ${sMM}м ${sSS}с ${sMS}мс`
+        : `ΔT: ${mm}м ${sSS}с ${sMS}мс`;
+}
+
+// Рисует данные курсоров X1/X2/ΔT справа поверх PNG-экспорта,
+// как на экране (цвета из CSS-переменных текущей темы).
+function drawCursorExport(ctx, width, cursors, lightMode = false) {
+    const c = cursors || { x1: null, x2: null };
+    const hasX1 = c.x1 != null, hasX2 = c.x2 != null;
+    if (!hasX1 && !hasX2) return;
+    ctx.save();
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'right';
+    ctx.font = 'bold 18px sans-serif';
+    const pad = 10, x = width - pad, y = pad, lineH = 22;
+    const x1Color = lightMode ? '#8A6D00' : (cssVar('--x1') || '#FFD700');
+    const x2Color = lightMode ? '#0077A0' : (cssVar('--x2') || '#00E5FF');
+    const dtColor = lightMode ? '#1B7F3B' : (cssVar('--dt') || '#00E676');
+    let i = 0;
+    if (hasX1) {
+        ctx.fillStyle = x1Color;
+        ctx.fillText(`X1: ${formatTime(c.x1)}`, x, y + i * lineH);
+        i++;
+    }
+    if (hasX2) {
+        ctx.fillStyle = x2Color;
+        ctx.fillText(`X2: ${formatTime(c.x2)}`, x, y + i * lineH);
+        i++;
+    }
+    if (hasX1 && hasX2) {
+        ctx.fillStyle = dtColor;
+        ctx.fillText(formatCursorDelta(c.x1, c.x2), x, y + i * lineH);
+    }
+    ctx.restore();
+}
+
 function updateCursorPanel(cursors) {
     const c = cursors || { x1: null, x2: null };
     document.getElementById("lbl-x1").innerText = "X1: " + (c.x1 ? formatTime(c.x1) : "—");
@@ -2164,7 +2210,7 @@ function chartPngBlob(win, lightMode = false) {
 
         const drawLegend = (ctx, width, startY, textColor) => {
             if (legendRows.length === 0) return;
-            ctx.font = '12px sans-serif';
+            ctx.font = '18px sans-serif';
             ctx.textBaseline = 'middle';
             let y = startY + legendPad / 2 + legendRowH / 2;
             for (const row of legendRows) {
@@ -2195,6 +2241,7 @@ function chartPngBlob(win, lightMode = false) {
             ctx.fillStyle = bg;
             ctx.fillRect(0, 0, out.width, out.height);
             ctx.drawImage(src, 0, 0);
+            drawCursorExport(ctx, out.width, win.cursors, false);
             const textColor = getComputedStyle(document.body).getPropertyValue('--text').trim() || '#ffffff';
             drawLegend(ctx, out.width, src.height, textColor);
             out.toBlob(b => resolve(b), 'image/png');
@@ -2242,6 +2289,7 @@ function chartPngBlob(win, lightMode = false) {
             ctx.fillStyle = LIGHT_THEME.plotBg;
             ctx.fillRect(0, 0, out.width, out.height);
             ctx.drawImage(tmpCanvas, 0, 0);
+            drawCursorExport(ctx, out.width, win.cursors, true);
             drawLegend(ctx, out.width, tmpCanvas.height, '#000000');
             tmpChart.destroy();
             out.toBlob(b => resolve(b), 'image/png');
