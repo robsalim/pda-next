@@ -202,6 +202,9 @@ fn save(path: &Path, data: &Value) -> Result<(), String> {
 /// Приводит состав из запроса к каноническому виду или возвращает ошибку.
 /// Оставляются только положительные целые id тегов; пустые окна сохраняются
 /// (окно без сигналов — тоже состояние вкладки).
+/// Окно может быть задано двумя способами:
+///   * старый формат — просто массив id:  [5, 7]
+///   * новый формат — объект с сигналами и высотой: { "signals": [5, 7], "height": 420 }
 pub fn sanitize(data: &Value) -> Result<Value, String> {
     let windows = data
         .get("windows")
@@ -213,26 +216,53 @@ pub fn sanitize(data: &Value) -> Result<Value, String> {
     let mut total = 0usize;
     let mut clean: Vec<Value> = Vec::with_capacity(windows.len());
     for w in windows {
-        let ids = match w {
-            Value::Array(ids) => ids,
-            Value::Null => &Vec::new(),
-            _ => return Err("окно набора должно быть списком id сигналов".into()),
+        let (row, height) = match w {
+            Value::Array(ids) => {
+                let mut row: Vec<i64> = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let id = id.as_i64().ok_or("id сигнала должен быть числом")?;
+                    if id <= 0 {
+                        continue;
+                    }
+                    total += 1;
+                    if total > MAX_TAGS_TOTAL {
+                        return Err(format!("слишком много сигналов (> {MAX_TAGS_TOTAL})"));
+                    }
+                    if !row.contains(&id) {
+                        row.push(id);
+                    }
+                }
+                (row, None)
+            }
+            Value::Object(obj) => {
+                let signals = obj
+                    .get("signals")
+                    .and_then(Value::as_array)
+                    .ok_or("окно набора должно содержать массив signals")?;
+                let mut row: Vec<i64> = Vec::with_capacity(signals.len());
+                for id in signals {
+                    let id = id.as_i64().ok_or("id сигнала должен быть числом")?;
+                    if id <= 0 {
+                        continue;
+                    }
+                    total += 1;
+                    if total > MAX_TAGS_TOTAL {
+                        return Err(format!("слишком много сигналов (> {MAX_TAGS_TOTAL})"));
+                    }
+                    if !row.contains(&id) {
+                        row.push(id);
+                    }
+                }
+                let height = obj.get("height").and_then(Value::as_u64).map(|h| h as i64);
+                (row, height)
+            }
+            _ => return Err("окно набора должно быть списком id или объектом {signals, height}".into()),
         };
-        let mut row: Vec<i64> = Vec::with_capacity(ids.len());
-        for id in ids {
-            let id = id.as_i64().ok_or("id сигнала должен быть числом")?;
-            if id <= 0 {
-                continue;
-            }
-            total += 1;
-            if total > MAX_TAGS_TOTAL {
-                return Err(format!("слишком много сигналов (> {MAX_TAGS_TOTAL})"));
-            }
-            if !row.contains(&id) {
-                row.push(id);
-            }
+        let mut entry = json!({ "signals": Value::Array(row.into_iter().map(Value::from).collect()) });
+        if let Some(h) = height {
+            entry["height"] = Value::from(h);
         }
-        clean.push(Value::Array(row.into_iter().map(Value::from).collect()));
+        clean.push(entry);
     }
     let active = data
         .get("active")
@@ -275,8 +305,19 @@ pub fn list(path: &Path) -> Value {
                     let signals: usize = windows
                         .map(|ws| {
                             ws.iter()
-                                .filter_map(Value::as_array)
-                                .map(|w| w.len())
+                                .filter_map(|w| {
+                                    if let Value::Array(arr) = w {
+                                        // старый формат: окно — массив id
+                                        Some(arr.len())
+                                    } else if let Value::Object(obj) = w {
+                                        // новый формат: окно — {signals, height}
+                                        obj.get("signals")
+                                            .and_then(Value::as_array)
+                                            .map(|arr| arr.len())
+                                    } else {
+                                        None
+                                    }
+                                })
                                 .sum()
                         })
                         .unwrap_or(0);
@@ -350,7 +391,7 @@ mod tests {
     #[test]
     fn sanitize_keeps_positive_unique_ids() {
         let v = sanitize(&json!({"windows": [[5, 5, 0, -3, 7], []], "active": 9})).unwrap();
-        assert_eq!(v["windows"], json!([[5, 7], []]), "нули/дубли вне набора, пустое окно живо");
+        assert_eq!(v["windows"], json!([{"signals": [5, 7]}, {"signals": []}]), "нули/дубли вне набора, пустое окно живо");
         assert_eq!(v["active"], 1, "активное окно не за пределами списка");
         assert!(sanitize(&json!({"windows": "нет"})).is_err());
     }
@@ -381,7 +422,7 @@ mod tests {
         // Перезапись по имени не создаёт дубль.
         put(&path, "Цех 1", &json!({"windows": [[9]], "active": 0})).unwrap();
         assert_eq!(list(&path)["sets"].as_array().unwrap().len(), 2);
-        assert_eq!(list(&path)["sets"][0]["windows"], json!([[9]]));
+        assert_eq!(list(&path)["sets"][0]["windows"], json!([{"signals": [9]}]));
 
         assert!(remove(&path, "Цех 1").unwrap());
         assert!(!remove(&path, "Цех 1").unwrap(), "повторное удаление — просто false");

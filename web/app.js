@@ -37,6 +37,11 @@ function makeCursors() { return { x1: null, x2: null }; }
 let bitsCursors = makeCursors();
 let chartsPaused = false;
 let bitsPaused = false;
+// Режим «ЗУМ окна»: включённое выделение прямоугольником с увеличением по X и Y.
+// Пока активен, live стоит на паузе, а Y-шкала зафиксирована (авто-Y выключен)
+// до нажатия «🔍 100%».
+let chartsRectZoom = false;
+let bitsRectZoom = false;
 // Пока пользователь держит кнопку мыши на графике (rubber-band zoom uPlot'а,
 // перетаскивание курсоров X1/X2, пан за ось), live-тик обязан молчать: иначе
 // setData перетирает массивы посреди выделения, и рамка/курсор «прыгают».
@@ -147,6 +152,57 @@ function togglePause(tab) {
         btn.classList.toggle('btn-action', !bitsPaused);
         if (!bitsPaused) reloadBits(false);
     }
+}
+
+/// Режим «ЗУМ окна»: включает выделение прямоугольной области на графике с
+/// увеличением по X И Y. На время выделения live стоит на паузе, а авто-Y
+/// выключен — после зума Y-шкала держится до нажатия «🔍 100%».
+function toggleRectZoom(tab) {
+    const isCharts = tab === 'charts';
+    if (isCharts) {
+        chartsRectZoom = !chartsRectZoom;
+        // Выделение прямоугольником — это работа с неподвижной картинкой:
+        // ставим live на паузу (если ещё не на паузе).
+        if (chartsRectZoom && !chartsPaused) togglePause('charts');
+        updateRectZoomButton('charts');
+        applyRectZoomToCharts(chartsRectZoom);
+        chartsStatusLine(chartsRectZoom
+            ? 'ЗУМ окна: выделите прямоугольник мышью (X и Y)'
+            : 'ЗУМ окна выключен');
+    } else {
+        bitsRectZoom = !bitsRectZoom;
+        if (bitsRectZoom && !bitsPaused) togglePause('bits');
+        updateRectZoomButton('bits');
+        applyRectZoomToBits(bitsRectZoom);
+    }
+}
+
+function updateRectZoomButton(tab) {
+    const btn = document.getElementById(`btn-rectzoom-${tab}`);
+    if (!btn) return;
+    const on = tab === 'charts' ? chartsRectZoom : bitsRectZoom;
+    btn.classList.toggle('btn-add', on);
+    btn.classList.toggle('btn-action', !on);
+}
+
+/// Применяет к курсорам всех окон режим выделения: y=true — тянуть рамку по
+/// обеим осям, y=false — только по X (rubber-band zoom по времени).
+function applyRectZoomToCharts(on) {
+    for (const win of chartWindows) {
+        const u = win.chart;
+        if (!u || !u.cursor || !u.cursor.drag) continue;
+        u.cursor.drag.x = true;
+        u.cursor.drag.y = on;
+        u.cursor.drag.setScale = true;
+    }
+}
+
+function applyRectZoomToBits(on) {
+    const u = bitsChart;
+    if (!u || !u.cursor || !u.cursor.drag) return;
+    u.cursor.drag.x = true;
+    u.cursor.drag.y = on;
+    u.cursor.drag.setScale = true;
 }
 
 // Разбор подписи окна: полный цикл «15 мин» проверяем раньше «5 мин»,
@@ -743,6 +799,8 @@ function resetZoom(u) {
     if (win) {
         if (win.id === activeWindowId) userZoomedCharts = false;
         win.zoomed = false;
+        // Сбрасываем режим «ЗУМ окна»: авто-Y возвращается, live снимается с паузы.
+        if (chartsRectZoom) { chartsRectZoom = false; updateRectZoomButton('charts'); applyRectZoomToCharts(false); }
         // Полная перезагрузка для одного окна: reloadWindowRange не подходит,
         // он тянет видимый зум. Дёргаем reloadCharts(true) — он пересоздаст
         // все окна, но это единственный источник полного диапазона.
@@ -1392,7 +1450,13 @@ let chartSetsCache = [];     // последний список наборов (
 
 function chartState() {
     return {
-        windows: chartWindows.map(w => w.signals.map(s => s.tag.id)),
+        windows: chartWindows.map(w => ({
+            signals: w.signals.map(s => s.tag.id),
+            height: (() => {
+                const root = document.querySelector(`.chart-window[data-window-id="${w.id}"]`);
+                return root ? root.offsetHeight : 0;
+            })(),
+        })),
         active: Math.max(0, chartWindows.findIndex(w => w.id === activeWindowId)),
     };
 }
@@ -1406,11 +1470,19 @@ async function applyChartPreset(data) {
         if (i >= chartWindows.length) addChartWindow();
         // addSignals работает с активным окном — переключаемся перед добавлением
         selectChartWindow(chartWindows[i].id);
-        const ids = (Array.isArray(windows[i]) ? windows[i] : [])
-            .map(Number).filter(n => Number.isFinite(n) && n > 0);
+        const entry = windows[i];
+        const ids = Array.isArray(entry)
+            ? entry
+            : (entry && entry.signals) || [];
+        const cleanIds = ids.map(Number).filter(n => Number.isFinite(n) && n > 0);
         // Удалённые из конфигурации теги пропустит сам addSignals (их нет в allTags)
-        if (ids.length) {
-            try { await addSignals(ids); } catch (e) { console.warn('chart preset apply', e); }
+        if (cleanIds.length) {
+            try { await addSignals(cleanIds); } catch (e) { console.warn('chart preset apply', e); }
+        }
+        // Применяем сохранённую высоту окна (если набор хранит объект {signals, height})
+        if (entry && !Array.isArray(entry) && entry.height) {
+            const root = document.querySelector(`.chart-window[data-window-id="${chartWindows[i].id}"]`);
+            if (root) root.style.height = `${Math.max(260, entry.height)}px`;
         }
     }
     const back = chartWindows[data.active] || chartWindows[0];
@@ -1803,7 +1875,7 @@ function rebuildChartWindow(win, forceFit = false) {
         },
         plugins: [wheelZoomPlugin('charts', win.cursors)],
         axes: [{ stroke: tc.axis, grid: { stroke: tc.grid } }, { stroke: tc.axis, grid: { stroke: tc.grid } }],
-        series, cursor: { drag: { x: true, y: false } },
+        series, cursor: { drag: { x: true, y: chartsRectZoom } },
         // ВАЖНО: значения opts.hooks uPlot вызывает как массивы (hooks[name].forEach),
         // в отличие от хуков плагина, которые он сам нормализует через concat. Голая
         // функция здесь роняет инициализацию графика (TypeError: forEach is not a
@@ -1974,7 +2046,7 @@ async function reloadBits(forceFit = false) {
             // поэтому границы читаем из u.scales.x внутри отложенного вызова.
             setScale: [(u, k) => { if (k === 'x') onBitsScaleChange(u); }],
         },
-        series, cursor: { drag: { x: true, y: false } }
+        series, cursor: { drag: { x: true, y: bitsRectZoom } }
     };
     bitsSuppressReload = true;
     const u = new uPlot(opts, data, box);

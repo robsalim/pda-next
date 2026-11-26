@@ -84,7 +84,10 @@
                             <option value="72 часа">72 часа</option>
                         </select>
                         <button id="btn-pause-charts" class="btn-action" onclick="togglePause('charts')">⏸ Пауза</button>
+                        <button id="btn-rectzoom-charts" class="btn-action" onclick="toggleRectZoom('charts')" title="ЗУМ окна: пауза + выделение прямоугольником с увеличением по X и Y" aria-label="ЗУМ окна"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" style="vertical-align:middle;"><rect x="1.5" y="1.5" width="8.5" height="8.5" rx="1.2" stroke-dasharray="2.2 1.6"/><circle cx="10.3" cy="10.3" r="3.4"/><line x1="12.7" y1="12.7" x2="15" y2="15"/></svg></button>
                     </span>
+
+
 
                     <span id="charts-arch-panel" style="display: none;">
                         <label>Начало:</label>
@@ -111,14 +114,14 @@
                          x→ — вернуть весь загруженный интервал. -->
                     <button class="btn-action" onclick="autoScaleY()" title="Автомасштаб по значению (Y) для текущего окна по времени">↑y 100%</button>
                     <button class="btn-action" onclick="autoScaleX()" title="Автомасштаб по времени (X) — весь загруженный интервал">x→ 100%</button>
-                    <button class="btn-action" onclick="syncZoomToAll()" title="Временные границы активного графика — всем остальным окнам">🔍⇉ Перенести масштаб</button>
+                    <button class="btn-action" onclick="syncZoomToAll()" title="Временные границы активного графика — всем остальным окнам">🔍⇉ Все</button>
 
                     <button class="btn-action" onclick="clearCharts()">✕ Очистить</button>
 
                     <button class="btn-teal" onclick="exportActiveChartPng()" title="Сохранить активное окно графика как PNG">🖼 PNG</button>
                     <button class="btn-teal" onclick="exportAllChartsPdf()" title="Сохранить все графики с легендами в PDF">📄 PDF</button>
-                    <button class="btn-teal" onclick="saveChartPresetDialog()" title="Запомнить состав всех окон под именем и вернуть его позже кнопкой «Загрузить набор»">💾 Сохранить набор</button>
-                    <button class="btn-teal" onclick="loadChartPresetDialog()" title="Вернуть сохранённый состав окон и сигналов">📂 Загрузить набор</button>
+                    <button class="btn-teal" onclick="saveChartPresetDialog()" title="Запомнить состав всех окон под именем и вернуть его позже кнопкой «Загрузить набор»">💾 Набор</button>
+                    <button class="btn-teal" onclick="loadChartPresetDialog()" title="Вернуть сохранённый состав окон и сигналов">📂 Набор</button>
                 </div>
                 <!-- Мини-обзор текущего архивного окна (прореженного сервером)
                      с подсветкой интервалов без данных. Показывается в режиме

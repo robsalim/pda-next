@@ -589,7 +589,7 @@ async fn chart_presets_roundtrip() {
     let sets = list["sets"].as_array().unwrap();
     assert_eq!(sets.len(), 1, "именованный набор в списке: {list}");
     assert_eq!(sets[0]["name"], "Цех 1 — линия");
-    assert_eq!(sets[0]["windows"], json!([[12, 40], [3]]));
+    assert_eq!(sets[0]["windows"], json!([{"signals": [12, 40]}, {"signals": [3]}]));
     assert_eq!(sets[0]["active"], 1);
     assert_eq!(sets[0]["signals"], 3, "размер набора для подписи в UI");
     assert!(sets[0]["saved_at"].is_string(), "время сохранения видно");

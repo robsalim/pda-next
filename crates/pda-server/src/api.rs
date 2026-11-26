@@ -1,6 +1,5 @@
 //! REST-эндпоинты (аналог web_server.py FastAPI + API для вкладок IO/DB).
 //!
-//! Формат ответов повторяет Python-версию там, где её читает фронтенд:
 //! /api/tags, /api/points/:id?span=, /api/archive/:id, /api/live.
 //! Остальное — CRUD конфигурации и статусы, которые в desktop-версии делали
 //! PyQt-виджеты напрямую через DatabaseService.
@@ -24,7 +23,7 @@ use crate::state::AppCore;
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
-/// Ошибка API -> 500 + текст (Python бросал исключения так же).
+/// Ошибка API -> 500 + текст.
 pub struct ApiError(pub String);
 
 impl IntoResponse for ApiError {
@@ -43,7 +42,7 @@ impl From<pda_core::database::db_service::DbError> for ApiError {
 
 /// Разбор текстового окна ("5 мин", "15 мин", "1 час", ...) по образцу
 /// _parse_span_text из десктопного chart_widget.py. «15 мин» проверяется
-/// раньше «5 мин» (в Python подстрока «5» есть в «15» — не копируем этот баг).
+/// раньше «5 мин».
 pub fn parse_span_ms(text: &str) -> i64 {
     let t = text.trim();
     if t.contains("15") && t.contains("мин") {
@@ -87,7 +86,6 @@ fn points_payload(points: Vec<pda_core::models::DataPoint>) -> Vec<(f64, f64)> {
     points
         .into_iter()
         .map(|p| {
-            // Python: p.timestamp.timestamp() → float с микросекундами.
             // Rust: timestamp_millis() / 1000.0 — миллисекунды как float секунд.
             let ts = p
                 .timestamp
@@ -283,7 +281,7 @@ fn default_dtype() -> String {
 
 // ---------------------------------------------------------------- чтение
 
-/// Список тегов с именами подключений (формат Python /api/tags).
+/// Список тегов с именами подключений (формат  /api/tags).
 pub async fn tags(State(core): State<Arc<AppCore>>) -> ApiResult<Json<Value>> {
     let db = core.db_snapshot().await;
     let tags = db.get_all_tags().await?;
@@ -319,7 +317,7 @@ pub struct SpanQuery {
     span: String,
 }
 
-/// Точки за окно «span» относительно последней записи (Python /api/points).
+/// Точки за окно «span» относительно последней записи ( /api/points).
 /// Виртуальные теги: окно берётся относительно последней записи операндов,
 /// значения вычисляются из их историй.
 pub async fn points(
@@ -380,7 +378,7 @@ pub struct ArchiveQuery {
     t1: Option<f64>,
 }
 
-/// Исторический диапазон (Python /api/archive).
+/// Исторический диапазон ( /api/archive).
 pub async fn archive(
     State(core): State<Arc<AppCore>>,
     UrlPath(tag_id): UrlPath<i64>,
@@ -692,7 +690,7 @@ pub async fn series(
     })))
 }
 
-/// Текущие значения из реестра (Python /api/live), с именами для таблиц IO.
+/// Текущие значения из реестра ( /api/live), с именами для таблиц IO.
 pub async fn live(State(core): State<Arc<AppCore>>) -> Json<Value> {
     let rows: Vec<Value> = core
         .registry
@@ -920,7 +918,7 @@ pub async fn update_connection(
     let db = core.db_snapshot().await;
     let conn = conn_from_body(id, b);
     db.update_connection(&conn).await?;
-    // Python: после редактирования подключения — restart_all всего стека.
+    // после редактирования подключения — restart_all всего стека.
     core.manager.write().await.restart_all().await;
     Ok(Json(json!({ "ok": true })))
 }
@@ -942,7 +940,7 @@ pub async fn delete_connection(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// Перезапуск одного модуля (Python: «Перезапустить» в контекстном меню).
+/// Перезапуск одного модуля («Перезапустить» в контекстном меню).
 pub async fn restart_connection(
     State(core): State<Arc<AppCore>>,
     UrlPath(id): UrlPath<i64>,
@@ -1177,7 +1175,6 @@ pub struct DbSwitchBody {
 
 impl DbSwitchBody {
     fn into_cfg(&self) -> DbConfig {
-        // python DatabaseService(**cfg): поле engine, остальное по движку
         DbConfig::from_json(&json!({
             "engine": self.engine,
             "sqlite_path": self.sqlite_path,
@@ -1217,7 +1214,7 @@ pub async fn db_test(Json(b): Json<DbSwitchBody>) -> Json<Value> {
     }
 }
 
-/// Создать целевую базу (аналог Python create_database). SQLite создаётся
+/// Создать целевую базу. SQLite создаётся
 /// автоматически при применении; MariaDB/MySQL пока не перенесены.
 pub async fn db_create(Json(b): Json<DbSwitchBody>) -> ApiResult<Json<Value>> {
     match b.engine.as_str() {
@@ -1237,7 +1234,7 @@ pub async fn db_create(Json(b): Json<DbSwitchBody>) -> ApiResult<Json<Value>> {
     }
 }
 
-/// Применить и переключить (Python _save_and_reconnect): пишем db_config.json,
+/// Применить и переключить: пишем db_config.json,
 /// останавливаем драйверы, открываем новую базу, перезапускаем.
 pub async fn db_switch(
     State(core): State<Arc<AppCore>>,
@@ -1939,12 +1936,16 @@ pub async fn export_pdf(
                 ops.push(printpdf::Op::SetFillColor {
                     col: css_rgb(color_str),
                 });
+                // colored square (квадратик) before signal name for better understanding
+                ops.push(printpdf::Op::SetFillColor {
+                    col: printpdf::Color::Rgb(printpdf::Rgb::new(0.8, 0.8, 0.8, None)),
+                });
                 ops.push(printpdf::Op::DrawRectangle {
                     rectangle: printpdf::Rect {
-                        x: printpdf::Pt(x + 4.0),
+                        x: printpdf::Pt(x + 1.0),
                         y: printpdf::Pt(ty - 3.0),
-                        width: printpdf::Pt(10.0),
-                        height: printpdf::Pt(10.0),
+                        width: printpdf::Pt(5.0),
+                        height: printpdf::Pt(5.0),
                         mode: None,
                         winding_order: None,
                     },
@@ -2147,4 +2148,5 @@ mod pdf_tests {
         assert!(img_h > 200.0, "img_h={}", img_h);
     }
 }
+
 

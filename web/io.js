@@ -603,10 +603,10 @@ async function ioDelGroup() {
 function driverInfo(key) { return driverTypes.find(t => t.key === key) || {}; }
 
 const BASE_TYPES = ['FLOAT', 'INT16', 'UINT16', 'BOOL'];
-const S7_EXTRA = ['BYTE', 'DWORD'];
+const S7_EXTRA = ['BYTE', 'DWORD', 'DINT'];
 const MODBUS_TYPES = ['INT16', 'UINT16', 'FLOAT', 'BOOL'];
-const SIZE_TYPES = { B: ['BYTE'], W: ['INT16', 'UINT16'], D: ['FLOAT', 'DWORD'], X: ['BOOL'] };
-const SIZE_BY_TYPE = { BOOL: 'X', BYTE: 'B', FLOAT: 'D', INT16: 'W', UINT16: 'W', DWORD: 'D' };
+const SIZE_TYPES = { B: ['BYTE'], W: ['INT16', 'UINT16'], D: ['FLOAT', 'DWORD', 'DINT'], X: ['BOOL'] };
+const SIZE_BY_TYPE = { BOOL: 'X', BYTE: 'B', FLOAT: 'D', INT16: 'W', UINT16: 'W', DWORD: 'D', DINT: 'D' };
 
 // Парсеры адреса (обратный разбор для конструктора).
 /// Размер для конструктора: буква в адресе важнее всего, но каноническая
@@ -909,7 +909,7 @@ function ioNextAddress(address, dataType) {
     if (!m) return addr;
     const bitRaw = m[7];
     let bit = parseInt(bitRaw || '0', 10);
-    let sizeLetter = m[2] || m[5] || ({ FLOAT: 'D', DWORD: 'D', BOOL: 'X', BYTE: 'B' }[up] || 'W');
+    let sizeLetter = m[2] || m[5] || ({ FLOAT: 'D', DWORD: 'D', DINT: 'D', BOOL: 'X', BYTE: 'B' }[up] || 'W');
     if (bitRaw != null) sizeLetter = 'X';
     const byteLen = { W: 2, B: 1, D: 4, X: 1 }[sizeLetter];
 

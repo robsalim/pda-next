@@ -82,7 +82,7 @@ impl SizeLetter {
 /// Размер по умолчанию, если буква размера в адресе не указана.
 fn size_by_data_type(data_type: &str) -> SizeLetter {
     match data_type.trim().to_uppercase().as_str() {
-        "FLOAT" | "DWORD" => SizeLetter::D,
+        "FLOAT" | "DWORD" | "DINT" => SizeLetter::D,
         "INT16" | "UINT16" | "INT" | "WORD" => SizeLetter::W,
         "BOOL" => SizeLetter::X,
         _ => SizeLetter::B,
@@ -341,6 +341,8 @@ fn extract(buf: &[u8], rel: usize, a: &S7Address, data_type: &str) -> Option<f64
             let word = u32::from_be_bytes([buf[rel], buf[rel + 1], buf[rel + 2], buf[rel + 3]]);
             Some(if data_type.trim().eq_ignore_ascii_case("FLOAT") {
                 f32::from_bits(word) as f64
+            } else if data_type.trim().eq_ignore_ascii_case("DINT") {
+                word as i32 as f64
             } else {
                 word as f64
             })
