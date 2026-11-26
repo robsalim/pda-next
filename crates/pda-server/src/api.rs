@@ -1826,7 +1826,7 @@ pub async fn export_pdf(
         for &(ci, pl) in &pg.charts {
             let page = &charts[ci];
             let page_title = if page.title.is_empty() {
-                format!("График {}", ci + 1)
+                String::new()
             } else {
                 page.title.clone()
             };
