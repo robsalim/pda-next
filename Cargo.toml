@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/pda-core", "crates/pda-server", "crates/pda-desktop"]
 
 [workspace.package]
-version = "1.2.2"
+version = "1.2.5"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
