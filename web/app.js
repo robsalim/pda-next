@@ -2290,7 +2290,9 @@ function chartPngBlob(win, lightMode = false) {
             ctx.fillRect(0, 0, out.width, out.height);
             ctx.drawImage(tmpCanvas, 0, 0);
             drawCursorExport(ctx, out.width, win.cursors, true);
-            drawLegend(ctx, out.width, tmpCanvas.height, '#000000');
+            if (window._pdfIncludeLegend) {
+                drawLegend(ctx, out.width, tmpCanvas.height, '#000000');
+            }
             tmpChart.destroy();
             out.toBlob(b => resolve(b), 'image/png');
         });
@@ -2378,6 +2380,11 @@ async function exportAllChartsPdf() {
         alertBox('Экспорт PDF', 'Нет графиков для экспорта');
         return;
     }
+
+    // Спрашиваем, нужна ли легенда внизу PDF
+    const includeLegend = confirm('Включить текст легенд внизу PDF?');
+    if (includeLegend === null) return;  // пользователь нажал Отмена
+    window._pdfIncludeLegend = includeLegend;
     const title = `PDA — ${wins.length} график(ов)`;
     try {
         // 1) Захватываем все окна в светлой теме
@@ -2398,8 +2405,10 @@ async function exportAllChartsPdf() {
             formData.append(`chart_${i}`, pngBlob, `chart_${i}.png`);
             formData.append(`title_${i}`, chartWindowTitle(win));
             for (const row of collectLegendRows(win)) {
-                formData.append(`legend_name_${i}[]`, row.name);
-                formData.append(`legend_color_${i}[]`, row.color);
+                if (window._pdfIncludeLegend) {
+                    formData.append(`legend_name_${i}[]`, row.name);
+                    formData.append(`legend_color_${i}[]`, row.color);
+                }
             }
         }
 
