@@ -2298,9 +2298,9 @@ function chartPngBlob(win, lightMode = false) {
 }
 
 // Экспорт активного окна графика в PNG (аналог «Сохранить как изображение»).
-// Файл пишет сервер (POST /api/export/png), а не браузер: скачивание через
-// <a download> в WebView2 оболочки pda-desktop молча не доходило до
-// пользователя. Сервер отвечает реальным путём, и мы его показываем.
+// Перед сохранением спрашивает пользователя: на сервер (как раньше — файл
+// пишет бэкенд и возвращает путь) или на клиент (прямое скачивание файла
+// браузером через blob URL).
 async function exportActiveChartPng() {
     const win = getActiveWindow();
     if (!win || !win.chart || !win.signals.length) {
@@ -2312,13 +2312,34 @@ async function exportActiveChartPng() {
         const blob = await chartPngBlob(win, false);
         if (!blob) throw new Error('canvas не вернул изображение');
         const name = `pda_chart_${exportStamp()}.png`;
-        const r = await fetch(`/api/export/png?name=${encodeURIComponent(name)}`, {
-            method: 'POST', headers: { 'Content-Type': 'image/png' }, body: blob,
-        });
-        const text = await r.text();
-        if (!r.ok) throw new Error(text || `HTTP ${r.status}`);
-        const j = JSON.parse(text);
-        alertBox('Экспорт PNG', `Сохранено (${Math.round(j.bytes / 1024)} КБ):\n${j.path}`);
+
+        const choice = await confirmBox(
+            `Экспорт PNG: «${name}»\nКуда сохранить файл?`,
+            { yes: 'На сервер', no: 'На клиент', cancel: 'Отмена' },
+        );
+        if (choice === null) return; // пользователь отменил
+
+        if (choice === true) {
+            // Вариант 1 — сохранить на сервере (POST /api/export/png).
+            const r = await fetch(`/api/export/png?name=${encodeURIComponent(name)}`, {
+                method: 'POST', headers: { 'Content-Type': 'image/png' }, body: blob,
+            });
+            const text = await r.text();
+            if (!r.ok) throw new Error(text || `HTTP ${r.status}`);
+            const j = JSON.parse(text);
+            alertBox('Экспорт PNG', `Сохранено на сервере (${Math.round(j.bytes / 1024)} КБ):\n${j.path}`);
+        } else {
+            // Вариант 2 — выгрузить на клиент (прямое скачивание браузером).
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = name;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            alertBox('Экспорт PNG', `Файл «${name}» отправлен на скачивание`);
+        }
     } catch (e) {
         alertBox('Экспорт PNG', `Не удалось сохранить: ${e.message}`, true);
     }
