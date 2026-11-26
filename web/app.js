@@ -2290,8 +2290,9 @@ function chartPngBlob(win, lightMode = false) {
             ctx.fillRect(0, 0, out.width, out.height);
             ctx.drawImage(tmpCanvas, 0, 0);
             drawCursorExport(ctx, out.width, win.cursors, true);
-            // Легенда снизу не рисуем на канвасе (пользователь попросил убрать)
-            // Курсоры рисует drawCursorExport выше
+            drawLegend(ctx, out.width, tmpCanvas.height, '#000000');
+            // Легенда снизу (цветные подписи) оставляем,
+            // а черный фон/текст под legends высотой регулируется через legendHeight
             
             tmpChart.destroy();
             out.toBlob(b => resolve(b), 'image/png');
