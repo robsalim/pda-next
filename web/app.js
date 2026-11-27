@@ -617,8 +617,17 @@ function axisPanCursor(down) {
 function wheelZoomPlugin(chartType, cursors) {
     return {
         hooks: {
-            ready: u => {
+        ready: u => {
                 let plot = u.root.querySelector(".u-over");
+                // Любое взаимодействие с графиком (зум колесом, выделение рамкой,
+                // пан за ось, drag курсора, клик) делает это окно АКТИВНЫМ —
+                // раньше активация шла только по отдельному клику по окну, и при
+                // зуме на неактивном окне панель курсоров/кнопок относилась не к нему.
+                const activate = () => {
+                    if (chartType !== 'charts') return;
+                    const w = chartWindows.find(x => x.chart === u);
+                    if (w && w.id !== activeWindowId) selectChartWindow(w.id);
+                };
                 // Зум по колесу применяется МГНОВЕННО на каждое событие, как в
                 // pyqtgraph. Раньше здесь был debounce 150 мс и один шаг
                 // масштаба на пачку событий — вращение ощущался «вязким».
@@ -626,6 +635,7 @@ function wheelZoomPlugin(chartType, cursors) {
                 // поэтому колесо с мелким шагом крутит так же плавно.
                 plot.addEventListener("wheel", e => {
                     e.preventDefault();
+                    activate();
                     if (chartType === 'charts') userZoomedCharts = true;
                     else userZoomedBits = true;
                     let d = e.deltaY;
@@ -651,6 +661,7 @@ function wheelZoomPlugin(chartType, cursors) {
                 // только для своих случаев, так что сюда приходит чистый
                 // «графический» mousedown.
                 plot.addEventListener("mousedown", e => {
+                    activate();
                     if (e.button === 0 && !dragCursor) holdLive(chartType);
                 });
 
@@ -665,6 +676,7 @@ function wheelZoomPlugin(chartType, cursors) {
                     axisEl.addEventListener('mousedown', e => {
                         if (e.button !== 0) return;
                         e.preventDefault();
+                        activate();
                         // bbox в device-пикселях, координаты мыши — CSS-пиксели.
                         // pxRatio — свойство экземпляра uPlot (не namespace):
                         // на экране 125%/150% без деления пан ехал бы быстрее курсора.
@@ -733,6 +745,7 @@ function wheelZoomPlugin(chartType, cursors) {
                     // проверка границ работает во всех браузерах.
                     if (e.clientX < rect.left || e.clientX > rect.right ||
                         e.clientY < rect.top || e.clientY > rect.bottom) return;
+                    activate();
                     // Перетаскивание возможно только за свою линию: ЛКМ — X1, ПКМ — X2
                     const near = nearCursor(e.clientX - rect.left);
                     dragCursor = ((e.button === 0 && near === 'x1') || (e.button === 2 && near === 'x2')) ? near : null;
@@ -749,12 +762,14 @@ function wheelZoomPlugin(chartType, cursors) {
                 // ЛКМ -> X1, ПКМ -> X2 (на каждом графике свои)
                 plot.addEventListener("click", e => {
                     if (suppressClick) { suppressClick = false; return; }
+                    activate();
                     cursors.x1 = u.posToVal(e.clientX - plot.getBoundingClientRect().left, "x");
                     refreshHeaderCursors();
                     u.redraw();
                 });
                 plot.addEventListener("contextmenu", e => {
                     e.preventDefault();
+                    activate();
                     cursors.x2 = u.posToVal(e.clientX - plot.getBoundingClientRect().left, "x");
                     refreshHeaderCursors();
                     u.redraw();
@@ -869,6 +884,10 @@ function syncZoomToAll() {
         // идёт live-тик (suppressReload), а окно после переноса точно ЗУМИРОВАНО.
         w.zoomed = true;
         w.chart.setScale('x', { min: t0, max: t1 });
+        // НЕ вызываем scheduleZoomReload здесь — setScale откладывает обновление
+        // границ в микрозадачу (microTask(_commit)), и границы ещё старые.
+        // Хук setScale срабатывает ВНУТРИ setScales, ГДЕ границы уже обновлены —
+        // он сам вызовет scheduleZoomReload с правильными границами.
     }
     if (src.id === activeWindowId) userZoomedCharts = true;
     chartsStatusLine(`Масштаб ${formatTime(t0)} — ${formatTime(t1)} перенесён на ${targets.length} гр.`);
@@ -1291,25 +1310,25 @@ function scheduleZoomReload(w) {
     const wait = ZOOM_RELOAD_MIN_MS - (Date.now() - st.last);
     if (wait <= 0) {
         st.last = Date.now();
-        fireChartReload(w, st);
+        doZoomReload(w, st);
     } else {
         clearTimeout(st.timer);
         st.timer = setTimeout(() => {
             st.last = Date.now();
-            fireChartReload(w, st);
+            doZoomReload(w, st);
         }, wait);
     }
 }
 
-function fireChartReload(w, st) {
+function doZoomReload(w, st) {
     const u = w.chart;
     if (!u || !w.signals.length) return;
+    const seq = ++st.seq;
+    // Границы уже применены: хук setScale вызывается ПОСЛЕ обновления
+    // sc.min/sc.max в setScales(uPlot 1.6).
     const vm = u.scales.x.min, vx = u.scales.x.max;
     if (!(vx > vm)) return;
-    const seq = ++st.seq;
     reloadWindowRange(w, vm, vx).then(updated => {
-        // Устаревший ответ (пока ждали, ушёл новый запрос) не применяем —
-        // иначе он перетирает более свежие данные.
         if (!updated || st.seq !== seq || w.chart !== u) return;
         applySeriesData(w, u);
     });
@@ -1761,7 +1780,25 @@ async function reloadCharts(forceFit = false) {
                 }
             }
         }
-        rebuildChartWindow(win, forceFit);
+        // Live-тик с уже построенным графиком и тем же составом сигналов:
+        // обновляем массивы через setData БЕЗ destroy/new uPlot. Пересоздание
+        // графика каждую секунду (canvas + все слушатели + Path2D) давало
+        // регулярный микрофриз. Пересоздание остаётся для явной загрузки
+        // (forceFit), первого построения и смены состава/темы — они сами зовут
+        // rebuildChartWindow. suppressReload гасим вручную: setData+setScale
+        // программные, хук setScale не должен пометить окно зумированным.
+        const liveInPlace = !forceFit && !isArchive && win.chart && win.signals.length;
+        if (liveInPlace) {
+            win.suppressReload = true;
+            applySeriesData(win, win.chart);
+            // Фит по полному интервалу последней загрузки + авто-Y, как делал
+            // rebuild с fit=true: окно едет за текущим моментом.
+            if (win.fullT1 > win.fullT0) win.chart.setScale('x', { min: win.fullT0, max: win.fullT1 });
+            fitYToVisible(win.chart);
+            Promise.resolve().then(() => { if (win.chart) win.suppressReload = false; });
+        } else {
+            rebuildChartWindow(win, forceFit);
+        }
     }
     // Обзор суток рисуется по тегам активного окна — пересобираем его при
     // явной загрузке архива (смена даты/режима/состава сигналов).
@@ -1967,6 +2004,12 @@ function applySeriesData(win, u) {
     win.signals.forEach((s) => newData.push(s.values));
     win.suppressReload = true;
     u.setData(newData, false);
+    // uPlot при setData(data, false) НЕ вызывает commit — массивы меняются, но
+    // canvas остаётся старым. После зума рамкой (одно событие, без следующих
+    // шагов колеса) новые данные висели невидимыми до любого следующего
+    // setScale. Явный redraw рисует их сразу; commit внутри uPlot дедуплицируется,
+    // поэтому следующий setScale не даст двойной перерисовки.
+    u.redraw();
     Promise.resolve().then(() => { if (win.chart === u) win.suppressReload = false; });
 }
 
@@ -2035,6 +2078,9 @@ async function refreshZoomedLiveBits() {
 
     bitsSuppressReload = true;
     u.setData(bitsSeriesArrays(payload, nBits), false);
+    // setData(..., false) не вызывает commit: без redraw новые данные лежат
+    // в массивах, но canvas остаётся старым до следующего setScale.
+    u.redraw();
     Promise.resolve().then(() => { if (bitsChart === u) bitsSuppressReload = false; });
 
     if (follow) u.setScale('x', { min: nowSec - width, max: nowSec });
@@ -2158,6 +2204,9 @@ function fireBitsReload(u, st) {
         if (!payload.times || !payload.times.length) return;
         bitsSuppressReload = true;
         u.setData(bitsSeriesArrays(payload, nBits), false);
+        // Та же причина, что и в applySeriesData: setData(..., false) без commit
+        // не перерисовывает — после зума рамкой данные появлялись не сразу.
+        u.redraw();
         Promise.resolve().then(() => { if (bitsChart === u) bitsSuppressReload = false; });
     }).catch(() => {});
 }
@@ -2613,17 +2662,25 @@ function closeAlertBox() {
 
 // ---------------------------------------------------------------- live-обновление
 // Каждые 1000 мс опрашиваем /api/points для обновления статус-панели.
+// reloadCharts/reloadBits — async: если ответ сервера идёт дольше секунды,
+// следующий тик не должен запускаться поверх (наложение пересозданий графика
+// превращало единичный фриз в каскад). busy-флаг пропускает тик, пока
+// предыдущая перезагрузка не завершилась.
+let chartsReloadBusy = false;
+let bitsReloadBusy = false;
 setInterval(async () => {
     const isChartsActive = document.getElementById('page-charts').classList.contains('active');
     const isBitsActive = document.getElementById('page-bits').classList.contains('active');
     const hasSignals = chartWindows.some(w => w.signals.length > 0);
     if (isChartsActive && hasSignals && !chartsPaused && mouseHeldCharts === 0 &&
-        document.getElementById('charts-mode').value === 'Live') {
-        reloadCharts(false);
+        !chartsReloadBusy && document.getElementById('charts-mode').value === 'Live') {
+        chartsReloadBusy = true;
+        try { await reloadCharts(false); } finally { chartsReloadBusy = false; }
     }
     if (isBitsActive && !bitsPaused && mouseHeldBits === 0 &&
-        document.getElementById('bits-mode').value === 'Live') {
-        reloadBits(false);
+        !bitsReloadBusy && document.getElementById('bits-mode').value === 'Live') {
+        bitsReloadBusy = true;
+        try { await reloadBits(false); } finally { bitsReloadBusy = false; }
     }
 }, 1000);
 

@@ -1593,14 +1593,15 @@ impl PdfGeom {
         self.margin + self.table_h(rows, cols)
     }
 
-    /// Вписать PNG `img_w × img_h` px в ширину области и высоту `avail_h`.
+    /// Вписать PNG `img_w × img_h` px в ширину области (всегда полная ширина между полями).
+    /// Высота считается пропорционально без сжатия — если не влезает по высоте,
+    /// планер сам перенесёт график на новую страницу.
     /// Возвращает (масштаб, высота в pt).
-    pub fn fit(&self, img_w: usize, img_h: usize, avail_h: f32) -> (f32, f32) {
+    pub fn fit(&self, img_w: usize, img_h: usize, _avail_h: f32) -> (f32, f32) {
         if img_w == 0 || img_h == 0 {
             return (1.0, 0.0);
         }
-        let avail = avail_h.max(self.min_img_h);
-        let scale = (self.area_w() / img_w as f32).min(avail / img_h as f32);
+        let scale = self.area_w() / img_w as f32;
         (scale, img_h as f32 * scale)
     }
 }
@@ -1635,47 +1636,58 @@ pub struct PdfPagePlan {
 
 /// Жадно раскладываем графики по страницам сверху вниз.
 ///
-/// Каждому блоку хватает места до верхней границы таблицы сигналов ЭТОЙ
-/// страницы, причём таблица учитывает легенды уже поставленных графиков:
-/// добавление сигнала поднимает её вверх, и следующий блок обязан влезть под
-/// неё, а не в неё. Первый блок страницы ставится всегда — если окно выше
-/// листа, оно займёт всю доступную высоту (но не меньше `min_img_h`).
+/// Все графики имеют одинаковую ширину (весь лист за вычетом полей).
+/// Если график не влезает по высоте на текущую страницу (заголовок + картинка
+/// + зазор не помещаются над таблицей сигналов), он переносится на новую
+/// страницу целиком, без сжатия.
 pub fn plan_pages(g: &PdfGeom, charts: &[ChartBox]) -> Vec<PdfPagePlan> {
     let mut pages: Vec<PdfPagePlan> = Vec::new();
     let mut cur = PdfPagePlan::default();
     let mut y = g.blocks_top();
 
-    // Геометрия блока, поставленного на высоту y, для страницы с rows легенд.
-    let block = |rows: usize, y: f32, b: &ChartBox| -> (PlacedChart, usize, usize) {
-        let cols = g.table_cols(rows);
-        let avail = y - g.title_h - g.title_gap - (g.table_top(rows, cols) + g.block_gap);
-        let (scale, img_h) = g.fit(b.img_w, b.img_h, avail);
-        (
-            PlacedChart {
-                title_y: y,
-                img_y: y - g.title_h - g.title_gap - img_h,
-                scale,
-                img_h,
-            },
-            rows,
-            cols,
-        )
-    };
-
-
     for (i, b) in charts.iter().enumerate() {
-        let (placed, rows, cols) = block(cur.rows + b.rows, y, b);
-        // Низ блока не должен заходить под таблицу, которая выросла от его
-        // легенд: если зашёл — график уходит на чистую страницу.
-        if !cur.charts.is_empty() && placed.img_y < g.table_top(rows, cols) {
+        let prospective_rows = cur.rows + b.rows;
+        let cols = g.table_cols(prospective_rows);
+
+        // Всегда полная ширина, высота пропорциональна (без сжатия).
+        let (scale, img_h) = g.fit(b.img_w, b.img_h, 0.0);
+        let block_h = g.title_h + g.title_gap + img_h;
+        let block_bottom = y - block_h;
+
+        // Низ блока не должен заходить под таблицу: если зашёл — на новую страницу.
+        let table_top = g.table_top(prospective_rows, cols);
+        if !cur.charts.is_empty() && block_bottom < table_top + g.block_gap {
             pages.push(std::mem::take(&mut cur));
             y = g.blocks_top();
+
+            // Пересчитываем для чистой страницы (rows = 0 + b.rows).
+            let new_cols = g.table_cols(b.rows);
+            let (scale, img_h) = g.fit(b.img_w, b.img_h, 0.0);
+            let block_h = g.title_h + g.title_gap + img_h;
+            let block_bottom = y - block_h;
+
+            let placed = PlacedChart {
+                title_y: y,
+                img_y: block_bottom,
+                scale,
+                img_h,
+            };
+            cur.charts.push((i, placed));
+            cur.rows = b.rows;
+            cur.cols = new_cols;
+            y = block_bottom - g.block_gap;
+        } else {
+            let placed = PlacedChart {
+                title_y: y,
+                img_y: block_bottom,
+                scale,
+                img_h,
+            };
+            cur.charts.push((i, placed));
+            cur.rows = prospective_rows;
+            cur.cols = cols;
+            y = block_bottom - g.block_gap;
         }
-        let (placed, rows, cols) = block(cur.rows + b.rows, y, b);
-        cur.charts.push((i, placed));
-        cur.rows = rows;
-        cur.cols = cols;
-        y = placed.img_y - g.block_gap;
     }
     if !cur.charts.is_empty() {
         pages.push(cur);
