@@ -240,7 +240,7 @@ impl DatabaseService {
                     }
                     return Ok(result);
                 }
-                get_series_bucketed_pg(&c, tag_ids, &start, &end, bucket, self.timescale).await
+                get_series_bucketed_pg(&c, tag_ids, &start, &end, bucket).await
             }
         }
     }
@@ -347,7 +347,7 @@ impl DatabaseService {
             }
             Backend::Postgres(lock) => {
                 let c = lock.lock().await;
-                busy_buckets_pg(&c, tag_ids, &start, &end, bucket_ms, self.timescale).await
+                busy_buckets_pg(&c, tag_ids, &start, &end, bucket_ms).await
             }
         }
     }
@@ -693,37 +693,22 @@ async fn get_series_bucketed_pg(
     start: &DateTime<Local>,
     end: &DateTime<Local>,
     bucket_ms: i64,
-    timescale: bool,
 ) -> DbResult<Vec<(i64, Vec<DataPoint>)>> {
     let p_ids: Vec<i32> = tag_ids.iter().map(|t| *t as i32).collect();
     let p_start = start.with_timezone(&Utc);
     let p_end = end.with_timezone(&Utc);
 
-    let rows = if timescale {
-        // TimescaleDB: используем time_bucket(interval).
-        // bucket_ms → интервал литералом в SQL: параметром его не передать —
-        // сервер выводит тип $4 как interval, а tokio-postgres сериализует
-        // только Rust-типы, у которых есть pg-код interval (String/text — нет).
-        // Значение целое и вычислено у нас, инъекция исключена.
-        c.query(
-            &format!(
-                "SELECT tag_id, \
-                 (EXTRACT(EPOCH FROM time_bucket('{bucket_ms} milliseconds'::interval, \"timestamp\")) * 1000)::bigint AS b, \
-                 AVG(value) \
-                 FROM data_points \
-                 WHERE tag_id = ANY($1::int[]) AND \"timestamp\" >= $2 AND \"timestamp\" <= $3 \
-                 GROUP BY 1, 2 ORDER BY 1, 2;",
-            ),
-            &[&p_ids, &p_start, &p_end],
-        )
-        .await
-        .map_err(|e| e.to_string())?
-    } else {
-        // Обычный PostgreSQL: целочисленная арифметика epoch_ms.
-        // EXTRACT(EPOCH ...) → float8, *1000 → float8, ::bigint → целое.
-        // Деление bigint/bigint → целочисленное, *bigint → bigint.
-        let bucket = bucket_ms as i64;
-        c.query(
+    // Сетка бакетов — ВСЕГДА целочисленная арифметика epoch_ms, одинаковая для
+    // PostgreSQL и TimescaleDB. time_bucket() выравнивает бакеты по origin
+    // 2000-01-01, а Rust-сторона (и /api/gaps) считает их от epoch 1970: при
+    // шаге, не делящем сутки нацело, сетки расходились и «занятые» бакеты не
+    // совпадали с ожидаемыми — обзор архива заливал красным интервалы, где
+    // данные есть.
+    // EXTRACT(EPOCH ...) → float8, *1000 → float8, ::bigint → целое.
+    // Деление bigint/bigint → целочисленное, *bigint → bigint.
+    let bucket = bucket_ms as i64;
+    let rows = c
+        .query(
             "SELECT tag_id, \
              (EXTRACT(EPOCH FROM \"timestamp\") * 1000)::bigint / $4::bigint * $4::bigint AS b, \
              AVG(value) \
@@ -733,8 +718,8 @@ async fn get_series_bucketed_pg(
             &[&p_ids, &p_start, &p_end, &bucket],
         )
         .await
-        .map_err(|e| e.to_string())?
-    };
+        .map_err(|e| e.to_string())?;
+
 
     let mut by_tag: std::collections::BTreeMap<i64, Vec<(f64, f64)>> =
         std::collections::BTreeMap::new();
@@ -799,35 +784,24 @@ fn busy_buckets_sqlite(
     Ok(out)
 }
 
-/// DISTINCT по бакету (PostgreSQL/Timescale). Для Timescale берём time_bucket,
-/// чтобы запрос шёл по индексу чанков, а не сканировал гипертаблицу.
+/// DISTINCT по бакету (PostgreSQL/Timescale).
+/// Сетка — целочисленная арифметика epoch_ms (та же, что в get_series_bucketed_pg
+/// и в /api/gaps): time_bucket() выравнивает по origin 2000-01-01 и расходится
+/// с Rust-сеткой, из-за чего обзор архива показывал ложные «дыры».
 async fn busy_buckets_pg(
     c: &tokio_postgres::Client,
     tag_ids: &[i64],
     start: &DateTime<Local>,
     end: &DateTime<Local>,
     bucket_ms: i64,
-    timescale: bool,
 ) -> DbResult<Vec<i64>> {
     let p_ids: Vec<i32> = tag_ids.iter().map(|t| *t as i32).collect();
     let p_start = start.with_timezone(&Utc);
     let p_end = end.with_timezone(&Utc);
     let lim = (MAX_POINTS * 2) as i64;
 
-    let rows = if timescale {
-        c.query(
-            &format!(
-                "SELECT DISTINCT (EXTRACT(EPOCH FROM time_bucket('{bucket_ms} milliseconds'::interval, \"timestamp\")) * 1000)::bigint AS b \
-                 FROM data_points \
-                 WHERE tag_id = ANY($1::int[]) AND \"timestamp\" >= $2 AND \"timestamp\" <= $3 \
-                 ORDER BY 1 LIMIT {lim};",
-            ),
-            &[&p_ids, &p_start, &p_end],
-        )
-        .await
-        .map_err(|e| e.to_string())?
-    } else {
-        c.query(
+    let rows = c
+        .query(
             "SELECT DISTINCT (EXTRACT(EPOCH FROM \"timestamp\") * 1000)::bigint / $4::bigint * $4::bigint AS b \
              FROM data_points \
              WHERE tag_id = ANY($1::int[]) AND \"timestamp\" >= $2 AND \"timestamp\" <= $3 \
@@ -835,8 +809,7 @@ async fn busy_buckets_pg(
             &[&p_ids, &p_start, &p_end, &bucket_ms, &lim],
         )
         .await
-        .map_err(|e| e.to_string())?
-    };
+        .map_err(|e| e.to_string())?;
 
     Ok(rows.iter().filter_map(|r| r.get::<_, Option<i64>>(0)).collect())
 }

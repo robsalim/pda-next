@@ -247,22 +247,13 @@ let archWindow = null;
 function clearArchWindow() { archWindow = null; }
 
 /// Подставляет окно из обзора в панель: «Начало» = левая граница, а
-/// «Длительность» — ближайший вариант списка (чтобы панель не врала).
+/// ВАЖНО: панель «Начало / Длительность» НЕ трогаем. Она задаёт окно обзора,
+/// и пользователь просил всегда видеть сверху и на мини-графике один и тот же
+/// заданный диапазон. Выделение живёт только в archWindow и сужает графики;
+/// вернуться к полному окну — кнопка «Загрузить архив» (она сбрасывает archWindow).
 function setArchWindow(t0, t1) {
     if (!(t1 > t0)) return;
     archWindow = { t0, t1 };
-    setArchStartValue('charts', Math.round(t0 * 1000));
-    const sel = document.getElementById('charts-arch-dur');
-    if (sel) {
-        const spanMs = (t1 - t0) * 1000;
-        let best = null, bestDiff = Infinity;
-        for (const o of sel.options) {
-            const d = Math.abs(getDurationMs(o.value) - spanMs);
-            if (d < bestDiff) { bestDiff = d; best = o; }
-        }
-        if (best) sel.value = best.value;
-    }
-    userSetArchStart.add('charts');
 }
 
 function fmtArchTs(ms) {
@@ -271,16 +262,29 @@ function fmtArchTs(ms) {
     return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/// Текущее архивное окно в epoch-мс: точное выделение с мини-обзора, иначе
-/// «Начало» + «Длительность» из панели. Мини-обзор рисуется по этим же
-/// границам — иначе его ось расходилась с датой, которую видно сверху.
-function archWindowMs(tab) {
-    if (tab === 'charts' && archWindow)
-        return { t0: archWindow.t0 * 1000, t1: archWindow.t1 * 1000 };
+/// Окно обзора — ВСЕГДА «Начало» + «Длительность» из панели, независимо от
+/// выделения на мини-графике: обзор не должен зумиться кнопкой «⤓ Выбранное»,
+/// иначе пользователь теряет картину целиком.
+function panelWindowMs(tab) {
     const startMs = new Date(document.getElementById(`${tab}-arch-start`).value).getTime();
     const durMs = getDurationMs(document.getElementById(`${tab}-arch-dur`).value);
     if (isNaN(startMs)) return null;
     return { t0: startMs, t1: startMs + durMs };
+}
+
+/// Текущее архивное окно в epoch-мс: точное выделение с мини-обзора, иначе
+/// «Начало» + «Длительность» из панели.
+function archWindowMs(tab) {
+    if (tab === 'charts' && archWindow)
+        return { t0: archWindow.t0 * 1000, t1: archWindow.t1 * 1000 };
+    return panelWindowMs(tab);
+}
+
+/// Явная загрузка архива из панели: сбрасывает выделение с обзора, чтобы
+/// вернуться к полному «Начало + Длительность».
+function loadArchiveCharts() {
+    clearArchWindow();
+    reloadCharts(true);
 }
 
 function setLastDataHint(tab) {
@@ -333,7 +337,9 @@ async function loadArchOverview() {
     if (!wrap || !box) return;
     const win = getActiveWindow();
     const tags = win ? win.signals.map(s => s.tag.id) : [];
-    const range = archWindowMs('charts');
+    // Обзор строится по панели (Начало + Длительность), а не по выделению:
+    // «⤓ Выбранное» сужает только графики, мини-график остаётся полным.
+    const range = panelWindowMs('charts');
     if (document.getElementById('charts-mode').value !== 'Archive' || !tags.length || !range) {
         hideArchOverview();
         return;
@@ -577,7 +583,10 @@ function applyArchOverviewSelection() {
     setArchWindow(t0, t1);
     // Снимаем рамку выделения: окно уже перенесено в панель.
     u.setSelect({ left: 0, width: 0, top: 0, height: 0 }, false);
-    reloadCharts(true);
+    // skipOverview=true — мини-обзор НЕ пересобираем: он всегда показывает
+    // полный диапазон из панели, а не выделенный кусок.
+    reloadCharts(true, true);
+    chartsStatusLine(`Окно из обзора: ${formatTime(t0)} — ${formatTime(t1)}`);
 }
 
 
@@ -1728,7 +1737,7 @@ async function refreshZoomedLiveWindow(win) {
     if (follow) u.setScale('x', { min: nowSec - width, max: nowSec });
 }
 
-async function reloadCharts(forceFit = false) {
+async function reloadCharts(forceFit = false, skipOverview = false) {
     const isArchive = document.getElementById('charts-mode').value === 'Archive';
     const emptySignals = [];
     for (const win of chartWindows) {
@@ -1802,7 +1811,9 @@ async function reloadCharts(forceFit = false) {
     }
     // Обзор суток рисуется по тегам активного окна — пересобираем его при
     // явной загрузке архива (смена даты/режима/состава сигналов).
-    if (isArchive && forceFit) loadArchOverview();
+    // skipOverview — «⤓ Выбранное»: график сужается до выделения, но обзор
+    // должен остаться на полном диапазоне из панели.
+    if (isArchive && forceFit && !skipOverview) loadArchOverview();
     else if (!isArchive) hideArchOverview();
     // Раньше пустой ответ молча оставлял на экране старый график («тишина»).
     // Теперь при явной загрузке архива говорим, что данных в окне нет.
