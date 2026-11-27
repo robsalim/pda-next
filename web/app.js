@@ -2442,8 +2442,17 @@ async function exportAllChartsPdf() {
         return;
     }
 
-
     const title = `PDA — ${wins.length} график(ов)`;
+
+    // Спрашиваем, куда сохранить PDF
+    const choice = await confirmBox(
+        `Экспорт PDF: \"${title}\"\\nКуда сохранить файл?`,
+        { yes: 'На сервер', no: 'На клиент', cancel: 'Отмена' },
+    );
+    if (choice === null) return; // пользователь отменил
+
+    if (choice === true) {
+        // Вариант 1 — сохранить на сервере (POST /api/export/pdf)
     try {
         // 1) Захватываем все окна в светлой теме
         const charts = [];
@@ -2480,6 +2489,47 @@ async function exportAllChartsPdf() {
         alertBox('Экспорт PDF', `Сохранено (${Math.round(j.bytes / 1024)} КБ):\n${j.path}`);
     } catch (e) {
         alertBox('Экспорт PDF', `Не удалось сохранить: ${e.message}`, true);
+    }
+    } else {
+        // Вариант 2 — выгрузить на клиент (прямое скачивание браузером)
+        // Сначала захватываем PNG для всех графиков
+        const charts2 = [];
+        for (const win of wins) {
+            const pngBlob = await chartPngBlob(win, true); // light mode
+            if (pngBlob) {
+                charts2.push({ win, pngBlob });
+            }
+        }
+        if (!charts2.length) throw new Error('Не удалось захватить графики');
+
+        // Формируем данные для отправки
+        const formData2 = new FormData();
+        formData2.append('title', title);
+        for (let i = 0; i < charts2.length; i++) {
+            const { win, pngBlob } = charts2[i];
+            formData2.append(`chart_${i}`, pngBlob, `chart_${i}.png`);
+            formData2.append(`title_${i}`, chartWindowTitle(win));
+        }
+
+        // Отправляем на сервер для генерации PDF и получаем его сразу в ответе
+        // (client=1 — сервер не пишет файл к себе, иначе в «Загрузках» будет два файла).
+        const r = await fetch('/api/export/pdf?count=' + charts2.length + '&client=1', {
+            method: 'POST', body: formData2,
+        });
+        if (!r.ok) {
+            const text = await r.text();
+            throw new Error(text || `HTTP ${r.status}`);
+        }
+        const blob = await r.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `pda_pdf_${exportStamp()}.pdf`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        alertBox('Экспорт PDF', `Файл отправлен на скачивание`);
     }
 }
 

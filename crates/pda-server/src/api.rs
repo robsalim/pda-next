@@ -1724,10 +1724,12 @@ fn split_field_index(name: &str) -> (&str, Option<usize>) {
 /// Поля multipart: `chart_{i}`, `title_{i}`, `legend_name_{i}[]`,
 /// `legend_color_{i}[]`; `title` без индекса — общий заголовок (имя файла).
 /// Все координаты в PDF: Pt (1pt = 1/72"), origin — левый НИЖНИЙ угол.
+/// Query: `?client=1` — вернуть PDF сразу в ответе (без записи на диск).
 pub async fn export_pdf(
     State(core): State<Arc<AppCore>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
     mut payload: axum::extract::Multipart,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     let dir = core.exports_dir.clone();
     std::fs::create_dir_all(&dir)
         .map_err(|e| ApiError(format!("Не удалось создать каталог {}: {e}", dir.display())))?;
@@ -1992,9 +1994,28 @@ pub async fn export_pdf(
 
 
     // 5) Сохраняем
-    let path = unique_path(&dir, &safe_export_name(Some(&doc_title), "pdf"));
+    // Generate date-based filename (like PNG export: YYYYMMDD_HHMMSS)
+    let date_str = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    // safe_export_name уже добавляет расширение — второй раз ".pdf" не клеим.
+    let file_name = format!("{}_{}", date_str, safe_export_name(Some(&doc_title), "pdf"));
     let mut warnings = Vec::new();
     let bytes = doc.save(&printpdf::PdfSaveOptions::default(), &mut warnings);
+
+    // Клиентский режим: отдаём PDF прямо в ответе, на диск сервера не пишем,
+    // иначе браузер скачает второй файл из ~/Downloads.
+    if q.get("client").map(|v| v == "1").unwrap_or(false) {
+        return axum::response::Response::builder()
+            .header("Content-Type", "application/pdf")
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename=\"{}\"", file_name),
+            )
+            .header("Content-Length", bytes.len())
+            .body(axum::body::Body::from(bytes))
+            .map_err(|e| ApiError(format!("Ошибка формирования ответа: {e}")));
+    }
+
+    let path = unique_path(&dir, &file_name);
     std::fs::write(&path, &bytes)
         .map_err(|e| ApiError(format!("Не удалось записать {}: {e}", path.display())))?;
     tracing::info!(
@@ -2004,7 +2025,31 @@ pub async fn export_pdf(
     );
     Ok(Json(
         json!({ "ok": true, "path": path.to_string_lossy(), "bytes": bytes.len() }),
-    ))
+    )
+    .into_response())
+}
+
+/// Скачивание сгенерированного PDF файла клиенту.
+/// Принимает путь к файлу в query параметре `path`.
+pub async fn download_pdf(
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Response, ApiError> {
+    let path_str = q.get("path").ok_or_else(|| ApiError("Не указан путь к файлу".into()))?;
+    let path = std::path::Path::new(path_str);
+    if !path.exists() {
+        return Err(ApiError(format!("Файл не найден: {}", path_str)));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|e| ApiError(format!("Не удалось прочитать файл: {e}")))?;
+    let file_name = path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("download.pdf");
+    axum::response::Response::builder()
+        .header("Content-Type", "application/pdf")
+        .header("Content-Disposition", format!("attachment; filename=\"{}\"", file_name))
+        .header("Content-Length", bytes.len())
+        .body(axum::body::Body::from(bytes))
+        .map_err(|e| ApiError(format!("Ошибка формирования ответа: {e}")))
 }
 
 // ---------------------------------------------------------------- маршруты
@@ -2049,6 +2094,7 @@ pub fn router(core: Arc<AppCore>) -> Router {
         .route("/export/png", post(export_png))
         .route("/export/file", post(export_file))
         .route("/export/pdf", post(export_pdf))
+        .route("/api/download/pdf", get(download_pdf))
         .with_state(core.clone())
         // Лимит тела по умолчанию в axum — 2 МБ, чемтёжный график в PNG может
         // быть больше. Свой порог (32 МБ) проверяет сам export_png.
